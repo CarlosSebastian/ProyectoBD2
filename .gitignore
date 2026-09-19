@@ -1,0 +1,20 @@
+build/
+# Todo lo que el motor genera dentro de data/ queda fuera del repositorio.
+# Se ignora la carpeta ENTERA y se rescata solo el .gitkeep: con patrones de
+# un nivel (data/*.dat) se colaban los binarios que los tests dejan en
+# subcarpetas como data/test_sql_estrictos/.
+data/*
+!data/.gitkeep
+*.o
+*.exe
+.vscode/
+
+informe/*.aux
+informe/*.log
+informe/*.out
+informe/*.fls
+informe/*.fdb_latexmk
+informe/figuras/*.png
+
+# Las figuras en PDF y el informe compilado SI se versionan: el enunciado
+# pide el PDF en el repositorio.

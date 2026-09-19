@@ -1,0 +1,10 @@
+# Esta carpeta la usa el motor para los archivos binarios que genera:
+#     <tabla>.dat      area de datos (Heap o area principal del Sequential)
+#     <tabla>.ovf      area de overflow del Sequential File
+#     <tabla>_<col>.idx  indice B+ o hash extensible
+#     catalog.txt      catalogo de tablas e indices
+#     dataset_<N>.csv  dataset sintetico de los experimentos
+#
+# El contenido esta en .gitignore porque son binarios generados y pesan
+# demasiado (el dataset de 500 000 filas son ~16 MB). Este archivo existe
+# solo para que la carpeta viaje en el repositorio, como pide el enunciado.

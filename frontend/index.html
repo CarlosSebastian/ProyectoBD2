@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cliente SQL — Mini-gestor BD2</title>
+<style>
+  :root{
+    --bg:#f4f5f7; --panel:#ffffff; --border:#dcdfe4; --text:#1c2024; --muted:#6b7280;
+    --accent:#1d6fd0; --accent-soft:#e8f1fc; --ok:#0f7b45; --err:#c0342b; --warn:#a4620a;
+    --sx-kw:#7c3aed; --sx-tipo:#0e7490; --sx-mot:#b45309;
+    --sx-str:#15803d; --sx-num:#c2410c; --sx-com:#6b7280;
+    --mono:'SF Mono',ui-monospace,'Cascadia Code',Consolas,'Liberation Mono',monospace;
+    --radius:8px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#14171a; --panel:#1c2024; --border:#2f353b; --text:#e6e8ea; --muted:#98a1ab;
+      --accent:#5aa2f0; --accent-soft:#1b2c40; --ok:#4ec27f; --err:#f08379; --warn:#e0a44a;
+      --sx-kw:#c4b5fd; --sx-tipo:#67e8f9; --sx-mot:#fcd34d;
+      --sx-str:#86efac; --sx-num:#fdba74; --sx-com:#98a1ab;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:10px 16px;
+         background:var(--panel);border-bottom:1px solid var(--border)}
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:-.01em}
+  header .sub{color:var(--muted);font-size:12px}
+  header .spacer{flex:1}
+  .pill{font-size:11px;padding:2px 8px;border-radius:999px;background:var(--accent-soft);
+        color:var(--accent);border:1px solid var(--border);white-space:nowrap}
+
+  .layout{display:grid;grid-template-columns:250px 1fr;gap:12px;padding:12px;
+          height:calc(100vh - 49px);align-items:stretch}
+  @media (max-width:900px){ .layout{grid-template-columns:1fr;height:auto} }
+
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+         display:flex;flex-direction:column;min-height:0;overflow:hidden}
+  .panel > h2{margin:0;padding:9px 12px;font-size:11px;text-transform:uppercase;
+              letter-spacing:.07em;color:var(--muted);border-bottom:1px solid var(--border);
+              font-weight:600;display:flex;align-items:center;gap:8px}
+  .panel .body{padding:12px;overflow:auto;flex:1;min-height:0}
+
+  .right{display:grid;grid-template-rows:auto 1fr;gap:12px;min-height:0}
+  .bottom{display:grid;grid-template-columns:1fr 340px;gap:12px;min-height:0}
+  @media (max-width:1100px){ .bottom{grid-template-columns:1fr} }
+
+  /* 1. Explorador */
+  .tabla-item{border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-bottom:8px;cursor:pointer}
+  .tabla-item:hover{border-color:var(--accent)}
+  .tabla-item .nom{font-weight:600;display:flex;justify-content:space-between;align-items:center;gap:6px}
+  .tabla-item .meta{color:var(--muted);font-size:11.5px;margin-top:3px}
+  .tabla-item .cols{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:5px;line-height:1.45}
+  .badge{font-size:10px;padding:1px 6px;border-radius:4px;border:1px solid var(--border);
+         background:var(--bg);color:var(--muted);font-weight:500}
+  .badge.idx{color:var(--ok);border-color:var(--ok)}
+  .badge.seq{color:var(--warn);border-color:var(--warn)}
+
+  /* 2. Editor */
+  /* Editor SQL con resaltado: un <pre> pintado debajo y el <textarea> encima
+     con el texto transparente. Ambos comparten metricas de fuente EXACTAS
+     (familia, tamano, interlineado, padding y borde) para que el cursor caiga
+     justo sobre el glifo resaltado. Sin librerias externas. */
+  .editor{position:relative}
+  .editor > pre, .editor > textarea{
+           margin:0;width:100%;min-height:110px;font-family:var(--mono);font-size:13px;
+           padding:10px;border:1px solid transparent;border-radius:6px;line-height:1.5;
+           white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word;
+           tab-size:2}
+  .editor > pre{position:absolute;inset:0;z-index:0;pointer-events:none;overflow:hidden;
+           border-color:var(--border);background:var(--bg);color:var(--text)}
+  .editor > textarea{position:relative;z-index:1;resize:vertical;
+           background:transparent;color:transparent;caret-color:var(--text);
+           border-color:var(--border);overflow:auto}
+  .editor > textarea:focus{outline:2px solid var(--accent);outline-offset:-1px}
+  .editor > textarea::selection{background:var(--accent-soft);color:transparent}
+  .sx-kw{color:var(--sx-kw);font-weight:600}
+  .sx-tipo{color:var(--sx-tipo)}
+  .sx-mot{color:var(--sx-mot);font-weight:600}
+  .sx-str{color:var(--sx-str)}
+  .sx-num{color:var(--sx-num)}
+  .sx-com{color:var(--sx-com);font-style:italic}
+  .sx-op{color:var(--muted)}
+  .barra{display:flex;gap:8px;align-items:center;margin-top:9px;flex-wrap:wrap}
+  button{font:inherit;font-size:13px;padding:6px 14px;border-radius:6px;border:1px solid var(--border);
+         background:var(--panel);color:var(--text);cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:500}
+  button.primary:hover{filter:brightness(1.08)}
+  button:disabled{opacity:.55;cursor:default}
+  .ejemplos{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px}
+  .ejemplos button{font-size:11.5px;padding:3px 9px;color:var(--muted)}
+  .hint{color:var(--muted);font-size:11.5px}
+
+  /* mensajes */
+  .msg{margin-top:10px;padding:9px 11px;border-radius:6px;font-size:13px;border:1px solid}
+  .msg.ok{background:color-mix(in srgb,var(--ok) 10%,transparent);border-color:var(--ok);color:var(--ok)}
+  .msg.err{background:color-mix(in srgb,var(--err) 10%,transparent);border-color:var(--err);color:var(--err)}
+  .msg code{font-family:var(--mono);font-size:12px}
+
+  /* 3. Resultados */
+  table{border-collapse:collapse;width:100%;font-size:12.5px}
+  th,td{text-align:left;padding:5px 9px;border-bottom:1px solid var(--border);white-space:nowrap}
+  th{position:sticky;top:0;background:var(--panel);font-weight:600;font-size:11px;
+     text-transform:uppercase;letter-spacing:.04em;color:var(--muted);z-index:1}
+  td{font-family:var(--mono);font-size:12px}
+  tbody tr:hover{background:var(--accent-soft)}
+  .paginacion{display:flex;align-items:center;gap:10px;padding:8px 12px;border-top:1px solid var(--border);
+              font-size:12px;color:var(--muted)}
+  .vacio{color:var(--muted);padding:20px 4px;text-align:center;font-size:13px}
+
+  /* 4. Plan y metricas */
+  .metricas{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
+  .metrica{border:1px solid var(--border);border-radius:6px;padding:8px 10px;background:var(--bg)}
+  .metrica .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+  .metrica .v{font-size:17px;font-weight:600;font-family:var(--mono);margin-top:2px}
+  .metrica.ancha{grid-column:1 / -1}
+  .ruta{font-family:var(--mono);font-size:12px;padding:7px 10px;border-radius:6px;
+        background:var(--accent-soft);color:var(--accent);border:1px solid var(--border);margin-bottom:12px}
+  .paso{margin-bottom:9px}
+  .paso .fila{display:flex;justify-content:space-between;gap:8px;font-size:12px}
+  .paso .nombre{font-weight:500}
+  .paso .ms{font-family:var(--mono);color:var(--muted);font-size:11.5px}
+  .paso .detalle{color:var(--muted);font-size:11px;margin-top:1px}
+  .paso .barra-ms{height:3px;border-radius:2px;background:var(--accent);margin-top:4px;min-width:2px}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Cliente SQL</h1>
+  <span class="sub">Mini-gestor de bases de datos multimodal · CS2042</span>
+  <span class="spacer"></span>
+  <span class="pill" id="pill-page">página — B</span>
+  <span class="pill" id="pill-io">I/O total: —</span>
+</header>
+
+<div class="layout">
+
+  <!-- PANEL 1: Explorador de tablas -->
+  <section class="panel">
+    <h2>1 · Explorador de tablas
+      <span class="spacer" style="flex:1"></span>
+      <button id="btn-refrescar" style="padding:2px 8px;font-size:11px">↻</button>
+    </h2>
+    <div class="body" id="explorador"><div class="vacio">Cargando…</div></div>
+  </section>
+
+  <div class="right">
+
+    <!-- PANEL 2: Editor SQL -->
+    <section class="panel">
+      <h2>2 · Editor SQL</h2>
+      <div class="body">
+        <div class="editor">
+          <pre id="sql-hl" aria-hidden="true"></pre>
+          <textarea id="sql" spellcheck="false" autocapitalize="off" autocorrect="off"
+                    aria-label="Editor SQL">SELECT * FROM empleados WHERE id >= 100 AND id <= 120;</textarea>
+        </div>
+        <div class="barra">
+          <button class="primary" id="btn-ejecutar">Ejecutar</button>
+          <span class="hint">Ctrl/Cmd + Enter</span>
+        </div>
+        <div class="ejemplos" id="ejemplos"></div>
+        <div id="mensaje"></div>
+      </div>
+    </section>
+
+    <div class="bottom">
+      <!-- PANEL 3: Visor de resultados -->
+      <section class="panel">
+        <h2>3 · Resultados <span id="res-count" style="color:var(--muted);font-weight:400"></span></h2>
+        <div class="body" style="padding:0" id="resultados">
+          <div class="vacio">Ejecuta una consulta para ver resultados.</div>
+        </div>
+        <div class="paginacion" id="paginacion" hidden>
+          <button id="pag-prev">←</button>
+          <span id="pag-info"></span>
+          <button id="pag-next">→</button>
+        </div>
+      </section>
+
+      <!-- PANEL 4: Plan de ejecución y métricas -->
+      <section class="panel">
+        <h2>4 · Plan de ejecución y métricas</h2>
+        <div class="body" id="plan">
+          <div class="vacio">Sin consulta ejecutada.</div>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const FILAS_POR_PAGINA = 50;
+let ultimo = null, pagina = 0;
+
+const EJEMPLOS = [
+  ["CREATE TABLE", "CREATE TABLE empleados (id INT PRIMARY KEY, nombre CHAR(30), dept CHAR(20), salario FLOAT) USING HEAP;"],
+  ["INSERT",       "INSERT INTO empleados VALUES (101, 'Ada Lovelace', 'Analytics', 5200.0);"],
+  ["CREATE INDEX", "CREATE INDEX idx_emp_id ON empleados (id) USING BTREE;"],
+  ["Puntual",      "SELECT * FROM empleados WHERE id = 101;"],
+  ["Rango",        "SELECT * FROM empleados WHERE id >= 100 AND id <= 500;"],
+  ["DELETE",       "DELETE FROM empleados WHERE id = 101;"],
+];
+
+function escapar(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// ---------- Panel 1 ----------
+async function cargarTablas(){
+  const cont = $('#explorador');
+  try{
+    const r = await fetch('/api/tables');
+    const d = await r.json();
+      $('#pill-io').textContent = `I/O acumulado: ${d.disk_reads_total}R / ${d.disk_writes_total}W`;
+    if(!d.tables.length){
+      cont.innerHTML = '<div class="vacio">No hay tablas todavía.<br>Crea una con CREATE TABLE.</div>';
+      return;
+    }
+    cont.innerHTML = d.tables.map(t => `
+      <div class="tabla-item" data-tabla="${escapar(t.name)}">
+        <div class="nom">${escapar(t.name)}
+          <span class="badge ${t.engine==='SEQUENTIAL'?'seq':''}">${escapar(t.engine)}</span></div>
+        <div class="meta">${t.rows} filas · ${t.heap_pages} pág. datos${t.index_pages?` · ${t.index_pages} pág. índice`:''}</div>
+        ${t.overflow_pages?`<div class="meta"><span class="badge seq">OVERFLOW</span> ${t.overflow_pages} pág. · ${t.overflow_rows} filas</div>`:''}
+        ${t.engine==='SEQUENTIAL'?`<div style="margin-top:6px"><button class="reorg" data-t="${escapar(t.name)}" style="font-size:11px;padding:2px 8px">Reorganizar</button></div>`:''}
+        ${t.indexes.map(i=>`<div class="meta"><span class="badge idx">${escapar(i.kind)}</span> sobre ${escapar(i.column)}</div>`).join('')}
+        <div class="cols">${t.columns.map(c=>`${escapar(c.name)} <span style="opacity:.65">${escapar(c.type)}</span>`).join('<br>')}</div>
+      </div>`).join('');
+    cont.querySelectorAll('.tabla-item').forEach(el => el.onclick = ev => {
+      if (ev.target.closest('.reorg')) return;
+      $('#sql').value = `SELECT * FROM ${el.dataset.tabla} LIMIT 50;`;
+      pintarResaltado();
+      $('#sql').focus();
+    });
+    cont.querySelectorAll('.reorg').forEach(b => b.onclick = async ev => {
+      ev.stopPropagation();
+      b.disabled = true; b.textContent = 'Reorganizando…';
+      try{
+        const r = await fetch('/api/tables/reorganize', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({table: b.dataset.t})
+        });
+        const d = await r.json();
+        ultimo = d; pintarMensaje(d); pintarPlan(d);
+        cargarTablas();
+      }catch(e){
+        $('#mensaje').innerHTML = `<div class="msg err">Error de red: ${escapar(e.message)}</div>`;
+        b.disabled = false; b.textContent = 'Reorganizar';
+      }
+    });
+  }catch(e){
+    cont.innerHTML = `<div class="vacio">No se pudo contactar al servidor.<br><small>${escapar(e.message)}</small></div>`;
+  }
+}
+
+// ---------- Panel 2 ----------
+async function ejecutar(){
+  const sql = $('#sql').value.trim();
+  if(!sql) return;
+  const btn = $('#btn-ejecutar');
+  btn.disabled = true; btn.textContent = 'Ejecutando…';
+  try{
+    const r = await fetch('/api/query', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({sql})
+    });
+    const d = await r.json();
+    ultimo = d; pagina = 0;
+    pintarMensaje(d); pintarResultados(d); pintarPlan(d);
+    cargarTablas();
+  }catch(e){
+    $('#mensaje').innerHTML = `<div class="msg err">Error de red: ${escapar(e.message)}</div>`;
+  }finally{
+    btn.disabled = false; btn.textContent = 'Ejecutar';
+  }
+}
+
+function pintarMensaje(d){
+  const m = $('#mensaje');
+  if(!d.ok)            m.innerHTML = `<div class="msg err">${escapar(d.error)}</div>`;
+  else if(d.message)   m.innerHTML = `<div class="msg ok">${escapar(d.message)}</div>`;
+  else                 m.innerHTML = '';
+}
+
+// ---------- Panel 3 ----------
+function pintarResultados(d){
+  const cont = $('#resultados'), pag = $('#paginacion');
+  $('#res-count').textContent = d.ok && d.columns.length ? `· ${d.row_count} fila(s)` : '';
+  if(!d.ok || !d.columns.length){
+    cont.innerHTML = `<div class="vacio">${d.ok ? 'La sentencia no devuelve filas.' : 'La consulta falló.'}</div>`;
+    pag.hidden = true;
+    return;
+  }
+  const total = Math.max(1, Math.ceil(d.rows.length / FILAS_POR_PAGINA));
+  pagina = Math.min(pagina, total - 1);
+  const desde = pagina * FILAS_POR_PAGINA;
+  const visibles = d.rows.slice(desde, desde + FILAS_POR_PAGINA);
+  cont.innerHTML = `<table>
+    <thead><tr>${d.columns.map(c=>`<th>${escapar(c)}</th>`).join('')}</tr></thead>
+    <tbody>${visibles.map(f=>`<tr>${f.map(c=>`<td>${escapar(c)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+  pag.hidden = d.rows.length <= FILAS_POR_PAGINA;
+  $('#pag-info').textContent = `${desde+1}–${Math.min(desde+FILAS_POR_PAGINA, d.rows.length)} de ${d.rows.length}`;
+  $('#pag-prev').disabled = pagina === 0;
+  $('#pag-next').disabled = pagina >= total - 1;
+}
+
+// ---------- Panel 4 ----------
+function pintarPlan(d){
+  const cont = $('#plan');
+  if(!d.ok){ cont.innerHTML = '<div class="vacio">La consulta falló: no hay plan.</div>'; return; }
+  const maxMs = Math.max(...d.plan.map(p=>p.ms), 0.0001);
+  cont.innerHTML = `
+    <div class="metricas">
+      <div class="metrica"><div class="k">Disk reads</div><div class="v">${d.disk_reads}</div></div>
+      <div class="metrica"><div class="k">Disk writes</div><div class="v">${d.disk_writes}</div></div>
+      <div class="metrica" title="Accesos logicos a pagina via buffer pool"><div class="k">Accesos pág.</div><div class="v">${d.page_accesses}</div></div>
+      <div class="metrica" title="De los accesos, cuantos se sirvieron desde RAM"><div class="k">Buffer hits</div><div class="v">${d.buffer_hits}</div></div>
+      <div class="metrica"><div class="k">Parseo</div><div class="v">${d.parse_ms.toFixed(3)}<span style="font-size:11px"> ms</span></div></div>
+      <div class="metrica" title="Tiempo de la ruta de acceso, sin contar el parseo ni la materializacion"><div class="k">Ejecución</div><div class="v">${d.exec_ms.toFixed(3)}<span style="font-size:11px"> ms</span></div></div>
+      <div class="metrica ancha"><div class="k">Total</div><div class="v">${d.total_ms.toFixed(3)}<span style="font-size:11px"> ms</span></div></div>
+    </div>
+    <div class="ruta">${escapar(d.metodo)}</div>
+    ${d.plan.map(p=>`
+      <div class="paso">
+        <div class="fila"><span class="nombre">${escapar(p.paso)}</span><span class="ms">${p.ms.toFixed(3)} ms</span></div>
+        ${p.detalle ? `<div class="detalle">${escapar(p.detalle)}</div>` : ''}
+        <div class="barra-ms" style="width:${Math.max(2, (p.ms/maxMs)*100)}%"></div>
+      </div>`).join('')}`;
+}
+
+// ---------- resaltado de sintaxis (panel 2) ----------
+const SX_PALABRAS = /^(SELECT|FROM|WHERE|AND|OR|INSERT|INTO|VALUES|CREATE|TABLE|INDEX|ON|USING|PRIMARY|KEY|NOT|NULL|DELETE|LIMIT|BETWEEN)$/i;
+const SX_TIPOS    = /^(INT|INTEGER|BIGINT|FLOAT|DOUBLE|REAL|CHAR|VARCHAR|TEXT)$/i;
+const SX_MOTORES  = /^(HEAP|SEQUENTIAL|BTREE|HASH)$/i;
+
+// Un solo barrido: comentario -> cadena -> numero -> identificador -> operador.
+// Todo lo que no casa se escapa igual, asi que el <pre> nunca puede recibir
+// marcado que venga de lo que el usuario escribio.
+function resaltarSQL(txt){
+  const re = /(--[^\n]*)|('(?:[^']|'')*'?)|(\b\d+(?:\.\d+)?\b)|([A-Za-z_][A-Za-z0-9_]*)|([<>=!]+|[(),;*])/g;
+  let out = '', ultimo = 0, m;
+  while((m = re.exec(txt)) !== null){
+    out += escapar(txt.slice(ultimo, m.index));
+    const t = m[0];
+    let cls = '';
+    if(m[1])      cls = 'sx-com';
+    else if(m[2]) cls = 'sx-str';
+    else if(m[3]) cls = 'sx-num';
+    else if(m[4]) cls = SX_PALABRAS.test(t) ? 'sx-kw'
+                      : SX_TIPOS.test(t)    ? 'sx-tipo'
+                      : SX_MOTORES.test(t)  ? 'sx-mot' : '';
+    else if(m[5]) cls = 'sx-op';
+    out += cls ? `<span class="${cls}">${escapar(t)}</span>` : escapar(t);
+    ultimo = m.index + t.length;
+  }
+  out += escapar(txt.slice(ultimo));
+  return out + '\n';                 // la linea final necesita su salto
+}
+
+function pintarResaltado(){
+  const ta = $('#sql'), pre = $('#sql-hl');
+  pre.innerHTML = resaltarSQL(ta.value);
+  pre.scrollTop = ta.scrollTop;
+  pre.scrollLeft = ta.scrollLeft;
+}
+
+// ---------- init ----------
+$('#ejemplos').innerHTML = EJEMPLOS.map((e,i)=>`<button data-i="${i}">${escapar(e[0])}</button>`).join('');
+$('#ejemplos').onclick = ev => {
+  const b = ev.target.closest('button'); if(!b) return;
+  $('#sql').value = EJEMPLOS[+b.dataset.i][1]; pintarResaltado(); $('#sql').focus();
+};
+$('#sql').addEventListener('input', pintarResaltado);
+$('#sql').addEventListener('scroll', pintarResaltado);
+pintarResaltado();
+$('#btn-ejecutar').onclick = ejecutar;
+$('#btn-refrescar').onclick = cargarTablas;
+$('#pag-prev').onclick = () => { pagina--; pintarResultados(ultimo); };
+$('#pag-next').onclick = () => { pagina++; pintarResultados(ultimo); };
+$('#sql').addEventListener('keydown', e => {
+  if((e.ctrlKey||e.metaKey) && e.key === 'Enter'){ e.preventDefault(); ejecutar(); }
+});
+fetch('/api/health').then(r=>r.json()).then(d=>{
+  $('#pill-page').textContent = `página ${d.page_size} B · pool ${d.pool_pages}`;
+}).catch(()=>{});
+cargarTablas();
+</script>
+</body>
+</html>
