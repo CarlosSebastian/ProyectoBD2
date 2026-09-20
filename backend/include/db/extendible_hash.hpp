@@ -48,6 +48,10 @@ public:
                   "el directorio del hash no cabe en una pagina");
     static constexpr page_id_t DIR_PAGE = 1;
 
+    // Firma en la META, por el mismo motivo que en el arbol B+.
+    static constexpr std::int32_t MAGIC = 0x45484153;   // "EHAS"
+    static constexpr int OFF_MAGIC = 16;
+
     explicit ExtendibleHash(BufferPool* bp) : bp_(bp) {
         if (bp_->disk()->numPages() == 0) {
             page_id_t meta;
@@ -67,6 +71,19 @@ public:
             setNumBuckets(2);
             setDirEntry(0, b0);
             setDirEntry(1, b1);
+        }
+        if (bp_->disk()->numPages() > 0) {
+            char* m0 = bp_->fetchPage(0);
+            const std::int32_t magia = readAt<std::int32_t>(m0, OFF_MAGIC);
+            if (magia == 0) { writeAt<std::int32_t>(m0, OFF_MAGIC, MAGIC); bp_->unpinPage(0, true); }
+            else {
+                bp_->unpinPage(0, false);
+                if (magia != MAGIC)
+                    throw DBException(
+                        "El archivo de indice no contiene un hash extensible. "
+                        "Suele pasar cuando se reutiliza un .idx de otro tipo: "
+                        "borre el archivo y vuelva a crear el indice.");
+            }
         }
     }
 

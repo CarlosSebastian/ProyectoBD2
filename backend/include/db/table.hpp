@@ -66,7 +66,8 @@ public:
 
     const PlanInfo& lastPlan() const { return last_plan_; }
 
-    void buildIndex();                     // reconstruye el indice recorriendo los datos
+    void buildIndex();                     // vacia el indice y lo repuebla desde los datos
+    void recrearIndiceVacio();             // trunca el .idx y recrea la estructura
     bool reorganize(double fill_factor = -1.0);   // solo SEQUENTIAL; reconstruye el indice
 
     // Reorganizacion automatica al superar el umbral de overflow. Encendida

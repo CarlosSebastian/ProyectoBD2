@@ -43,6 +43,12 @@ public:
 
     static_assert(sizeof(K) <= 256, "clave demasiado grande para el nodo");
 
+    // Firma en la META: identifica el archivo como un arbol B+. Sin ella, un
+    // .idx que contenga otra estructura se lee como si fuera un arbol y el
+    // descenso acaba pidiendo una pagina que no existe.
+    static constexpr std::int32_t MAGIC = 0x42504C53;   // "BPLS"
+    static constexpr int OFF_MAGIC = 16;
+
     explicit BPlusTree(BufferPool* bp) : bp_(bp) {
         if (bp_->disk()->numPages() == 0) {
             page_id_t meta;
@@ -51,7 +57,17 @@ public:
             writeAt<page_id_t>(m, 0, INVALID_PAGE_ID);
             writeAt<std::int32_t>(m, 4, 0);
             writeAt<std::int64_t>(m, 8, 0);
+            writeAt<std::int32_t>(m, OFF_MAGIC, MAGIC);
             bp_->unpinPage(meta, true);
+        } else {
+            const char* m = bp_->fetchPage(0);
+            const std::int32_t magia = readAt<std::int32_t>(m, OFF_MAGIC);
+            bp_->unpinPage(0, false);
+            if (magia != MAGIC)
+                throw DBException(
+                    "El archivo de indice no contiene un arbol B+. Suele pasar "
+                    "cuando se reutiliza un .idx de otro tipo: borre el archivo "
+                    "y vuelva a crear el indice.");
         }
     }
 

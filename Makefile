@@ -26,6 +26,8 @@ LDLIBS   :=
 # En Windows (MinGW) el servidor necesita enlazar contra Winsock.
 ifeq ($(OS),Windows_NT)
   LDLIBS += -lws2_32
+  # cpp-httplib exige Windows 10; MinGW declara una version mas vieja por defecto.
+  CXXFLAGS += -D_WIN32_WINNT=0x0A00
 endif
 
 BUILD := build

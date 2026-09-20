@@ -1,6 +1,6 @@
 # Resultados experimentales
 
-Generado por `benchmarks/run_experimentos.sh` el 2026-09-19 16:56.
+Generado por `benchmarks/run_experimentos.sh` el 2026-09-20 11:55.
 Dataset: 500000 filas sinteticas, claves barajadas con semilla fija.
 
 
@@ -13,11 +13,11 @@ Pagina de 4096 B | buffer pool de 64 paginas | claves desordenadas
 
 | Estructura | N=1000 | N=10000 | N=50000 | N=100000 | N=250000 | N=500000 |
 |---|---|---|---|---|---|---|
-| Heap File | 0 | 3 | 16 | 32 | 82 | 169 |
-| Sequential sin reorg. | 12 | 7141 | no termina | no termina | no termina | no termina |
-| Sequential con reorg. | 3 | 45 | 453 | 1254 | 4122 | 10828 |
-| Heap + B+ Tree | 1 | 6 | 73 | 197 | 630 | 1485 |
-| Heap + Hash dinamico | 0 | 4 | 63 | 172 | 553 | 1568 |
+| Heap File | 1 | 4 | 22 | 46 | 124 | 255 |
+| Sequential sin reorg. | 16 | 39489 | no termina | no termina | no termina | no termina |
+| Sequential con reorg. | 63 | 106 | 881 | 2664 | 9321 | 25554 |
+| Heap + B+ Tree | 1 | 7 | 186 | 525 | 2000 | 4821 |
+| Heap + Hash dinamico | 1 | 10 | 172 | 505 | 1888 | 5670 |
 
 ### Escrituras de disco (bloques de 4096 B)
 
@@ -33,20 +33,20 @@ Pagina de 4096 B | buffer pool de 64 paginas | claves desordenadas
 
 | Estructura | N alcanzado | Paginas | us/tupla | Reorganizaciones |
 |---|---|---|---|---|
-| Heap File | 500000 | 5409 | 0.34 | 0 |
-| Sequential sin reorg. | 10000 | 128 | 714.15 | 0 |
-| Sequential con reorg. | 500000 | 6840 | 21.66 | 17 |
-| Heap + B+ Tree | 500000 | 8263 | 2.97 | 0 |
-| Heap + Hash dinamico | 500000 | 7618 | 3.14 | 0 |
+| Heap File | 500000 | 5409 | 0.51 | 0 |
+| Sequential sin reorg. | 10000 | 128 | 3948.92 | 0 |
+| Sequential con reorg. | 500000 | 6840 | 51.11 | 17 |
+| Heap + B+ Tree | 500000 | 8263 | 9.64 | 0 |
+| Heap + Hash dinamico | 500000 | 7618 | 11.34 | 0 |
 
 ### Degradacion del Sequential File SIN reorganizacion
 
 | N | Tiempo (ms) | us/tupla | Lecturas de disco |
 |---|---|---|---|
-| 1000 | 12 | 12.0 | 0 |
-| 5000 | 336 | 67.3 | 0 |
-| 10000 | 7511 | 751.1 | 6058793 |
-| 20000 | 65191 | 3259.5 | 55299674 |
+| 1000 | 17 | 16.9 | 0 |
+| 5000 | 498 | 99.5 | 0 |
+| 10000 | 20728 | 2072.8 | 6058793 |
+| 20000 | 178835 | 8941.7 | 55299674 |
 
 El costo por tupla crece con N, asi que el costo total es cuadratico:
 toda la carga cae en una unica cadena de overflow que hay que recorrer
@@ -75,10 +75,10 @@ N = 100000 registros | 1000 consultas aleatorias | pagina de 4096 B | buffer poo
 
 | Metodo | Media | Desv. estandar | Speedup vs full scan |
 |---|---|---|---|
-| Full Scan (Heap) | 20.6174 | 0.5786 | 1.0x |
-| Busqueda Binaria (Sequential) | 0.0398 | 0.0106 | 517.9x |
-| Arbol B+ | 0.0042 | 0.0022 | 4930.1x |
-| Hash dinamico | 0.0040 | 0.0026 | 5200.3x |
+| Full Scan (Heap) | 33.6934 | 1.4253 | 1.0x |
+| Busqueda Binaria (Sequential) | 0.0908 | 0.0289 | 371.1x |
+| Arbol B+ | 0.0108 | 0.0291 | 3108.5x |
+| Hash dinamico | 0.0092 | 0.0050 | 3651.5x |
 
 ### Verificacion y tamano
 
@@ -113,9 +113,9 @@ N = 100000 registros | 20 consultas por selectividad | pagina de 4096 B | buffer
 
 | Metodo | 0.1 % | 1.0 % | 5.0 % | 10.0 % | 25.0 % |
 |---|---|---|---|---|---|
-| Full Scan (Heap) | 21.437 | 21.835 | 23.378 | 24.452 | 28.291 |
-| Sequential File | 0.140 | 0.871 | 3.350 | 6.439 | 15.755 |
-| Arbol B+ | 0.291 | 1.546 | 7.735 | 15.600 | 37.991 |
+| Full Scan (Heap) | 35.122 | 37.349 | 41.602 | 42.535 | 49.181 |
+| Sequential File | 0.197 | 1.384 | 6.870 | 13.721 | 34.671 |
+| Arbol B+ | 0.547 | 5.200 | 26.280 | 53.912 | 129.181 |
 
 ### Filas devueltas por consulta (verificacion)
 
@@ -129,15 +129,15 @@ N = 100000 registros | 20 consultas por selectividad | pagina de 4096 B | buffer
 
 | Metodo | 0.1 % | 1.0 % | 5.0 % | 10.0 % | 25.0 % |
 |---|---|---|---|---|---|
-| Sequential File | 153.5x | 25.1x | 7.0x | 3.8x | 1.8x |
-| Arbol B+ | 73.6x | 14.1x | 3.0x | 1.6x | 0.7x |
+| Sequential File | 178.4x | 27.0x | 6.1x | 3.1x | 1.4x |
+| Arbol B+ | 64.3x | 7.2x | 1.6x | 0.8x | 0.4x |
 
 ### Punto de cruce con el full scan
 
 | Metodo | Cruce (selectividad) |
 |---|---|
 | Sequential File | no cruza hasta el 25 % |
-| Arbol B+ | 15.5 % |
+| Arbol B+ | 7.4 % |
 
 Las tres filas devuelven la misma cantidad de tuplas, asi que la comparacion
 es justa: los tres metodos entregan las filas completas, no solo sus RID.
@@ -155,7 +155,7 @@ por clave son fisicamente vecinas, asi que un rango es lectura casi secuencial.
 Por eso gana al B+ en todas las selectividades a pesar de no tener indice.
 
 Conclusion para el planificador: sobre un heap, un IndexRangeScan solo conviene
-por debajo de 15.5 % de selectividad;
+por debajo de 7.4 % de selectividad;
 pasado ese umbral deberia elegir SeqScan.
 Es la misma regla que aplican los optimizadores reales.
 

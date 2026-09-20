@@ -30,9 +30,15 @@ POOL=${POOL:-64}
 FLAGS="-std=c++17 -O2 -Wall -Wextra -Ibackend/include -DDB_PAGE_SIZE=$PAGE"
 
 # Winsock solo en Windows (Git Bash / MSYS / Cygwin lo reportan en $OSTYPE).
+# Ademas hay que declarar Windows 10: MinGW asume una version mas vieja por
+# defecto y cpp-httplib corta la compilacion con
+#   #error "cpp-httplib doesn't support Windows 8 or lower"
 EXTRA_SRV="-pthread"
 case "$OSTYPE" in
-  msys*|cygwin*|win32*) EXTRA_SRV="-pthread -lws2_32" ;;
+  msys*|cygwin*|win32*)
+    EXTRA_SRV="-pthread -lws2_32"
+    FLAGS="$FLAGS -D_WIN32_WINNT=0x0A00"
+    ;;
 esac
 
 # Extension del ejecutable: .exe en Windows, nada en Linux/Mac.

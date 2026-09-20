@@ -2,6 +2,7 @@
 //  test_sql.cpp - Parser SQL y ejecutor (Database) de extremo a extremo
 // ============================================================================
 #include <filesystem>
+#include <fstream>
 #include <string>
 
 #include "db/database.hpp"
@@ -259,6 +260,50 @@ int main() {
         QueryResult tras = db2.execute("SELECT * FROM f");
         CHECK(tras.ok, "tras reiniciar el servidor la tabla sigue accesible");
         CHECK_EQ(tras.rows.size(), static_cast<std::size_t>(2), "con las dos filas");
+    }
+
+    // ---------------------------------------------------------------------
+    //  REGRESION: un .idx que quedo de un indice ANTERIOR, de otro tipo.
+    //  CREATE INDEX no truncaba el archivo, asi que el constructor del B+ veia
+    //  un archivo no vacio, reutilizaba la META de un hash y el descenso
+    //  terminaba pidiendo una pagina inexistente:
+    //      "readPage: pagina fuera de rango: 245"
+    //  Ahora cada indice firma su META, y un archivo del tipo equivocado se
+    //  descarta y se reconstruye desde los datos.
+    // ---------------------------------------------------------------------
+    {
+        SECTION("un .idx viejo de otro tipo no inutiliza la tabla");
+        const std::string DIR = "data/test_sql_idxviejo";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        {
+            Database db(DIR);
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, v CHAR(20))");
+            for (int i = 1; i <= 300; ++i)
+                db.execute("INSERT INTO t VALUES (" + std::to_string(i) + ", 'x')");
+            QueryResult h = db.execute("CREATE INDEX ix ON t (id) USING HASH");
+            CHECK(h.ok, "se crea primero un indice HASH");
+            CHECK_EQ(db.execute("SELECT * FROM t WHERE id = 150").rows.size(),
+                     static_cast<std::size_t>(1), "el hash responde");
+        }
+        // El catalogo pasa a declarar BPLUS, pero el .idx sigue siendo el hash.
+        {
+            std::ofstream c(DIR + "/catalog.txt", std::ios::trunc);
+            c << "TABLE t t.dat HEAP id\n"
+                 "COL id INT 0\n"
+                 "COL v VARCHAR 20\n"
+                 "INDEX id BPLUS t_id.idx\n"
+                 "END\n";
+        }
+        {
+            Database db(DIR);
+            QueryResult r = db.execute("SELECT * FROM t WHERE id = 150");
+            CHECK(r.ok, std::string("la tabla sigue accesible") + (r.ok ? "" : " -> " + r.error));
+            CHECK_EQ(r.rows.size(), static_cast<std::size_t>(1), "y devuelve la fila correcta");
+            CHECK_EQ(r.metodo, std::string("INDEX BPLUS"), "reconstruido como B+, que es lo que dice el catalogo");
+            CHECK_EQ(db.execute("SELECT * FROM t WHERE id > 297").rows.size(),
+                     static_cast<std::size_t>(3), "y los rangos tambien funcionan");
+        }
     }
 
     DONE("test_sql");

@@ -63,12 +63,21 @@ Table::Table(const std::string& data_dir, const TableInfo& info, int pool_size) 
         idx_disk_ = std::make_unique<DiskManager>(joinPath(data_dir, ix.file));
         idx_bp_   = std::make_unique<BufferPool>(idx_disk_.get(), pool_size);
 
-        if (ix.kind == IndexKind::BPLUS) {
-            if (kt == Type::INT) bt_int_ = std::make_unique<BPlusTree<std::int64_t>>(idx_bp_.get());
-            else                 bt_str_ = std::make_unique<BPlusTree<Key32>>(idx_bp_.get());
-        } else {
-            if (kt == Type::INT) hs_int_ = std::make_unique<ExtendibleHash<std::int64_t>>(idx_bp_.get());
-            else                 hs_str_ = std::make_unique<ExtendibleHash<Key32>>(idx_bp_.get());
+        try {
+            if (ix.kind == IndexKind::BPLUS) {
+                if (kt == Type::INT) bt_int_ = std::make_unique<BPlusTree<std::int64_t>>(idx_bp_.get());
+                else                 bt_str_ = std::make_unique<BPlusTree<Key32>>(idx_bp_.get());
+            } else {
+                if (kt == Type::INT) hs_int_ = std::make_unique<ExtendibleHash<std::int64_t>>(idx_bp_.get());
+                else                 hs_str_ = std::make_unique<ExtendibleHash<Key32>>(idx_bp_.get());
+            }
+        } catch (const DBException&) {
+            // El .idx que hay en disco no es del tipo que declara el catalogo:
+            // es un archivo viejo que quedo de un indice anterior. El catalogo
+            // manda, y un indice siempre se puede reconstruir desde los datos,
+            // asi que se tira el archivo y se repuebla en vez de dejar la tabla
+            // inaccesible.
+            buildIndex();
         }
     }
 }
@@ -244,8 +253,32 @@ std::vector<Tuple> Table::scan() {
 }
 
 // ---------------------------------------------------------------------------
+// Vacia el archivo de indice y recrea la estructura desde cero.
+// Es OBLIGATORIO antes de repoblar: si el .idx ya existia, el constructor del
+// B+ o del Hash ve que el archivo no esta vacio y NO lo inicializa, sino que
+// reutiliza la META que encuentre. Con un archivo del tipo equivocado --por
+// ejemplo un indice hash que se vuelve a declarar como BTREE-- eso hace que el
+// arbol lea bytes de otra estructura y termine pidiendo una pagina inexistente.
+void Table::recrearIndiceVacio() {
+    if (key_col_ < 0 || !idx_disk_ || info_.indexes.empty()) return;
+    idx_bp_->invalidateAll();
+    idx_disk_->truncate();
+    bt_int_.reset(); bt_str_.reset(); hs_int_.reset(); hs_str_.reset();
+
+    const IndexInfo& ix = info_.indexes.front();
+    const Type kt = info_.schema[key_col_].type;
+    if (ix.kind == IndexKind::BPLUS) {
+        if (kt == Type::INT) bt_int_ = std::make_unique<BPlusTree<std::int64_t>>(idx_bp_.get());
+        else                 bt_str_ = std::make_unique<BPlusTree<Key32>>(idx_bp_.get());
+    } else {
+        if (kt == Type::INT) hs_int_ = std::make_unique<ExtendibleHash<std::int64_t>>(idx_bp_.get());
+        else                 hs_str_ = std::make_unique<ExtendibleHash<Key32>>(idx_bp_.get());
+    }
+}
+
 void Table::buildIndex() {
     if (key_col_ < 0) return;
+    recrearIndiceVacio();
     for (const RID& rid : engine_->scanAll()) {
         Tuple t;
         if (getByRID(rid, t)) insertIntoIndex(t.values[key_col_], rid);
@@ -259,21 +292,8 @@ bool Table::reorganize(double fill_factor) {
     // reorganize() reescribe el area principal, asi que TODOS los RID cambian.
     // Cualquier indice que apunte a esta tabla queda invalido y hay que
     // reconstruirlo desde cero.
-    if (key_col_ >= 0 && idx_disk_) {
-        idx_bp_->invalidateAll();
-        idx_disk_->truncate();
-        const IndexInfo& ix = info_.indexes.front();
-        Type kt = info_.schema[key_col_].type;
-        bt_int_.reset(); bt_str_.reset(); hs_int_.reset(); hs_str_.reset();
-        if (ix.kind == IndexKind::BPLUS) {
-            if (kt == Type::INT) bt_int_ = std::make_unique<BPlusTree<std::int64_t>>(idx_bp_.get());
-            else                 bt_str_ = std::make_unique<BPlusTree<Key32>>(idx_bp_.get());
-        } else {
-            if (kt == Type::INT) hs_int_ = std::make_unique<ExtendibleHash<std::int64_t>>(idx_bp_.get());
-            else                 hs_str_ = std::make_unique<ExtendibleHash<Key32>>(idx_bp_.get());
-        }
-        buildIndex();
-    }
+    // buildIndex() ya vacia y recrea el indice antes de repoblarlo.
+    if (key_col_ >= 0 && idx_disk_) buildIndex();
     return true;
 }
 
