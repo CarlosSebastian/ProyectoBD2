@@ -71,10 +71,6 @@ benchmarks/
   graficas.py            genera las figuras del informe
   run_experimentos.sh    corre los cuatro y escribe resultados.md
   resultados.md          salida cruda de la última corrida
-informe/
-  informe.tex            informe técnico
-  informe.pdf            compilado (13 páginas)
-  figuras/               las cinco figuras
 data/              archivos binarios generados (ignorados por git)
                    .gitkeep documenta que hay dentro
 ```
@@ -155,23 +151,3 @@ Los slots son *append-only*: un insert nunca desplaza entradas del directorio,
 así que los RID que ya recibió un índice siguen siendo válidos. Al borrar se
 compacta la página pero el índice del slot se conserva.
 
-## Estado frente al Entregable 1
-
-El mapeo requisito por requisito del enunciado, con las decisiones de diseño
-justificadas y las limitaciones conocidas, está en el informe
-([`informe/informe.tex`](informe/informe.tex), secciones 9 y 10). Resumen:
-
-| Componente | Estado |
-|---|---|
-| Páginas de tamaño fijo, RID, DiskCounter | listo |
-| Heap File (slotted pages, longitud variable) | listo |
-| B+ Tree multinivel en disco | listo |
-| Hashing dinámico (Extendible) | listo |
-| Parser SQL + planificador + telemetría | listo |
-| API REST + cliente web de 4 paneles | listo |
-| Sequential File (overflow + reorganize) | listo |
-| Page header completo con `next/prev_page_id` | listo |
-| Los 4 experimentos sobre ≥100 k registros | listo |
-| Gráficas e informe LaTeX | listo |
-| Video demostrativo (5–10 min) | **pendiente** |
-| Repo en GitHub con acceso al docente | **pendiente** |
