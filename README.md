@@ -22,20 +22,19 @@ Opciones útiles:
 
 ```bash
 ./benchmarks/run_experimentos.sh   # los 4 experimentos -> benchmarks/resultados.md
-python3 benchmarks/graficas.py     # regenera las figuras del informe
-cd informe && latexmk -pdf informe.tex   # recompila el informe
 make run PORT=9000                 # otro puerto
 ./build/dbserver --pool 8          # buffer pool pequeño: hace visible el I/O físico
-make test                          # 6 suites de tests (4358 verificaciones)
+make test                          # 6 suites de tests (4364 verificaciones)
 make bench                         # corre los cuatro experimentos
 make demo                          # recorrido end-to-end por consola
 make PAGE=8192 bench               # Experimento 4: variar el tamaño de bloque
 
 # Inspeccionar los binarios por dentro (lo que pide el video):
-./build/dump_page data/empleados.dat 0        # cabecera + directorio de slots
-./build/dump_page data/empleados.dat --resumen  # una línea por página
-./build/dump_page data/empleados_id.idx 1     # nodo del índice B+ o bucket del hash
-./build/dump_page data/empleados.dat 0 --hex  # los 4096 bytes completos
+# Los archivos se nombran según la tabla: CREATE TABLE ventas -> data/ventas.dat
+./build/dump_page data/<tabla>.dat 0            # cabecera + directorio de slots
+./build/dump_page data/<tabla>.dat --resumen    # una línea por página
+./build/dump_page data/<tabla>_<columna>.idx 1  # nodo del B+ o bucket del hash
+./build/dump_page data/<tabla>.dat 0 --hex      # los 4096 bytes completos
 ```
 
 Requiere `g++` con C++17. **Si no tienes `make`** (por ejemplo en Git Bash),
@@ -68,7 +67,6 @@ frontend/
 benchmarks/
   gen_dataset.cpp        generador del dataset sintético
   exp1..exp4_*.cpp       los cuatro experimentos del enunciado
-  graficas.py            genera las figuras del informe
   run_experimentos.sh    corre los cuatro y escribe resultados.md
   resultados.md          salida cruda de la última corrida
 data/              archivos binarios generados (ignorados por git)
@@ -121,16 +119,9 @@ entera y `disk_reads` cae a cero, pero `page_accesses` sigue mostrando la
 diferencia real entre `IndexScan` y `SeqScan`. Es la misma separación que hace
 `EXPLAIN (BUFFERS)` de PostgreSQL entre *shared hit* y *read*.
 
-Ejemplo medido con 3 000 filas y un pool de 8 páginas:
-
-| Consulta | Método | Accesos a página | Lecturas físicas |
-|---|---|---|---|
-| `WHERE id = 1500` (indexada) | INDEX BPLUS | 5 | 2 |
-| `WHERE dept = 'Dept3'` (sin índice) | SEQ SCAN | 3 030 | 60 |
-
 ## Rutas de acceso
 
-El planificador elige entre tres, en este orden:
+El planificador elige entre cuatro, en este orden:
 
 1. **IndexScan / IndexRangeScan** — hay un índice B+ o Hash sobre la columna.
 2. **Búsqueda binaria secuencial** — el motor es `SEQUENTIAL` y la columna es la
