@@ -30,7 +30,7 @@
 
 namespace bench {
 
-using Clock = std::chrono::high_resolution_clock;
+using Clock = std::chrono::steady_clock;
 
 struct Fila {
     std::int64_t id;

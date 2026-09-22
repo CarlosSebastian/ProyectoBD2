@@ -124,6 +124,15 @@ RID Table::insert(const Tuple& t) {
     // registros, asi que hacerlo despues devolveria un RID ya invalido.
     if (seq_ && auto_reorg_ && seq_->necesitaReorganizacion()) reorganize();
 
+     // Restriccion de PRIMARY KEY: no se admite un segundo registro con la misma clave 
+    if (!info_.key_column.empty()) {
+        int pki = info_.schema.indexOf(info_.key_column);
+        if (pki >= 0 && !searchRIDsEq(info_.key_column, t.values[static_cast<std::size_t>(pki)]).empty()) {
+            throw DBException("Violacion de PRIMARY KEY: ya existe un registro con " +
+                              info_.key_column + " = " + t.values[static_cast<std::size_t>(pki)].str());
+        }
+    }
+
     std::string bytes = serializeTuple(info_.schema, t);
     RID rid = engine_->insert(bytes);
     if (key_col_ >= 0) insertIntoIndex(t.values[key_col_], rid);
