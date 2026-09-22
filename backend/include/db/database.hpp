@@ -68,6 +68,7 @@ public:
     int poolSize() const { return pool_size_; }
 
     QueryResult               execute(const std::string& sql);
+    std::vector<QueryResult>  executeMultiple(const std::string& sql);      // varias, separadas por ';'
 
     // Vuelca a disco las paginas sucias de todas las tablas abiertas.
     void                      flush();
@@ -79,7 +80,7 @@ public:
 private:
     Table* abrir(const std::string& nombre);
     void   cerrar(const std::string& nombre);
-
+    QueryResult ejecutarStatement(const Statement& st);   
     QueryResult ejecutarCreateTable(const Statement& st);
     QueryResult ejecutarCreateIndex(const Statement& st);
     QueryResult ejecutarInsert(const Statement& st);

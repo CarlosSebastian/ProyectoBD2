@@ -268,9 +268,9 @@ async function ejecutar(){
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({sql})
     });
-    const d = await r.json();
-    ultimo = d; pagina = 0;
-    pintarMensaje(d); pintarResultados(d); pintarPlan(d);
+    const resp = await r.json();
+    ultimo = resp; pagina = 0;
+    pintarMensaje(resp); pintarResultados(resp); pintarPlan(resp);
     cargarTablas();
   }catch(e){
     $('#mensaje').innerHTML = `<div class="msg err">Error de red: ${escapar(e.message)}</div>`;
@@ -279,15 +279,32 @@ async function ejecutar(){
   }
 }
 
-function pintarMensaje(d){
+function pintarMensaje(resp){
   const m = $('#mensaje');
-  if(!d.ok)            m.innerHTML = `<div class="msg err">${escapar(d.error)}</div>`;
-  else if(d.message)   m.innerHTML = `<div class="msg ok">${escapar(d.message)}</div>`;
-  else                 m.innerHTML = '';
+  const items = resp.statements || [];
+  if (items.length <= 1) {
+    const d = items[0] || resp;
+    if (!d.ok)            m.innerHTML = `<div class="msg err">${escapar(d.error)}</div>`;
+    else if (d.message)   m.innerHTML = `<div class="msg ok">${escapar(d.message)}</div>`;
+    else                  m.innerHTML = '';
+    return;
+  }
+  // varias sentencias: una linea por cada una
+  m.innerHTML = items.map((d, i) => {
+    const cls = d.ok ? 'ok' : 'err';
+    const txt = d.ok ? (d.message || 'OK') : d.error;
+    return `<div class="msg ${cls}"><code>#${i+1}</code> ${escapar(txt)}</div>`;
+  }).join('');
 }
-
 // ---------- Panel 3 ----------
-function pintarResultados(d){
+function ultimaVistaDe(resp){
+  const items = resp.statements || [resp];
+  // preferir la ultima que trajo columnas (un SELECT); si no hay, la ultima de todas
+  for (let i = items.length - 1; i >= 0; i--) if (items[i].columns && items[i].columns.length) return items[i];
+  return items[items.length - 1];
+}
+function pintarResultados(resp){
+  const d = ultimaVistaDe(resp);
   const cont = $('#resultados'), pag = $('#paginacion');
   $('#res-count').textContent = d.ok && d.columns.length ? `· ${d.row_count} fila(s)` : '';
   if(!d.ok || !d.columns.length){
@@ -309,7 +326,8 @@ function pintarResultados(d){
 }
 
 // ---------- Panel 4 ----------
-function pintarPlan(d){
+function pintarPlan(resp){
+  const d = ultimaVistaDe(resp);
   const cont = $('#plan');
   if(!d.ok){ cont.innerHTML = '<div class="vacio">La consulta falló: no hay plan.</div>'; return; }
   const maxMs = Math.max(...d.plan.map(p=>p.ms), 0.0001);

@@ -95,7 +95,22 @@ class Parser {
 public:
     explicit Parser(std::vector<Token> ts) : ts_(std::move(ts)) {}
 
-    Statement parse() {
+    Statement parse() {                       //una sola sentencia
+        Statement st = parseOne();
+        if (cur().tipo != Tok::END)
+            throw DBException("Texto sobrante tras el final de la sentencia: '" + cur().texto + "'");
+        return st;
+    }
+
+    std::vector<Statement> parseAll() {       //varias sentencias separadas por ';'
+        std::vector<Statement> out;
+        while (cur().tipo != Tok::END) out.push_back(parseOne());
+        if (out.empty()) throw DBException("Consulta vacia");
+        return out;
+    }
+
+private:
+    Statement parseOne() {
         Statement st;
         std::string k = esperaIdent();
         if (k == "CREATE") {
@@ -110,8 +125,6 @@ public:
         throw DBException("Sentencia no soportada: '" + k +
                           "'. Se admiten CREATE TABLE, CREATE INDEX, INSERT, SELECT y DELETE.");
     }
-
-private:
     const Token& cur() const { return ts_[p_]; }
     void avanza() { if (p_ + 1 < ts_.size()) ++p_; }
 
@@ -221,27 +234,33 @@ private:
         return st;
     }
 
-    Statement parseInsert() {
-        Statement st;
-        st.kind = StmtKind::INSERT;
-        esperaPalabra("INTO");
-        st.table = esperaNombre();
-        if (esSimbolo("(")) {                       // lista de columnas: se acepta y se ignora
-            avanza();
-            while (!esSimbolo(")")) { avanza(); if (cur().tipo == Tok::END) throw DBException("INSERT mal formado"); }
-            avanza();
-        }
-        esperaPalabra("VALUES");
+Statement parseInsert() {
+    Statement st;
+    st.kind = StmtKind::INSERT;
+    esperaPalabra("INTO");
+    st.table = esperaNombre();
+    if (esSimbolo("(")) {                       // lista de columnas: se acepta y se ignora
+        avanza();
+        while (!esSimbolo(")")) { avanza(); if (cur().tipo == Tok::END) throw DBException("INSERT mal formado"); }
+        avanza();
+    }
+    esperaPalabra("VALUES");
+    while (true) {
         esperaSimbolo("(");
+        std::vector<Value> fila;
         while (true) {
-            st.values.push_back(esperaLiteral());
+            fila.push_back(esperaLiteral());
             if (esSimbolo(",")) { avanza(); continue; }
             break;
         }
         esperaSimbolo(")");
-        finSentencia();
-        return st;
+        st.rows.push_back(std::move(fila));
+        if (esSimbolo(",")) { avanza(); continue; }   // viene otra tupla: (...), (...)
+        break;
     }
+    finSentencia();
+    return st;
+}
 
     Statement parseSelect() {
         Statement st;
@@ -331,8 +350,6 @@ private:
 
     void finSentencia() {
         if (esSimbolo(";")) avanza();
-        if (cur().tipo != Tok::END)
-            throw DBException("Texto sobrante tras el final de la sentencia: '" + cur().texto + "'");
     }
 
     std::vector<Token> ts_;
@@ -348,4 +365,10 @@ Statement parseSQL(const std::string& sql) {
     return p.parse();
 }
 
+std::vector<Statement> parseSQLMultiple(const std::string& sql) {
+    std::vector<Token> ts = tokenize(sql);
+    if (ts.size() <= 1) throw DBException("Consulta vacia");
+    Parser p(std::move(ts));
+    return p.parseAll();
+}
 }  // namespace db

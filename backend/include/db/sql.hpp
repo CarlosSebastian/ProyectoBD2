@@ -69,7 +69,7 @@ struct Statement {
     IndexKind   index_kind = IndexKind::BPLUS;
 
     // INSERT
-    std::vector<Value> values;
+    std::vector<std::vector<Value>> rows; 
 
     // SELECT / DELETE
     std::vector<std::string> select_columns;   // vacio => SELECT *
@@ -78,6 +78,7 @@ struct Statement {
 };
 
 // Lanza DBException con un mensaje legible si la sentencia no es valida.
-Statement parseSQL(const std::string& sql);
+Statement parseSQL(const std::string& sql);                     // una sola sentencia (comportamiento actual)
+std::vector<Statement> parseSQLMultiple(const std::string& sql); // varias, separadas por ';'
 
 }  // namespace db
