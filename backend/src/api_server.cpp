@@ -68,7 +68,29 @@ static std::string resultToJson(const QueryResult& r) {
        << "}";
     return os.str();
 }
-
+static std::string resultsToJson(const std::vector<QueryResult>& rs) {
+    std::vector<std::string> items;
+    bool todo_ok = true;
+    long long dr = 0, dw = 0, pa = 0, bh = 0;
+    double total_ms = 0.0;
+    for (const QueryResult& r : rs) {
+        items.push_back(resultToJson(r));
+        if (!r.ok) todo_ok = false;
+        dr += r.disk_reads; dw += r.disk_writes;
+        pa += r.page_accesses; bh += r.buffer_hits;
+        total_ms += r.total_ms;
+    }
+    std::ostringstream os;
+    os << "{\"ok\":" << (todo_ok ? "true" : "false")
+       << ",\"statements\":" << json::arr(items)
+       << ",\"disk_reads\":" << dr
+       << ",\"disk_writes\":" << dw
+       << ",\"page_accesses\":" << pa
+       << ",\"buffer_hits\":" << bh
+       << ",\"total_ms\":" << json::num(total_ms)
+       << "}";
+    return os.str();
+}
 static std::string tablesToJson(const std::vector<TableSummary>& ts) {
     std::vector<std::string> items;
     for (const TableSummary& t : ts) {
@@ -127,8 +149,8 @@ int main(int argc, char** argv) {
         std::string sql;
         if (!json::getString(req.body, "sql", &sql)) sql = req.body;   // tambien acepta texto plano
         std::lock_guard<std::mutex> lock(mtx);
-        QueryResult r = db.execute(sql);
-        res.set_content(resultToJson(r), "application/json");
+        std::vector<QueryResult> rs = db.executeMultiple(sql);
+        res.set_content(resultsToJson(rs), "application/json");
     });
 
     srv.Get("/api/tables", [&](const httplib::Request&, httplib::Response& res) {

@@ -94,6 +94,64 @@ void Database::cerrar(const std::string& nombre) { abiertas_.erase(nombre); }
 void Database::flush() {
     for (auto& par : abiertas_) if (par.second) par.second->flush();
 }
+QueryResult Database::ejecutarStatement(const Statement& st) {
+    QueryResult r;
+    switch (st.kind) {
+        case StmtKind::CREATE_TABLE: r = ejecutarCreateTable(st); break;
+        case StmtKind::CREATE_INDEX: r = ejecutarCreateIndex(st); break;
+        case StmtKind::INSERT:       r = ejecutarInsert(st);      break;
+        case StmtKind::SELECT:       r = ejecutarSelect(st);      break;
+        case StmtKind::DELETE_:      r = ejecutarDelete(st);      break;
+    }
+    if (st.kind == StmtKind::CREATE_TABLE || st.kind == StmtKind::CREATE_INDEX ||
+        st.kind == StmtKind::INSERT       || st.kind == StmtKind::DELETE_) {
+        flush();
+    }
+    return r;
+}
+
+std::vector<QueryResult> Database::executeMultiple(const std::string& sql) {
+    std::vector<QueryResult> out;
+
+    std::vector<Statement> sts;
+    try {
+        auto t_parse = Clock::now();
+        sts = parseSQLMultiple(sql);
+        double parse_total = msDesde(t_parse);
+        // el tiempo de parseo se reparte informativamente entre sentencias
+        for (auto& _ : sts) (void)_;
+        (void)parse_total;
+    } catch (const DBException& e) {
+        QueryResult r; r.ok = false; r.error = e.what();
+        out.push_back(r);
+        return out;
+    }
+
+    for (const Statement& st : sts) {
+        QueryResult r;
+        auto t_ini = Clock::now();
+        DiskCounter::Snapshot io0 = DiskCounter::global().snapshot();
+        try {
+            r = ejecutarStatement(st);
+            r.ok = true;
+        } catch (const DBException& e) {
+            r.ok = false; r.error = e.what();
+        } catch (const std::exception& e) {
+            r.ok = false; r.error = std::string("Error interno: ") + e.what();
+        }
+        DiskCounter::Delta d = DiskCounter::global().since(io0);
+        r.disk_reads = d.reads; r.disk_writes = d.writes;
+        r.page_accesses = d.page_accesses; r.buffer_hits = d.buffer_hits;
+        r.total_ms = msDesde(t_ini);
+        out.push_back(r);
+
+        // Si una sentencia falla a mitad del bloque, las siguientes igual se
+        // intentan (semántica "best effort"); si prefieres abortar todo el
+        // bloque al primer error, descomenta:
+        // if (!r.ok) break;
+    }
+    return out;
+}
 
 QueryResult Database::execute(const std::string& sql) {
     QueryResult r;
@@ -104,38 +162,22 @@ QueryResult Database::execute(const std::string& sql) {
         auto t_parse = Clock::now();
         Statement st = parseSQL(sql);
         r.parse_ms = msDesde(t_parse);
-        r.plan.push_back(PlanStep{"Parse SQL", r.parse_ms, ""});
 
-        switch (st.kind) {
-            case StmtKind::CREATE_TABLE: { QueryResult x = ejecutarCreateTable(st); x.plan.insert(x.plan.begin(), r.plan.begin(), r.plan.end()); x.parse_ms = r.parse_ms; r = x; break; }
-            case StmtKind::CREATE_INDEX: { QueryResult x = ejecutarCreateIndex(st); x.plan.insert(x.plan.begin(), r.plan.begin(), r.plan.end()); x.parse_ms = r.parse_ms; r = x; break; }
-            case StmtKind::INSERT:       { QueryResult x = ejecutarInsert(st);      x.plan.insert(x.plan.begin(), r.plan.begin(), r.plan.end()); x.parse_ms = r.parse_ms; r = x; break; }
-            case StmtKind::SELECT:       { QueryResult x = ejecutarSelect(st);      x.plan.insert(x.plan.begin(), r.plan.begin(), r.plan.end()); x.parse_ms = r.parse_ms; r = x; break; }
-            case StmtKind::DELETE_:      { QueryResult x = ejecutarDelete(st);      x.plan.insert(x.plan.begin(), r.plan.begin(), r.plan.end()); x.parse_ms = r.parse_ms; r = x; break; }
-        }
-        // Las sentencias que mutan se bajan a disco en cuanto terminan: la
-        // unica durabilidad hasta ahora era el destructor de BufferPool, y un
-        // Ctrl+C sobre el servidor (que es como el README dice que se detiene)
-        // mata el proceso sin ejecutar destructores.
-        if (st.kind == StmtKind::CREATE_TABLE || st.kind == StmtKind::CREATE_INDEX ||
-            st.kind == StmtKind::INSERT       || st.kind == StmtKind::DELETE_) {
-            flush();
-        }
+        QueryResult x = ejecutarStatement(st);
+        x.plan.insert(x.plan.begin(), PlanStep{"Parse SQL", r.parse_ms, ""});
+        x.parse_ms = r.parse_ms;
+        r = x;
         r.ok = true;
     } catch (const DBException& e) {
-        r.ok    = false;
-        r.error = e.what();
+        r.ok = false; r.error = e.what();
     } catch (const std::exception& e) {
-        r.ok    = false;
-        r.error = std::string("Error interno: ") + e.what();
+        r.ok = false; r.error = std::string("Error interno: ") + e.what();
     }
 
     DiskCounter::Delta d = DiskCounter::global().since(io0);
-    r.disk_reads    = d.reads;
-    r.disk_writes   = d.writes;
-    r.page_accesses = d.page_accesses;
-    r.buffer_hits   = d.buffer_hits;
-    r.total_ms    = msDesde(t_ini);
+    r.disk_reads = d.reads; r.disk_writes = d.writes;
+    r.page_accesses = d.page_accesses; r.buffer_hits = d.buffer_hits;
+    r.total_ms = msDesde(t_ini);
     return r;
 }
 
@@ -222,20 +264,34 @@ QueryResult Database::ejecutarInsert(const Statement& st) {
 
     Table* t = abrir(st.table);
     const Schema& sch = t->schema();
-    if (st.values.size() != sch.size())
-        throw DBException("INSERT con " + std::to_string(st.values.size()) + " valores pero la tabla "
-                          "tiene " + std::to_string(sch.size()) + " columnas");
 
-    Tuple tup;
-    for (std::size_t i = 0; i < sch.size(); ++i)
-        tup.values.push_back(coerce(st.values[i], sch[i].type, sch[i].name));
+    if (st.rows.empty())
+        throw DBException("INSERT sin ninguna tupla en VALUES");
 
-    RID rid = t->insert(tup);
+    long long insertadas = 0;
+    std::string ultimo_rid;
+    for (const std::vector<Value>& fila : st.rows) {
+        if (fila.size() != sch.size())
+            throw DBException("INSERT con " + std::to_string(fila.size()) + " valores pero la tabla "
+                              "tiene " + std::to_string(sch.size()) + " columnas");
 
-    r.metodo  = "DML";
-    r.message = "1 fila insertada en '" + st.table + "' con RID " + rid.str() + ".";
+        Tuple tup;
+        tup.values.reserve(sch.size());
+        for (std::size_t i = 0; i < sch.size(); ++i)
+            tup.values.push_back(coerce(fila[i], sch[i].type, sch[i].name));
+
+        RID rid = t->insert(tup);
+        ultimo_rid = rid.str();
+        ++insertadas;
+    }
+
+    r.metodo    = "DML";
+    r.row_count = insertadas;
+    r.message   = std::to_string(insertadas) + " fila(s) insertada(s) en '" + st.table + "'" +
+                  (insertadas == 1 ? " con RID " + ultimo_rid + "." : ".");
     r.exec_ms = msDesde(t0);
-    r.plan.push_back(PlanStep{"INSERT", r.exec_ms, "RID " + rid.str()});
+    r.plan.push_back(PlanStep{"INSERT", r.exec_ms,
+                              std::to_string(insertadas) + " fila(s), ultimo RID " + ultimo_rid});
     return r;
 }
 
