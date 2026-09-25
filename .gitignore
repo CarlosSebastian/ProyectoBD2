@@ -18,3 +18,8 @@ informe/figuras/*.png
 
 # Las figuras en PDF y el informe compilado SI se versionan: el enunciado
 # pide el PDF en el repositorio.
+
+# El informe y el script de graficas son entregables aparte, NO van al repo.
+# Ademas, al estar ignorados, 'git clean -fd' ya no los borra.
+informe/
+benchmarks/graficas.py

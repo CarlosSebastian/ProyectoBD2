@@ -24,7 +24,7 @@ Opciones útiles:
 ./benchmarks/run_experimentos.sh   # los 4 experimentos -> benchmarks/resultados.md
 make run PORT=9000                 # otro puerto
 ./build/dbserver --pool 8          # buffer pool pequeño: hace visible el I/O físico
-make test                          # 6 suites de tests (4364 verificaciones)
+make test                          # 6 suites de tests (4365 verificaciones)
 make bench                         # corre los cuatro experimentos
 make demo                          # recorrido end-to-end por consola
 make PAGE=8192 bench               # Experimento 4: variar el tamaño de bloque
@@ -82,11 +82,23 @@ CREATE TABLE empleados (id INT PRIMARY KEY, nombre CHAR(30),
                         dept CHAR(20), salario FLOAT) USING [HEAP|SEQUENTIAL];
 CREATE INDEX idx_emp_id ON empleados (id) USING [BTREE|HASH];
 INSERT INTO empleados VALUES (101, 'Ada Lovelace', 'Analytics', 5200.0);
+INSERT INTO empleados VALUES (102, 'Alan Turing', 'IA', 6100.0),
+                             (103, 'Grace Hopper', 'Compiladores', 5900.0);
 SELECT * FROM empleados WHERE id = 101;
 SELECT id, nombre FROM empleados WHERE id >= 100 AND id <= 500 LIMIT 50;
 SELECT * FROM empleados WHERE id BETWEEN 100 AND 500;
 DELETE FROM empleados WHERE id = 101;
 ```
+
+Una misma petición admite **varias sentencias separadas por punto y coma**: el
+parser devuelve la lista completa y el motor las ejecuta en orden, respondiendo
+con un resultado por cada una más los contadores de I/O sumados. El lote **no es
+atómico** (no hay gestor de transacciones): si una sentencia falla, las
+anteriores ya están aplicadas y las siguientes se ejecutan igualmente, cada una
+con su propio indicador de éxito.
+
+`PRIMARY KEY` impone unicidad: antes de insertar se hace una búsqueda puntual
+por la columna clave y la operación se rechaza si el valor ya existe.
 
 Con `USING SEQUENTIAL` el archivo queda **ordenado físicamente por la PRIMARY
 KEY**: las búsquedas sobre esa columna se resuelven con búsqueda binaria sobre

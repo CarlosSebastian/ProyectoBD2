@@ -54,10 +54,11 @@ int main() {
     {
         Statement st = parseSQL("INSERT INTO empleados VALUES (101, 'Ada Lovelace', 'Analytics', 5200.0);");
         CHECK_EQ(static_cast<int>(st.kind), static_cast<int>(StmtKind::INSERT), "tipo");
-        CHECK_EQ(st.values.size(), static_cast<std::size_t>(4), "cantidad de valores");
-        CHECK_EQ(st.values[0].i, static_cast<std::int64_t>(101), "entero");
-        CHECK_EQ(st.values[1].s, std::string("Ada Lovelace"), "cadena con espacio");
-        CHECK_EQ(st.values[3].d, 5200.0, "decimal");
+        CHECK_EQ(st.rows.size(), static_cast<std::size_t>(1), "cantidad de tuplas");
+        CHECK_EQ(st.rows[0].size(), static_cast<std::size_t>(4), "cantidad de valores");
+        CHECK_EQ(st.rows[0][0].i, static_cast<std::int64_t>(101), "entero");
+        CHECK_EQ(st.rows[0][1].s, std::string("Ada Lovelace"), "cadena con espacio");
+        CHECK_EQ(st.rows[0][3].d, 5200.0, "decimal");
     }
 
     SECTION("SELECT y predicados");
