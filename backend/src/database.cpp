@@ -28,6 +28,12 @@ static Value coerce(const Value& v, Type destino, const std::string& col) {
             throw DBException("La columna '" + col + "' es INT y se recibio el decimal " + v.str());
         return Value::makeInt(static_cast<std::int64_t>(v.d));
     }
+    // Un POINT no se convierte desde ningun otro tipo: o viene de POINT(x,y)
+    // o es un error del usuario. Lo mismo al reves.
+    if (destino == Type::POINT || v.type == Type::POINT)
+        throw DBException("La columna '" + col + "' es de tipo " + typeName(destino) +
+                          " y se recibio un valor " + typeName(v.type) +
+                          ". Los puntos se escriben POINT(x, y).");
     if (destino == Type::VARCHAR) return Value::makeStr(v.str());
     throw DBException("Tipo incompatible para la columna '" + col + "': se esperaba " + typeName(destino));
 }
@@ -50,6 +56,8 @@ static Value cotaMin(Type t) {
         case Type::INT:     return Value::makeInt(std::numeric_limits<std::int64_t>::min());
         case Type::DOUBLE:  return Value::makeDouble(-std::numeric_limits<double>::infinity());
         case Type::VARCHAR: return Value::makeStr("");
+        case Type::POINT:   return Value::makePoint(-std::numeric_limits<double>::infinity(),
+                                                    -std::numeric_limits<double>::infinity());
     }
     return Value::makeInt(0);
 }
@@ -58,6 +66,8 @@ static Value cotaMax(Type t) {
         case Type::INT:     return Value::makeInt(std::numeric_limits<std::int64_t>::max());
         case Type::DOUBLE:  return Value::makeDouble(std::numeric_limits<double>::infinity());
         case Type::VARCHAR: return Value::makeStr(std::string(31, '\x7f'));
+        case Type::POINT:   return Value::makePoint(std::numeric_limits<double>::infinity(),
+                                                    std::numeric_limits<double>::infinity());
     }
     return Value::makeInt(0);
 }
@@ -234,9 +244,19 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
     // luego el constructor de Table rechaza el tipo, el catalogo queda con un
     // indice imposible y la tabla se vuelve inaccesible PARA SIEMPRE: como no
     // hay DROP INDEX, solo se recupera editando catalog.txt a mano.
-    if (ti.schema[static_cast<std::size_t>(ci_ix)].type == Type::DOUBLE)
-        throw DBException("Aun no se indexan columnas DOUBLE: '" + st.index_column +
-                          "'. La tabla queda intacta.");
+    const Type tipo_ix = ti.schema[static_cast<std::size_t>(ci_ix)].type;
+    if (st.index_kind == IndexKind::RTREE) {
+        if (tipo_ix != Type::POINT)
+            throw DBException("Un indice RTREE solo se crea sobre una columna POINT: '" +
+                              st.index_column + "' es " + typeName(tipo_ix) + ". La tabla queda intacta.");
+    } else {
+        if (tipo_ix == Type::DOUBLE)
+            throw DBException("Aun no se indexan columnas DOUBLE: '" + st.index_column +
+                              "'. La tabla queda intacta.");
+        if (tipo_ix == Type::POINT)
+            throw DBException("La columna '" + st.index_column + "' es POINT: use USING RTREE. "
+                              "La tabla queda intacta.");
+    }
 
     IndexInfo ix;
     ix.column = st.index_column;
@@ -304,8 +324,31 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     auto t_plan = Clock::now();
     const TableInfo& ti = catalog_.get(st.table);
     std::string ruta, detalle_ruta;
-    if (st.where.kind == PredKind::NONE) {
+    const IndexInfo* ix_knn = st.knn ? ti.findIndex(st.knn_column) : nullptr;
+    if (st.knn) {
+        // El KNN manda sobre el WHERE: es lo que decide la ruta de acceso.
+        if (ix_knn && ix_knn->kind == IndexKind::RTREE && st.limit >= 0) {
+            ruta = "IndexKNN";
+            detalle_ruta = "R-Tree best-first sobre " + st.knn_column +
+                           ", k=" + std::to_string(st.limit);
+        } else if (st.limit < 0) {
+            ruta = "SeqScan + orden";
+            detalle_ruta = "ORDER BY por distancia sin LIMIT: hay que ordenar todo";
+        } else {
+            ruta = "SeqScan + orden parcial";
+            detalle_ruta = "no hay indice RTREE sobre " + st.knn_column;
+        }
+    } else if (st.where.kind == PredKind::NONE) {
         ruta = "SeqScan"; detalle_ruta = "sin predicado";
+    } else if (st.where.kind == PredKind::WITHIN) {
+        const IndexInfo* ix = ti.findIndex(st.where.column);
+        if (ix && ix->kind == IndexKind::RTREE) {
+            ruta = "IndexWindowScan";
+            detalle_ruta = "R-Tree sobre " + st.where.column;
+        } else {
+            ruta = "SeqScan";
+            detalle_ruta = "no hay indice RTREE sobre " + st.where.column;
+        }
     } else {
         const IndexInfo* ix = ti.findIndex(st.where.column);
         const bool es_clave_seq = (claveSecuencialDe(ti) == st.where.column);
@@ -332,8 +375,19 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     auto t_exec = Clock::now();
     DiskCounter::Snapshot io_exec = DiskCounter::global().snapshot();
     std::vector<Tuple> filas;
-    if (st.where.kind == PredKind::NONE) {
+    if (st.knn) {
+        int ck = sch.indexOf(st.knn_column);
+        if (ck < 0) throw DBException("No existe la columna '" + st.knn_column + "'");
+        if (sch[ck].type != Type::POINT)
+            throw DBException("ORDER BY por distancia exige una columna POINT: '" +
+                              st.knn_column + "' es " + typeName(sch[ck].type));
+        filas = t->searchKNN(st.knn_column, st.knn_x, st.knn_y,
+                             st.limit >= 0 ? static_cast<int>(st.limit) : -1);
+    } else if (st.where.kind == PredKind::NONE) {
         filas = t->scan();
+    } else if (st.where.kind == PredKind::WITHIN) {
+        filas = t->searchWithin(st.where.column, st.where.wx0, st.where.wy0,
+                                st.where.wx1, st.where.wy1);
     } else {
         int ci = sch.indexOf(st.where.column);
         if (ci < 0) throw DBException("No existe la columna '" + st.where.column + "'");
@@ -399,7 +453,10 @@ QueryResult Database::ejecutarDelete(const Statement& st) {
 
     auto t_exec = Clock::now();
     std::vector<RID> objetivo;
-    if (st.where.kind == PredKind::EQ) {
+    if (st.where.kind == PredKind::WITHIN) {
+        objetivo = t->searchRIDsWithin(st.where.column, st.where.wx0, st.where.wy0,
+                                       st.where.wx1, st.where.wy1);
+    } else if (st.where.kind == PredKind::EQ) {
         objetivo = t->searchRIDsEq(st.where.column, coerce(st.where.eq, tipo, st.where.column));
     } else {
         Value lo = st.where.lo_abierto ? cotaMin(tipo) : coerce(st.where.lo, tipo, st.where.column);

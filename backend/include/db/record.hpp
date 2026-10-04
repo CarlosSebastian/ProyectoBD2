@@ -4,6 +4,7 @@
 //  Una tupla se guarda en el heap file como una secuencia de bytes:
 //      INT     -> 8 bytes (int64)
 //      DOUBLE  -> 8 bytes
+//      POINT   -> 16 bytes (dos doubles: x, y)
 //      VARCHAR -> int32 longitud + los bytes del texto
 //  Se serializa en el orden de las columnas del esquema, sin cabecera: el
 //  esquema (que vive en el catalogo) es lo que permite volver a leerla.
@@ -17,7 +18,10 @@
 
 namespace db {
 
-enum class Type { INT, DOUBLE, VARCHAR };
+// POINT es una coordenada 2D de ancho fijo (16 bytes). Es el tipo que indexa
+// el R-Tree: el motor lo trata como una caja envolvente degenerada en la que
+// las cuatro esquinas coinciden.
+enum class Type { INT, DOUBLE, VARCHAR, POINT };
 
 std::string typeName(Type t);
 Type        typeFromName(const std::string& s);
@@ -52,13 +56,17 @@ private:
 struct Value {
     Type         type = Type::INT;
     std::int64_t i    = 0;
-    double       d    = 0.0;
+    double       d    = 0.0;   // DOUBLE, y tambien la coordenada X de un POINT
+    double       y    = 0.0;   // solo POINT: coordenada Y
     std::string  s;
 
     Value() = default;
     static Value makeInt(std::int64_t v)      { Value x; x.type = Type::INT;     x.i = v; return x; }
     static Value makeDouble(double v)         { Value x; x.type = Type::DOUBLE;  x.d = v; return x; }
     static Value makeStr(const std::string& v){ Value x; x.type = Type::VARCHAR; x.s = v; return x; }
+    static Value makePoint(double px, double py) {
+        Value x; x.type = Type::POINT; x.d = px; x.y = py; return x;
+    }
 
     std::string str() const;
     bool operator==(const Value& o) const;

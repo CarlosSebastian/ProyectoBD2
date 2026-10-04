@@ -4,7 +4,7 @@
 //  Se persiste en un archivo de texto plano (data/catalog.txt) con formato:
 //     TABLE <nombre> <archivo_datos> <motor> <clave_primaria>
 //     COL   <nombre> <TIPO> <max_len>
-//     INDEX <columna> <BPLUS|HASH> <archivo>
+//     INDEX <columna> <BPLUS|HASH|RTREE> <archivo>
 //     END
 //  Texto plano a proposito: el catalogo se lee una vez al arrancar y hay que
 //  poder inspeccionarlo y depurarlo a mano durante el desarrollo.
@@ -19,7 +19,7 @@
 
 namespace db {
 
-enum class IndexKind { BPLUS, HASH };
+enum class IndexKind { BPLUS, HASH, RTREE };
 
 std::string indexKindName(IndexKind k);
 IndexKind   indexKindFromName(const std::string& s);

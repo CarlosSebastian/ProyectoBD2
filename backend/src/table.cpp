@@ -1,6 +1,8 @@
 #include "db/table.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <sstream>
 
 namespace db {
@@ -57,14 +59,24 @@ Table::Table(const std::string& data_dir, const TableInfo& info, int pool_size) 
         if (key_col_ < 0) throw DBException("La columna indexada no existe: " + ix.column);
 
         Type kt = info_.schema[key_col_].type;
-        if (kt == Type::DOUBLE)
-            throw DBException("Aun no se indexan columnas DOUBLE");
+        if (ix.kind == IndexKind::RTREE) {
+            if (kt != Type::POINT)
+                throw DBException("Un indice RTREE solo se puede crear sobre una columna POINT: '" +
+                                  ix.column + "' es " + typeName(kt));
+        } else {
+            if (kt == Type::DOUBLE)
+                throw DBException("Aun no se indexan columnas DOUBLE");
+            if (kt == Type::POINT)
+                throw DBException("Una columna POINT solo admite un indice RTREE: '" + ix.column + "'");
+        }
 
         idx_disk_ = std::make_unique<DiskManager>(joinPath(data_dir, ix.file));
         idx_bp_   = std::make_unique<BufferPool>(idx_disk_.get(), pool_size);
 
         try {
-            if (ix.kind == IndexKind::BPLUS) {
+            if (ix.kind == IndexKind::RTREE) {
+                rt_ = std::make_unique<RTree>(idx_bp_.get());
+            } else if (ix.kind == IndexKind::BPLUS) {
                 if (kt == Type::INT) bt_int_ = std::make_unique<BPlusTree<std::int64_t>>(idx_bp_.get());
                 else                 bt_str_ = std::make_unique<BPlusTree<Key32>>(idx_bp_.get());
             } else {
@@ -94,14 +106,23 @@ long long Table::lecturasTotales() const {
          + (idx_disk_ ? idx_disk_->readCount() : 0);
 }
 
+// Indice de la columna si es de tipo POINT; -1 en cualquier otro caso.
+int Table::columnaPunto(const std::string& col) const {
+    int ci = info_.schema.indexOf(col);
+    if (ci < 0) return -1;
+    return info_.schema[static_cast<std::size_t>(ci)].type == Type::POINT ? ci : -1;
+}
+
 void Table::insertIntoIndex(const Value& key, const RID& rid) {
-    if (bt_int_)      bt_int_->insert(key.i, rid);
+    if (rt_)          rt_->insert(MBR::point(key.d, key.y), rid);
+    else if (bt_int_) bt_int_->insert(key.i, rid);
     else if (hs_int_) hs_int_->insert(key.i, rid);
     else if (bt_str_) bt_str_->insert(Key32(key.s), rid);
     else if (hs_str_) hs_str_->insert(Key32(key.s), rid);
 }
 void Table::removeFromIndex(const Value& key, const RID& rid) {
-    if (bt_int_)      bt_int_->remove(key.i, rid);
+    if (rt_)          rt_->remove(MBR::point(key.d, key.y), rid);
+    else if (bt_int_) bt_int_->remove(key.i, rid);
     else if (hs_int_) hs_int_->remove(key.i, rid);
     else if (bt_str_) bt_str_->remove(Key32(key.s), rid);
     else if (hs_str_) hs_str_->remove(Key32(key.s), rid);
@@ -170,7 +191,11 @@ std::vector<RID> Table::searchRIDsEq(const std::string& col, const Value& v) {
     int ci = info_.schema.indexOf(col);
     if (ci < 0) throw DBException("No existe la columna: " + col);
 
-    if (indexedColumn(col)) {
+    if (indexedColumn(col) && rt_) {
+        // Igualdad sobre un punto: es una ventana degenerada de area cero.
+        last_plan_.metodo = "INDEX RTREE (punto)";
+        out = rt_->search(MBR::point(v.d, v.y));
+    } else if (indexedColumn(col)) {
         last_plan_.metodo = (bt_int_ || bt_str_) ? "INDEX BPLUS" : "INDEX HASH";
         out = indexLookup(v);
     } else if (claveSecuencial(col)) {
@@ -208,7 +233,12 @@ std::vector<RID> Table::searchRIDsRange(const std::string& col, const Value& lo,
         last_plan_.metodo = "SEQ BINARY SEARCH (rango)";
         out = seq_->searchRange(lo, hi);
     } else {
-        last_plan_.metodo = indexedColumn(col) ? "SEQ SCAN (hash no soporta rango)" : "SEQ SCAN";
+        if (indexedColumn(col) && rt_)
+            last_plan_.metodo = "SEQ SCAN (el R-Tree no ordena: use WITHIN)";
+        else if (indexedColumn(col))
+            last_plan_.metodo = "SEQ SCAN (hash no soporta rango)";
+        else
+            last_plan_.metodo = "SEQ SCAN";
         for (const RID& rid : engine_->scanAll()) {
             Tuple t;
             if (!getByRID(rid, t)) continue;
@@ -262,6 +292,99 @@ std::vector<Tuple> Table::scan() {
 }
 
 // ---------------------------------------------------------------------------
+//  Consultas espaciales. Son las dos rutas que estrena el Entregable 2.
+// ---------------------------------------------------------------------------
+std::vector<RID> Table::searchRIDsWithin(const std::string& col,
+                                         double x0, double y0, double x1, double y1) {
+    auto t0 = Clock::now();
+    long long r0 = lecturasTotales();
+
+    int ci = columnaPunto(col);
+    if (ci < 0) throw DBException("La columna '" + col + "' no es de tipo POINT");
+    const MBR ventana(x0, y0, x1, y1);
+
+    std::vector<RID> out;
+    if (indexedColumn(col) && rt_) {
+        last_plan_.metodo = "INDEX RTREE (ventana)";
+        out = rt_->search(ventana);
+    } else {
+        // Sin indice espacial hay que mirar punto por punto: es exactamente el
+        // full scan contra el que se compara el R-Tree en el experimento.
+        last_plan_.metodo = "SEQ SCAN (ventana)";
+        for (const RID& rid : engine_->scanAll()) {
+            Tuple t;
+            if (!getByRID(rid, t)) continue;
+            const Value& v = t.values[static_cast<std::size_t>(ci)];
+            if (MBR::point(v.d, v.y).interseca(ventana)) out.push_back(rid);
+        }
+    }
+
+    last_plan_.columna        = col;
+    last_plan_.registros      = static_cast<long long>(out.size());
+    last_plan_.paginas_leidas = lecturasTotales() - r0;
+    last_plan_.ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    return out;
+}
+
+std::vector<Tuple> Table::searchWithin(const std::string& col,
+                                       double x0, double y0, double x1, double y1) {
+    std::vector<Tuple> out;
+    for (const RID& rid : searchRIDsWithin(col, x0, y0, x1, y1)) {
+        Tuple t;
+        if (getByRID(rid, t)) out.push_back(t);
+    }
+    last_plan_.registros = static_cast<long long>(out.size());
+    return out;
+}
+
+std::vector<Tuple> Table::searchKNN(const std::string& col, double px, double py, int k) {
+    auto t0 = Clock::now();
+    long long r0 = lecturasTotales();
+
+    int ci = columnaPunto(col);
+    if (ci < 0) throw DBException("La columna '" + col + "' no es de tipo POINT");
+
+    std::vector<Tuple> out;
+    if (indexedColumn(col) && rt_ && k >= 0) {
+        last_plan_.metodo = "INDEX RTREE (knn)";
+        for (const auto& par : rt_->knn(px, py, k)) {
+            Tuple t;
+            if (getByRID(par.second, t)) out.push_back(t);
+        }
+    } else {
+        // Sin indice (o sin LIMIT) hay que calcular la distancia de TODAS las
+        // filas y ordenar. Con LIMIT se usa nth_element + sort parcial, que es
+        // O(n) en vez de O(n log n), pero sigue leyendo el archivo entero.
+        last_plan_.metodo = (k >= 0) ? "SEQ SCAN (knn)" : "SEQ SCAN (orden por distancia)";
+        std::vector<std::pair<double, Tuple>> todos;
+        for (const RID& rid : engine_->scanAll()) {
+            Tuple t;
+            if (!getByRID(rid, t)) continue;
+            const Value& v = t.values[static_cast<std::size_t>(ci)];
+            double dx = v.d - px, dy = v.y - py;
+            todos.emplace_back(std::sqrt(dx * dx + dy * dy), std::move(t));
+        }
+        auto antes = [](const std::pair<double, Tuple>& a, const std::pair<double, Tuple>& b) {
+            return a.first < b.first;
+        };
+        std::size_t tope = (k >= 0 && static_cast<std::size_t>(k) < todos.size())
+                         ? static_cast<std::size_t>(k) : todos.size();
+        if (tope < todos.size()) {
+            std::nth_element(todos.begin(), todos.begin() + static_cast<long>(tope), todos.end(), antes);
+            todos.resize(tope);
+        }
+        std::sort(todos.begin(), todos.end(), antes);
+        for (auto& par : todos) out.push_back(std::move(par.second));
+    }
+
+    last_plan_.columna        = col;
+    last_plan_.registros      = static_cast<long long>(out.size());
+    last_plan_.paginas_leidas = lecturasTotales() - r0;
+    last_plan_.ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Vacia el archivo de indice y recrea la estructura desde cero.
 // Es OBLIGATORIO antes de repoblar: si el .idx ya existia, el constructor del
 // B+ o del Hash ve que el archivo no esta vacio y NO lo inicializa, sino que
@@ -272,11 +395,13 @@ void Table::recrearIndiceVacio() {
     if (key_col_ < 0 || !idx_disk_ || info_.indexes.empty()) return;
     idx_bp_->invalidateAll();
     idx_disk_->truncate();
-    bt_int_.reset(); bt_str_.reset(); hs_int_.reset(); hs_str_.reset();
+    bt_int_.reset(); bt_str_.reset(); hs_int_.reset(); hs_str_.reset(); rt_.reset();
 
     const IndexInfo& ix = info_.indexes.front();
     const Type kt = info_.schema[key_col_].type;
-    if (ix.kind == IndexKind::BPLUS) {
+    if (ix.kind == IndexKind::RTREE) {
+        rt_ = std::make_unique<RTree>(idx_bp_.get());
+    } else if (ix.kind == IndexKind::BPLUS) {
         if (kt == Type::INT) bt_int_ = std::make_unique<BPlusTree<std::int64_t>>(idx_bp_.get());
         else                 bt_str_ = std::make_unique<BPlusTree<Key32>>(idx_bp_.get());
     } else {
