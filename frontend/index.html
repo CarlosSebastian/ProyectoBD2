@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Cliente SQL — Mini-gestor BD2</title>
+<!-- Leaflet: solo para el visor de mapa del modulo espacial. Si no hay
+     internet, el panel 5 lo avisa y el resto del cliente sigue funcionando. -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <style>
   :root{
     --bg:#f4f5f7; --panel:#ffffff; --border:#dcdfe4; --text:#1c2024; --muted:#6b7280;
@@ -42,6 +46,13 @@
               letter-spacing:.07em;color:var(--muted);border-bottom:1px solid var(--border);
               font-weight:600;display:flex;align-items:center;gap:8px}
   .panel .body{padding:12px;overflow:auto;flex:1;min-height:0}
+
+  /* 5. Mapa espacial: aparece solo si el resultado trae una columna POINT */
+  #panel-mapa{display:none}
+  #panel-mapa.visible{display:flex}
+  #mapa{width:100%;height:100%;min-height:260px;border-radius:0}
+  .leaflet-container{background:#0f1115}
+  #mapa-aviso{padding:12px;color:var(--muted);font-size:12px}
 
   .right{display:grid;grid-template-rows:auto 1fr;gap:12px;min-height:0}
   .bottom{display:grid;grid-template-columns:1fr 340px;gap:12px;min-height:0}
@@ -190,6 +201,18 @@
         </div>
       </section>
     </div>
+
+    <!-- PANEL 5: Visor de mapa (modulo espacial) -->
+    <section class="panel" id="panel-mapa">
+      <h2>5 · Mapa
+        <span class="spacer" style="flex:1"></span>
+        <span style="font-weight:400;text-transform:none;letter-spacing:0"
+              id="mapa-info"></span>
+      </h2>
+      <div class="body" style="padding:0" id="mapa-cont">
+        <div id="mapa"></div>
+      </div>
+    </section>
   </div>
 </div>
 
@@ -205,6 +228,9 @@ const EJEMPLOS = [
   ["Puntual",      "SELECT * FROM empleados WHERE id = 101;"],
   ["Rango",        "SELECT * FROM empleados WHERE id >= 100 AND id <= 500;"],
   ["DELETE",       "DELETE FROM empleados WHERE id = 101;"],
+  ["Espacial: crear", "CREATE TABLE lugares (id INT PRIMARY KEY, nombre CHAR(40), ubic POINT);\nINSERT INTO lugares VALUES (1,'UTEC Barranco',POINT(-77.0220,-12.1350)),(2,'Plaza de Armas',POINT(-77.0300,-12.0460)),(3,'Miraflores',POINT(-77.0300,-12.1200)),(4,'Callao',POINT(-77.1180,-12.0560)),(5,'Cusco',POINT(-71.9780,-13.5320));\nCREATE INDEX idx_ubic ON lugares (ubic) USING RTREE;"],
+  ["Ventana",      "SELECT * FROM lugares WHERE ubic WITHIN (-77.2, -12.2, -76.9, -12.0);"],
+  ["KNN",          "SELECT * FROM lugares ORDER BY ubic <-> POINT(-77.0300,-12.0460) LIMIT 3;"],
 ];
 
 function escapar(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -270,7 +296,7 @@ async function ejecutar(){
     });
     const resp = await r.json();
     ultimo = resp; pagina = 0;
-    pintarMensaje(resp); pintarResultados(resp); pintarPlan(resp);
+    pintarMensaje(resp); pintarResultados(resp); pintarPlan(resp); pintarMapa(resp, sql);
     cargarTablas();
   }catch(e){
     $('#mensaje').innerHTML = `<div class="msg err">Error de red: ${escapar(e.message)}</div>`;
@@ -384,6 +410,88 @@ function pintarResaltado(){
   pre.innerHTML = resaltarSQL(ta.value);
   pre.scrollTop = ta.scrollTop;
   pre.scrollLeft = ta.scrollLeft;
+}
+
+// ---------- Panel 5: mapa espacial ----------
+// Convencion: en POINT(x, y) la x es la LONGITUD y la y la LATITUD, que es el
+// orden (este, norte) de la cartografia. Leaflet pide [lat, lon], asi que al
+// dibujar se invierten.
+let mapa = null, capaMapa = null;
+
+function parsePunto(txt){
+  const m = /^\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)$/.exec(String(txt).trim());
+  return m ? {x: parseFloat(m[1]), y: parseFloat(m[2])} : null;
+}
+
+// Columna del resultado cuyos valores parecen puntos.
+function columnaPunto(d){
+  if(!d.columns || !d.rows.length) return -1;
+  for(let c = 0; c < d.columns.length; c++){
+    if(d.rows.every(f => parsePunto(f[c]))) return c;
+  }
+  return -1;
+}
+
+function pintarMapa(resp, sql){
+  const panel = $('#panel-mapa');
+  const d = ultimaVistaDe(resp);
+  const ci = (d && d.ok) ? columnaPunto(d) : -1;
+  if(ci < 0){ panel.classList.remove('visible'); return; }
+
+  panel.classList.add('visible');
+  if(typeof L === 'undefined'){
+    $('#mapa-cont').innerHTML = '<div id="mapa-aviso">El resultado tiene una columna ' +
+      'POINT, pero no se pudo cargar Leaflet (¿sin conexión?). Las coordenadas siguen ' +
+      'en el panel 3.</div>';
+    return;
+  }
+
+  if(!mapa){
+    mapa = L.map('mapa', {attributionControl:false});
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19}).addTo(mapa);
+  }
+  if(capaMapa) mapa.removeLayer(capaMapa);
+  capaMapa = L.layerGroup().addTo(mapa);
+
+  // Etiqueta de cada marcador: la primera columna de texto que no sea el punto.
+  let cEtiqueta = -1;
+  for(let c = 0; c < d.columns.length; c++) if(c !== ci){ cEtiqueta = c; break; }
+
+  const puntos = [];
+  d.rows.forEach((f, i) => {
+    const p = parsePunto(f[ci]); if(!p) return;
+    puntos.push([p.y, p.x]);
+    L.circleMarker([p.y, p.x], {radius:6, color:'#d97706', weight:2,
+                                fillColor:'#d97706', fillOpacity:.65})
+      .bindPopup(`<b>${escapar(cEtiqueta >= 0 ? f[cEtiqueta] : '#' + (i+1))}</b><br>` +
+                 `${escapar(d.columns[ci])} = ${escapar(f[ci])}`)
+      .addTo(capaMapa);
+  });
+
+  // Dibujar tambien la geometria de la consulta: el rectangulo del WITHIN o el
+  // punto de referencia del KNN. Se leen del SQL que se acaba de ejecutar.
+  let nota = `${puntos.length} punto(s)`;
+  const w = /WITHIN\s*\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)/i.exec(sql);
+  if(w){
+    const x0=+w[1], y0=+w[2], x1=+w[3], y1=+w[4];
+    L.rectangle([[Math.min(y0,y1), Math.min(x0,x1)], [Math.max(y0,y1), Math.max(x0,x1)]],
+                {color:'#3b82f6', weight:2, dashArray:'5 4', fill:false}).addTo(capaMapa);
+    puntos.push([y0,x0],[y1,x1]);
+    nota += ' · ventana en azul';
+  }
+  const k = /<->\s*POINT\s*\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)/i.exec(sql);
+  if(k){
+    const qx=+k[1], qy=+k[2];
+    L.circleMarker([qy,qx], {radius:9, color:'#3b82f6', weight:3, fillOpacity:0})
+      .bindPopup('Punto de consulta').addTo(capaMapa);
+    puntos.push([qy,qx]);
+    nota += ' · consulta en azul';
+  }
+  $('#mapa-info').textContent = nota;
+
+  if(puntos.length) mapa.fitBounds(L.latLngBounds(puntos).pad(0.25));
+  else mapa.setView([0,0], 2);
+  setTimeout(() => mapa.invalidateSize(), 30);   // el panel acaba de aparecer
 }
 
 // ---------- init ----------

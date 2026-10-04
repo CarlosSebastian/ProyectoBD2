@@ -10,6 +10,11 @@
 //     2. Busqueda binaria secuencial  si el motor es SEQUENTIAL y la columna
 //                                     es la clave que ordena el archivo
 //     3. SeqScan                      en cualquier otro caso
+//
+//  Para columnas POINT se suman dos rutas espaciales (Entregable 2):
+//     - ventana  'col WITHIN (x0,y0,x1,y1)'      -> R-Tree, o scan con filtro
+//     - KNN      'ORDER BY col <-> POINT(x,y)'   -> R-Tree best-first, o scan
+//                                                   con ordenacion parcial
 // ============================================================================
 #pragma once
 
@@ -23,6 +28,7 @@
 #include "db/extendible_hash.hpp"
 #include "db/heap_file.hpp"
 #include "db/record.hpp"
+#include "db/rtree.hpp"
 #include "db/sequential_file.hpp"
 #include "db/storage_engine.hpp"
 
@@ -64,6 +70,16 @@ public:
     std::vector<RID> searchRIDsEq(const std::string& col, const Value& v);
     std::vector<RID> searchRIDsRange(const std::string& col, const Value& lo, const Value& hi);
 
+    // ---- consultas espaciales (columna POINT) ----
+    // Ventana: todos los puntos dentro del rectangulo.
+    std::vector<Tuple> searchWithin(const std::string& col,
+                                    double x0, double y0, double x1, double y1);
+    std::vector<RID>   searchRIDsWithin(const std::string& col,
+                                        double x0, double y0, double x1, double y1);
+    // k vecinos mas cercanos, ya ordenados por distancia creciente.
+    // k < 0 significa "todos", ordenados igual.
+    std::vector<Tuple> searchKNN(const std::string& col, double px, double py, int k);
+
     const PlanInfo& lastPlan() const { return last_plan_; }
 
     void buildIndex();                     // vacia el indice y lo repuebla desde los datos
@@ -86,6 +102,7 @@ public:
     int  indexHeight() const {
         if (bt_int_) return bt_int_->getHeight();
         if (bt_str_) return bt_str_->getHeight();
+        if (rt_)     return rt_->getHeight();
         return 0;
     }
     int  overflowPages() const { return seq_ ? seq_->ovfPages() : 0; }
@@ -100,6 +117,7 @@ private:
     void   insertIntoIndex(const Value& key, const RID& rid);
     void   removeFromIndex(const Value& key, const RID& rid);
     bool   indexedColumn(const std::string& col) const;
+    int    columnaPunto(const std::string& col) const;   // -1 si no es POINT
     bool   claveSecuencial(const std::string& col) const;
     std::vector<RID> indexLookup(const Value& v);
     std::vector<RID> indexRange(const Value& lo, const Value& hi);
@@ -123,6 +141,7 @@ private:
     std::unique_ptr<BPlusTree<Key32>>             bt_str_;
     std::unique_ptr<ExtendibleHash<std::int64_t>> hs_int_;
     std::unique_ptr<ExtendibleHash<Key32>>        hs_str_;
+    std::unique_ptr<RTree>                        rt_;      // indice espacial
 
     PlanInfo last_plan_;
 };

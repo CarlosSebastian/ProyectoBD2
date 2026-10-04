@@ -80,7 +80,7 @@ data/              archivos binarios generados (ignorados por git)
 ```sql
 CREATE TABLE empleados (id INT PRIMARY KEY, nombre CHAR(30),
                         dept CHAR(20), salario FLOAT) USING [HEAP|SEQUENTIAL];
-CREATE INDEX idx_emp_id ON empleados (id) USING [BTREE|HASH];
+CREATE INDEX idx_emp_id ON empleados (id) USING [BTREE|HASH|RTREE];
 INSERT INTO empleados VALUES (101, 'Ada Lovelace', 'Analytics', 5200.0);
 INSERT INTO empleados VALUES (102, 'Alan Turing', 'IA', 6100.0),
                              (103, 'Grace Hopper', 'Compiladores', 5900.0);
@@ -99,6 +99,40 @@ con su propio indicador de éxito.
 
 `PRIMARY KEY` impone unicidad: antes de insertar se hace una búsqueda puntual
 por la columna clave y la operación se rechaza si el valor ya existe.
+
+### Módulo espacial (R-Tree)
+
+Una columna `POINT` guarda una coordenada 2D de ancho fijo (dos `double`, 16
+bytes). Se indexa con un **R-Tree en disco**: una página por nodo, 102 entradas
+por hoja y 113 por nodo interno con páginas de 4 KB, `ChooseSubtree` por mínima
+ampliación de área y split cuadrático de Guttman.
+
+```sql
+CREATE TABLE lugares (id INT PRIMARY KEY, nombre CHAR(40), ubic POINT);
+INSERT INTO lugares VALUES (1, 'UTEC Barranco', POINT(-77.0220, -12.1350));
+CREATE INDEX idx_ubic ON lugares (ubic) USING RTREE;
+
+-- ventana: todo lo que cae dentro del rectángulo (minx, miny, maxx, maxy)
+SELECT * FROM lugares WHERE ubic WITHIN (-77.2, -12.2, -76.9, -12.0);
+
+-- k vecinos más cercanos; <-> es la distancia euclidiana
+SELECT * FROM lugares ORDER BY ubic <-> POINT(-77.0300, -12.0460) LIMIT 3;
+```
+
+En `POINT(x, y)` la **x es la longitud** y la **y la latitud**, que es el orden
+(este, norte) de la cartografía; el visor de mapa las invierte al dibujar
+porque Leaflet pide `[lat, lon]`.
+
+El KNN usa búsqueda *best-first* con una cola de prioridad por MINDIST, así que
+el resultado es **exacto**, no aproximado: visita el mínimo de nodos necesario.
+Sobre 20 000 puntos, un KNN con k=10 cuesta 18 accesos a página frente a los
+20 138 del escaneo completo, y una ventana que devuelve 264 filas cuesta 278
+frente a 20 402.
+
+El panel 5 del cliente web dibuja el resultado en un mapa (Leaflet +
+OpenStreetMap) y aparece solo cuando la consulta devuelve una columna `POINT`.
+Necesita conexión a internet para las teselas; sin ella el panel lo avisa y el
+resto del cliente sigue funcionando.
 
 Con `USING SEQUENTIAL` el archivo queda **ordenado físicamente por la PRIMARY
 KEY**: las búsquedas sobre esa columna se resuelven con búsqueda binaria sobre

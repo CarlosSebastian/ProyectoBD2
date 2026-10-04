@@ -9,6 +9,7 @@ std::string typeName(Type t) {
         case Type::INT:     return "INT";
         case Type::DOUBLE:  return "DOUBLE";
         case Type::VARCHAR: return "VARCHAR";
+        case Type::POINT:   return "POINT";
     }
     return "INT";
 }
@@ -17,6 +18,7 @@ Type typeFromName(const std::string& s) {
     if (s == "INT")     return Type::INT;
     if (s == "DOUBLE")  return Type::DOUBLE;
     if (s == "VARCHAR") return Type::VARCHAR;
+    if (s == "POINT")   return Type::POINT;
     throw DBException("Tipo desconocido: " + s);
 }
 
@@ -36,6 +38,12 @@ std::string Value::str() const {
             return os.str();
         }
         case Type::VARCHAR: return s;
+        case Type::POINT: {
+            std::ostringstream os;
+            os.precision(6);
+            os << std::fixed << "(" << d << ", " << y << ")";
+            return os.str();
+        }
     }
     return "";
 }
@@ -46,6 +54,7 @@ bool Value::operator==(const Value& o) const {
         case Type::INT:     return i == o.i;
         case Type::DOUBLE:  return d == o.d;
         case Type::VARCHAR: return s == o.s;
+        case Type::POINT:   return d == o.d && y == o.y;
     }
     return false;
 }
@@ -55,6 +64,10 @@ bool Value::operator<(const Value& o) const {
         case Type::INT:     return i < o.i;
         case Type::DOUBLE:  return d < o.d;
         case Type::VARCHAR: return s < o.s;
+        // Los puntos no tienen un orden natural. Se define uno lexicografico
+        // (x, luego y) solo para que Value siga siendo comparable; el R-Tree
+        // nunca lo usa, ordena por solapamiento de cajas.
+        case Type::POINT:   return d != o.d ? d < o.d : y < o.y;
     }
     return false;
 }
@@ -85,6 +98,12 @@ std::string serializeTuple(const Schema& sch, const Tuple& t) {
             case Type::DOUBLE: {
                 double x = v.d;
                 out.append(reinterpret_cast<const char*>(&x), sizeof(x));
+                break;
+            }
+            case Type::POINT: {
+                double px = v.d, py = v.y;
+                out.append(reinterpret_cast<const char*>(&px), sizeof(px));
+                out.append(reinterpret_cast<const char*>(&py), sizeof(py));
                 break;
             }
             case Type::VARCHAR: {
@@ -121,6 +140,13 @@ Value extractColumn(const Schema& sch, int col, const char* data, int len) {
                 p += 8;
                 break;
             }
+            case Type::POINT: {
+                if (p + 16 > len) throw DBException("extractColumn: registro corrupto");
+                if (k == col) return Value::makePoint(readAt<double>(data, p),
+                                                      readAt<double>(data, p + 8));
+                p += 16;
+                break;
+            }
             case Type::VARCHAR: {
                 if (p + 4 > len) throw DBException("extractColumn: registro corrupto");
                 std::int32_t n = readAt<std::int32_t>(data, p);
@@ -151,6 +177,13 @@ Tuple deserializeTuple(const Schema& sch, const char* data, int len) {
                 if (p + 8 > len) throw DBException("deserializeTuple: registro corrupto");
                 t.values.push_back(Value::makeDouble(readAt<double>(data, p)));
                 p += 8;
+                break;
+            }
+            case Type::POINT: {
+                if (p + 16 > len) throw DBException("deserializeTuple: registro corrupto");
+                t.values.push_back(Value::makePoint(readAt<double>(data, p),
+                                                    readAt<double>(data, p + 8)));
+                p += 16;
                 break;
             }
             case Type::VARCHAR: {

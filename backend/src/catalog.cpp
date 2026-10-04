@@ -5,11 +5,19 @@
 
 namespace db {
 
-std::string indexKindName(IndexKind k) { return k == IndexKind::BPLUS ? "BPLUS" : "HASH"; }
+std::string indexKindName(IndexKind k) {
+    switch (k) {
+        case IndexKind::BPLUS: return "BPLUS";
+        case IndexKind::HASH:  return "HASH";
+        case IndexKind::RTREE: return "RTREE";
+    }
+    return "BPLUS";
+}
 
 IndexKind indexKindFromName(const std::string& s) {
     if (s == "BPLUS") return IndexKind::BPLUS;
     if (s == "HASH")  return IndexKind::HASH;
+    if (s == "RTREE") return IndexKind::RTREE;
     throw DBException("Tipo de indice desconocido: " + s);
 }
 

@@ -75,9 +75,12 @@ std::vector<Token> tokenize(const std::string& sql) {
             i = j + 1;
             continue;
         }
-        // simbolos, incluyendo los de dos caracteres
+        // simbolos, incluyendo los de dos y tres caracteres
         std::string sym(1, c);
-        if ((c == '>' || c == '<' || c == '!') && i + 1 < sql.size() && sql[i + 1] == '=') {
+        // '<->' (distancia) se prueba ANTES que '<=', porque comparten prefijo.
+        if (c == '<' && i + 2 < sql.size() && sql[i + 1] == '-' && sql[i + 2] == '>') {
+            sym = "<->"; i += 2;
+        } else if ((c == '>' || c == '<' || c == '!') && i + 1 < sql.size() && sql[i + 1] == '=') {
             sym += '='; ++i;
         }
         Token t; t.tipo = Tok::SYMBOL; t.texto = sym;
@@ -160,7 +163,28 @@ private:
         avanza();
         return v;
     }
+    // Numero con signo, entero o decimal. Lo usan POINT(...) y WITHIN(...).
+    double esperaDouble() {
+        if (cur().tipo != Tok::NUMBER)
+            throw DBException("Se esperaba un numero y se encontro '" + cur().texto + "'");
+        double v = std::atof(cur().texto.c_str());
+        avanza();
+        return v;
+    }
+
+    // POINT(x, y). Es el unico literal compuesto del lenguaje.
+    Value esperaPunto() {
+        esperaPalabra("POINT");
+        esperaSimbolo("(");
+        double x = esperaDouble();
+        esperaSimbolo(",");
+        double y = esperaDouble();
+        esperaSimbolo(")");
+        return Value::makePoint(x, y);
+    }
+
     Value esperaLiteral() {
+        if (esPalabra("POINT")) return esperaPunto();
         if (cur().tipo == Tok::NUMBER) {
             Value v = cur().decimal ? Value::makeDouble(std::atof(cur().texto.c_str()))
                                     : Value::makeInt(std::atoll(cur().texto.c_str()));
@@ -185,7 +209,9 @@ private:
             if (*len <= 0) *len = 64;
             return Type::VARCHAR;
         }
-        throw DBException("Tipo no soportado: '" + t + "'. Use INT, FLOAT/DOUBLE o CHAR(n)/VARCHAR(n).");
+        if (t == "POINT" || t == "GEOPOINT") return Type::POINT;
+        throw DBException("Tipo no soportado: '" + t +
+                          "'. Use INT, FLOAT/DOUBLE, CHAR(n)/VARCHAR(n) o POINT.");
     }
 
     Statement parseCreateTable() {
@@ -228,7 +254,9 @@ private:
             std::string k = esperaIdent();
             if (k == "BTREE" || k == "BPLUS" || k == "BTREE+") st.index_kind = IndexKind::BPLUS;
             else if (k == "HASH")                              st.index_kind = IndexKind::HASH;
-            else throw DBException("Tipo de indice no soportado: '" + k + "'. Use BTREE o HASH.");
+            else if (k == "RTREE" || k == "RTREE2D" || k == "GIST") st.index_kind = IndexKind::RTREE;
+            else throw DBException("Tipo de indice no soportado: '" + k +
+                                   "'. Use BTREE, HASH o RTREE.");
         }
         finSentencia();
         return st;
@@ -276,6 +304,20 @@ Statement parseInsert() {
         esperaPalabra("FROM");
         st.table = esperaNombre();
         if (esPalabra("WHERE")) { avanza(); st.where = parseWhere(); }
+        if (esPalabra("ORDER")) {
+            avanza();
+            esperaPalabra("BY");
+            st.knn_column = esperaNombre();
+            if (!esSimbolo("<->"))
+                throw DBException(
+                    "Solo se admite ordenar por distancia: ORDER BY " + st.knn_column +
+                    " <-> POINT(x, y). Se encontro '" + cur().texto + "'.");
+            avanza();
+            Value p = esperaPunto();
+            st.knn   = true;
+            st.knn_x = p.d;
+            st.knn_y = p.y;
+        }
         if (esPalabra("LIMIT")) { avanza(); st.limit = esperaEntero(); }
         finSentencia();
         return st;
@@ -304,6 +346,19 @@ Statement parseInsert() {
             pr.lo   = esperaLiteral();
             esperaPalabra("AND");
             pr.hi = esperaLiteral();
+            return pr;
+        }
+
+        // Ventana espacial: col WITHIN (minx, miny, maxx, maxy)
+        if (esPalabra("WITHIN")) {
+            avanza();
+            esperaSimbolo("(");
+            pr.wx0 = esperaDouble(); esperaSimbolo(",");
+            pr.wy0 = esperaDouble(); esperaSimbolo(",");
+            pr.wx1 = esperaDouble(); esperaSimbolo(",");
+            pr.wy1 = esperaDouble();
+            esperaSimbolo(")");
+            pr.kind = PredKind::WITHIN;
             return pr;
         }
 
