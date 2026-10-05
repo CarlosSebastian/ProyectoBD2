@@ -37,6 +37,14 @@ std::vector<RID> ventanaFuerzaBruta(const std::vector<Punto>& ps, const MBR& w,
     return out;
 }
 
+std::vector<double> knnGeoFuerzaBruta(const std::vector<Punto>& ps, double lon, double lat, int k) {
+    std::vector<double> d;
+    for (const Punto& p : ps) d.push_back(geo::haversine(lon, lat, p.x, p.y));
+    std::sort(d.begin(), d.end());
+    if (static_cast<int>(d.size()) > k) d.resize(static_cast<std::size_t>(k));
+    return d;
+}
+
 std::vector<double> knnFuerzaBruta(const std::vector<Punto>& ps, double px, double py, int k,
                                    const std::vector<char>& vivo) {
     std::vector<double> d;
@@ -201,6 +209,220 @@ int main() {
         bool lanzo = false;
         try { RTree rt(&bp); } catch (const DBException&) { lanzo = true; }
         CHECK(lanzo, "abrir un indice de otro tipo debe lanzar, no leer basura");
+    }
+
+    // ------------------------------------------------------------------
+    //  Distancia geografica (ST_DISTANCE): metros reales sobre la esfera.
+    // ------------------------------------------------------------------
+    SECTION("haversine contra distancias conocidas");
+    {
+        // Plaza de Armas de Lima -> UTEC Barranco, ~9.9 km en linea recta.
+        const double d1 = geo::haversine(-77.0300, -12.0460, -77.0220, -12.1350);
+        CHECK(d1 > 9000.0 && d1 < 11000.0, "Lima centro a Barranco ronda los 10 km");
+        // Lima -> Cusco, ~570 km.
+        const double d2 = geo::haversine(-77.0300, -12.0460, -71.9780, -13.5320);
+        CHECK(d2 > 550000.0 && d2 < 590000.0, "Lima a Cusco ronda los 570 km");
+        CHECK_EQ(geo::haversine(10.0, 20.0, 10.0, 20.0), 0.0, "distancia de un punto a si mismo");
+        // Un grado de longitud mide menos cuanto mas lejos del ecuador.
+        const double ecuador = geo::haversine(0.0, 0.0, 1.0, 0.0);
+        const double lat60   = geo::haversine(0.0, 60.0, 1.0, 60.0);
+        CHECK(lat60 < ecuador * 0.55, "a 60 grados un grado de longitud mide la mitad");
+    }
+
+    SECTION("mindistGeo NUNCA se pasa del minimo real (es lo que hace exacto al KNN)");
+    {
+        // Si la cota superara la distancia real, el best-first podria podar un
+        // nodo que si contenia un vecino mas cercano y devolver mal sin avisar.
+        std::mt19937 r2(99);
+        std::uniform_real_distribution<double> lonU(-180, 180), latU(-85, 85);
+        int violaciones = 0;
+        for (int t = 0; t < 400; ++t) {
+            MBR caja(lonU(r2), latU(r2), lonU(r2), latU(r2));
+            const double qlon = lonU(r2), qlat = latU(r2);
+            const double cota = caja.mindistGeo(qlon, qlat);
+            double real = 1e18;
+            for (int i = 0; i <= 25; ++i)
+                for (int j = 0; j <= 25; ++j)
+                    real = std::min(real, geo::haversine(
+                        qlon, qlat,
+                        caja.minx + (caja.maxx - caja.minx) * i / 25.0,
+                        caja.miny + (caja.maxy - caja.miny) * j / 25.0));
+            if (cota > real + 1e-6) ++violaciones;
+        }
+        CHECK_EQ(violaciones, 0, "la cota inferior se respeta en todas las cajas probadas");
+    }
+
+    SECTION("KNN geografico contra fuerza bruta");
+    {
+        resetFile("data/test_rtree_geo.idx");
+        DiskManager dmg("data/test_rtree_geo.idx");
+        BufferPool  bpg(&dmg, 64);
+        RTree       rg(&bpg);
+
+        // Puntos sobre coordenadas terrestres reales (lon, lat).
+        std::mt19937 r3(2026);
+        std::uniform_real_distribution<double> lonU(-180.0, 180.0), latU(-80.0, 80.0);
+        std::vector<Punto> geos(3000);
+        for (std::size_t i = 0; i < geos.size(); ++i) {
+            geos[i] = Punto{lonU(r3), latU(r3), RID(static_cast<int>(i) / 50,
+                                                    static_cast<int>(i) % 50)};
+            rg.insert(MBR::point(geos[i].x, geos[i].y), geos[i].rid);
+        }
+
+        const int ks[3] = {1, 5, 25};
+        for (int t = 0; t < 25; ++t) {
+            const double qlon = lonU(r3), qlat = latU(r3);
+            for (int ki = 0; ki < 3; ++ki) {
+                std::vector<std::pair<double, RID>> got = rg.knnGeo(qlon, qlat, ks[ki]);
+                std::vector<double> esp = knnGeoFuerzaBruta(geos, qlon, qlat, ks[ki]);
+                CHECK_EQ(got.size(), esp.size(), "cantidad de vecinos geograficos");
+                for (std::size_t i = 0; i < got.size(); ++i) {
+                    CHECK(std::fabs(got[i].first - esp[i]) < 1e-6,
+                          "la distancia geografica del vecino " + std::to_string(i) +
+                          " no coincide con la fuerza bruta");
+                    if (i) CHECK(got[i - 1].first <= got[i].first,
+                                 "el KNN geografico viene ordenado");
+                }
+            }
+        }
+
+        SECTION("busqueda por radio en metros contra fuerza bruta");
+        const double radios[3] = {200000.0, 1000000.0, 5000000.0};
+        for (int t = 0; t < 15; ++t) {
+            const double qlon = lonU(r3), qlat = latU(r3);
+            for (int ri = 0; ri < 3; ++ri) {
+                std::vector<RID> got = rg.searchRadio(qlon, qlat, radios[ri]);
+                std::sort(got.begin(), got.end());
+                std::vector<RID> esp;
+                for (const Punto& p : geos)
+                    if (geo::haversine(qlon, qlat, p.x, p.y) <= radios[ri]) esp.push_back(p.rid);
+                std::sort(esp.begin(), esp.end());
+                CHECK_EQ(got.size(), esp.size(), "cantidad de puntos dentro del radio");
+                CHECK(got == esp, "los RID dentro del radio no coinciden con la fuerza bruta");
+            }
+        }
+    }
+
+    SECTION("a 60 grados de latitud la euclidiana en grados da el orden EQUIVOCADO");
+    {
+        // Dos puntos desde (0, 60): uno a un grado al este, otro a 0.9 al norte.
+        // En grados el del norte parece mas cerca (0.9 < 1.0), pero en metros
+        // esta al doble de distancia, porque un grado de longitud a esa latitud
+        // mide la mitad que uno de latitud.
+        resetFile("data/test_rtree_n60.idx");
+        DiskManager dmn("data/test_rtree_n60.idx");
+        BufferPool  bpn(&dmn, 16);
+        RTree       rn(&bpn);
+        const RID este(0, 1), norte(0, 2);
+        rn.insert(MBR::point(1.0, 60.0), este);
+        rn.insert(MBR::point(0.0, 60.9), norte);
+
+        std::vector<std::pair<double, RID>> plano = rn.knn(0.0, 60.0, 1);
+        std::vector<std::pair<double, RID>> esfera = rn.knnGeo(0.0, 60.0, 1);
+        CHECK_EQ(plano.size(), static_cast<std::size_t>(1), "el KNN plano devuelve uno");
+        CHECK_EQ(esfera.size(), static_cast<std::size_t>(1), "el KNN geografico devuelve uno");
+        CHECK(plano[0].second == norte, "en grados gana el del norte (0.9 < 1.0)");
+        CHECK(esfera[0].second == este, "en metros gana el del este: 56 km contra 100 km");
+        CHECK(esfera[0].first < 60000.0, "y esta a menos de 60 km");
+    }
+
+    // ------------------------------------------------------------------
+    //  Geometria de poligonos: filtrado por MBR + refinamiento exacto.
+    // ------------------------------------------------------------------
+    SECTION("punto en poligono por lanzamiento de rayo");
+    {
+        const std::vector<double> cuadrado{0,0, 10,0, 10,10, 0,10};
+        CHECK(poly::contienePunto(cuadrado, 5, 5),      "centro dentro");
+        CHECK(!poly::contienePunto(cuadrado, 15, 5),    "a la derecha fuera");
+        CHECK(!poly::contienePunto(cuadrado, -1, 5),    "a la izquierda fuera");
+        CHECK(!poly::contienePunto(cuadrado, 5, 20),    "arriba fuera");
+
+        // Un triangulo: su caja envolvente contiene esquinas que el triangulo no.
+        const std::vector<double> triangulo{20,0, 30,0, 25,10};
+        CHECK(poly::contienePunto(triangulo, 25, 2),    "dentro del triangulo");
+        CHECK(!poly::contienePunto(triangulo, 21, 9),   "en la caja pero fuera del triangulo");
+        CHECK(poly::envolvente(triangulo).interseca(MBR::point(21, 9)),
+              "y sin embargo la caja SI lo contiene: por eso hace falta refinar");
+
+        // Una L: el hueco del angulo esta dentro de la caja pero fuera de la figura.
+        const std::vector<double> ele{0,0, 10,0, 10,3, 3,3, 3,10, 0,10};
+        CHECK(poly::contienePunto(ele, 1, 1),   "pata de la L");
+        CHECK(poly::contienePunto(ele, 8, 1),   "pie de la L");
+        CHECK(!poly::contienePunto(ele, 8, 8),  "el hueco de la L no esta dentro");
+    }
+
+    SECTION("interseccion poligono-rectangulo: los tres casos");
+    {
+        const std::vector<double> cuadrado{0,0, 10,0, 10,10, 0,10};
+        CHECK(poly::intersecaRect(cuadrado, MBR(5, 5, 15, 15)),  "los bordes se cruzan");
+        CHECK(poly::intersecaRect(cuadrado, MBR(2, 2, 3, 3)),    "el rectangulo esta dentro");
+        CHECK(poly::intersecaRect(cuadrado, MBR(-5, -5, 20, 20)),"el poligono esta dentro");
+        CHECK(!poly::intersecaRect(cuadrado, MBR(20, 20, 30, 30)), "disjuntos");
+
+        // Diagonal fina: su caja ocupa todo el cuadrante, la figura casi nada.
+        const std::vector<double> diag{0,0, 100,100, 99,100, 0,1};
+        CHECK(poly::envolvente(diag).interseca(MBR(90, 0, 95, 5)),
+              "la CAJA de la diagonal si toca esa ventana");
+        CHECK(!poly::intersecaRect(diag, MBR(90, 0, 95, 5)),
+              "pero la GEOMETRIA no: es el falso positivo que el refinamiento mata");
+        CHECK(poly::intersecaRect(diag, MBR(90, 88, 95, 95)),
+              "y donde si pasa la diagonal, se detecta");
+    }
+
+    SECTION("R-Tree sobre poligonos: filtrar + refinar contra fuerza bruta");
+    {
+        resetFile("data/test_rtree_poly.idx");
+        DiskManager dmp("data/test_rtree_poly.idx");
+        BufferPool  bpp(&dmp, 64);
+        RTree       rp(&bpp);
+
+        // 600 triangulos repartidos por el plano. El triangulo es la figura que
+        // mas castiga al MBR: ocupa la mitad de su caja envolvente.
+        std::mt19937 r4(555);
+        std::uniform_real_distribution<double> u(0.0, 500.0);
+        std::vector<std::vector<double>> figuras;
+        std::vector<RID> rids;
+        for (int i = 0; i < 600; ++i) {
+            const double x = u(r4), y = u(r4), lado = 5.0 + u(r4) / 20.0;
+            figuras.push_back({x, y, x + lado, y, x + lado / 2, y + lado});
+            rids.push_back(RID(i / 50, i % 50));
+            rp.insert(poly::envolvente(figuras.back()), rids.back());
+        }
+
+        int total_candidatos = 0, total_exactos = 0;
+        for (int t = 0; t < 40; ++t) {
+            const double x0 = u(r4), y0 = u(r4);
+            const MBR ventana(x0, y0, x0 + 30.0, y0 + 30.0);
+
+            // Paso 1: el indice filtra por caja.
+            std::vector<RID> cand = rp.search(ventana);
+            // Paso 2: refinamiento con la geometria real.
+            std::vector<RID> got;
+            for (const RID& rid : cand) {
+                std::size_t k = static_cast<std::size_t>(rid.page_id) * 50 +
+                                static_cast<std::size_t>(rid.slot);
+                if (poly::intersecaRect(figuras[k], ventana)) got.push_back(rid);
+            }
+            std::sort(got.begin(), got.end());
+
+            // Referencia: comprobar las 600 figuras una por una.
+            std::vector<RID> esp;
+            for (std::size_t k = 0; k < figuras.size(); ++k)
+                if (poly::intersecaRect(figuras[k], ventana)) esp.push_back(rids[k]);
+            std::sort(esp.begin(), esp.end());
+
+            CHECK(got == esp, "filtrar+refinar da lo mismo que revisar las 600 figuras");
+            total_candidatos += static_cast<int>(cand.size());
+            total_exactos    += static_cast<int>(got.size());
+        }
+        CHECK(total_candidatos >= total_exactos,
+              "el indice nunca puede devolver MENOS que la respuesta exacta");
+        CHECK(total_candidatos > total_exactos,
+              "y con triangulos siempre sobran candidatos: por eso el refinamiento existe");
+        std::cout << "   candidatos del indice=" << total_candidatos
+                  << "  exactos=" << total_exactos
+                  << "  descartados por el refinamiento="
+                  << (total_candidatos - total_exactos) << "\n";
     }
 
     DONE("test_rtree");

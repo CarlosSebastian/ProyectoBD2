@@ -1,5 +1,5 @@
 // ============================================================================
-//  table.hpp - Una tabla = motor de almacenamiento + (opcionalmente) un indice
+//  table.hpp - Una tabla = motor de almacenamiento + N indices
 //
 //  Es la primera pieza del motor de consultas: decide sola como resolver una
 //  busqueda y deja registrado el plan en lastPlan(), que es lo que alimenta el
@@ -40,6 +40,9 @@ struct PlanInfo {
     std::string columna;
     long long   paginas_leidas = 0;
     long long   registros      = 0;
+    // Candidatos que el indice devolvio y el refinamiento descarto. Solo tiene
+    // sentido en geometrias no puntuales, donde el MBR es una aproximacion.
+    long long   descartados    = 0;
     double      ms             = 0.0;
 
     std::string str() const;
@@ -79,6 +82,15 @@ public:
     // k vecinos mas cercanos, ya ordenados por distancia creciente.
     // k < 0 significa "todos", ordenados igual.
     std::vector<Tuple> searchKNN(const std::string& col, double px, double py, int k);
+    // Lo mismo pero por distancia GEOGRAFICA en metros (x = lon, y = lat).
+    std::vector<Tuple> searchKNNGeo(const std::string& col, double lon, double lat, int k);
+    // Todos los puntos a no mas de 'metros' del punto dado.
+    std::vector<Tuple> searchRadio(const std::string& col, double lon, double lat, double metros);
+    std::vector<RID>   searchRIDsRadio(const std::string& col, double lon, double lat, double metros);
+    // Poligonos que contienen al punto. Filtra por MBR en el indice y refina
+    // con la geometria real.
+    std::vector<Tuple> searchContains(const std::string& col, double px, double py);
+    std::vector<RID>   searchRIDsContains(const std::string& col, double px, double py);
 
     const PlanInfo& lastPlan() const { return last_plan_; }
 
@@ -99,32 +111,65 @@ public:
     int  indexPages() const;
     // Altura del arbol B+ (0 si el indice no es un B+). La usa el experimento
     // de sensibilidad al tamano de bloque.
-    int  indexHeight() const {
-        if (bt_int_) return bt_int_->getHeight();
-        if (bt_str_) return bt_str_->getHeight();
-        if (rt_)     return rt_->getHeight();
-        return 0;
-    }
+    // Altura del primer arbol que la tenga (B+ o R-Tree). La usa el
+    // experimento de sensibilidad al tamano de bloque, que solo monta uno.
+    int  indexHeight() const;
+    int  indexHeight(const std::string& col) const;
+    std::size_t numIndices() const { return indices_.size(); }
     int  overflowPages() const { return seq_ ? seq_->ovfPages() : 0; }
     long long overflowRecords() const { return seq_ ? seq_->ovfRecords() : 0; }
     bool esSecuencial() const { return seq_ != nullptr; }
     long long heapReads()  const { return store_disk_->readCount(); }
-    long long indexReads() const { return idx_disk_ ? idx_disk_->readCount() : 0; }
+    long long indexReads() const {
+        long long n = 0;
+        for (const Indice& ix : indices_) n += ix.disk->readCount();
+        return n;
+    }
     void resetStats();
     double bufferHitRate() const { return store_bp_->hitRate(); }
 
 private:
-    void   insertIntoIndex(const Value& key, const RID& rid);
-    void   removeFromIndex(const Value& key, const RID& rid);
-    bool   indexedColumn(const std::string& col) const;
+    // ------------------------------------------------------------------
+    //  Un indice vivo: la estructura en disco mas su propio archivo, su
+    //  gestor y su buffer pool. Cada indice es un archivo independiente,
+    //  asi que una tabla puede tener a la vez un B+ sobre la clave primaria
+    //  y un R-Tree sobre una columna POINT sin que se estorben.
+    // ------------------------------------------------------------------
+    struct Indice {
+        int         col  = -1;                 // columna del esquema que indexa
+        IndexKind   kind = IndexKind::BPLUS;
+        std::string columna;                   // nombre, para los mensajes
+
+        std::unique_ptr<DiskManager> disk;
+        std::unique_ptr<BufferPool>  bp;
+
+        std::unique_ptr<BPlusTree<std::int64_t>>      bt_int;
+        std::unique_ptr<BPlusTree<Key32>>             bt_str;
+        std::unique_ptr<ExtendibleHash<std::int64_t>> hs_int;
+        std::unique_ptr<ExtendibleHash<Key32>>        hs_str;
+        std::unique_ptr<RTree>                        rt;
+
+        void soltarEstructuras() {
+            bt_int.reset(); bt_str.reset(); hs_int.reset(); hs_str.reset(); rt.reset();
+        }
+    };
+
+    void   abrirIndice(Indice& ix);                       // crea la estructura en disco
+    void   insertIntoIndex(const Tuple& t, const RID& rid);
+    void   removeFromIndex(const Tuple& t, const RID& rid);
+    const Indice* indicePara(const std::string& col) const;
+    Indice*       indicePara(const std::string& col);
+    bool   indexedColumn(const std::string& col) const { return indicePara(col) != nullptr; }
     int    columnaPunto(const std::string& col) const;   // -1 si no es POINT
+    int    columnaGeom(const std::string& col) const;    // -1 si no es POINT ni POLYGON
+    // Caja envolvente del valor geometrico de una columna (punto o poligono).
+    static MBR cajaDe(const Value& v);
     bool   claveSecuencial(const std::string& col) const;
-    std::vector<RID> indexLookup(const Value& v);
-    std::vector<RID> indexRange(const Value& lo, const Value& hi);
+    static std::vector<RID> indexLookup(const Indice& ix, const Value& v);
+    static std::vector<RID> indexRange(const Indice& ix, const Value& lo, const Value& hi);
     long long lecturasTotales() const;
 
     TableInfo info_;
-    int       key_col_ = -1;          // columna indexada (-1 = sin indice)
     int       seq_col_ = -1;          // columna que ordena el Sequential File
 
     std::unique_ptr<DiskManager>   store_disk_;
@@ -135,13 +180,9 @@ private:
     SequentialFile*                seq_ = nullptr;   // no posee: apunta a engine_
     bool                           auto_reorg_ = true;
 
-    std::unique_ptr<DiskManager> idx_disk_;
-    std::unique_ptr<BufferPool>  idx_bp_;
-    std::unique_ptr<BPlusTree<std::int64_t>>      bt_int_;
-    std::unique_ptr<BPlusTree<Key32>>             bt_str_;
-    std::unique_ptr<ExtendibleHash<std::int64_t>> hs_int_;
-    std::unique_ptr<ExtendibleHash<Key32>>        hs_str_;
-    std::unique_ptr<RTree>                        rt_;      // indice espacial
+    std::vector<Indice> indices_;
+    std::string         data_dir_;
+    int                 pool_size_ = 64;
 
     PlanInfo last_plan_;
 };

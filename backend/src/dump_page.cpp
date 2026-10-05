@@ -218,6 +218,11 @@ constexpr int BP_KS       = 8;                         // claves int64
 constexpr int BP_VS       = 8;                         // sizeof(RID)
 constexpr int BP_LEAF_MAX = (PAGE_SIZE - BP_HDR) / (BP_KS + BP_VS);
 constexpr int BP_INT_MAXK = (PAGE_SIZE - BP_HDR - 4) / (BP_KS + 4);
+constexpr int RT_HDR      = 8;                         // rtree.hpp
+constexpr int RT_MBR      = 32;                        // cuatro doubles
+constexpr int RT_LEAF_MAX = (PAGE_SIZE - RT_HDR) / (RT_MBR + 8);
+constexpr int RT_INT_MAX  = (PAGE_SIZE - RT_HDR) / (RT_MBR + 4);
+constexpr std::int32_t RT_MAGIC = 0x52545245;          // "RTRE"
 constexpr int EH_HDR      = 12;                        // extendible_hash.hpp
 
 void dumpBPlus(const char* b, int numero, bool hex_completo) {
@@ -351,6 +356,74 @@ void dumpHash(const char* b, int numero, bool hex_completo) {
     std::cout << "\n";
 }
 
+// ---------------------------------------------------------------------------
+//  Indice espacial R-Tree. A diferencia del B+, un nodo no guarda claves sino
+//  CAJAS ENVOLVENTES de 32 bytes, y las hojas apuntan al dato por RID.
+// ---------------------------------------------------------------------------
+void dumpRTree(const char* b, int numero, bool hex_completo) {
+    linea('=');
+    std::cout << "  PAGINA " << numero << " del indice R-Tree   (offset "
+              << static_cast<long long>(numero) * PAGE_SIZE << ")\n";
+    linea('=');
+
+    if (numero == 0) {
+        std::cout << "\nPAGINA META\n";
+        std::cout << "  off  tam  campo                valor               bytes en disco\n";
+        linea();
+        campo("raiz",         0, 4, pid(readAt<page_id_t>(b, 0)), b);
+        campo("altura",       4, 4, std::to_string(readAt<std::int32_t>(b, 4)), b);
+        campo("num_entradas", 8, 8, std::to_string(readAt<std::int64_t>(b, 8)), b);
+        campo("MAGIC",       16, 4, "\"RTRE\"", b);
+        std::cout << "\n  Fan-out con esta pagina: " << RT_LEAF_MAX
+                  << " entradas por hoja, " << RT_INT_MAX << " por nodo interno.\n"
+                     "  Cada entrada es un MBR de " << RT_MBR << " B (minx,miny,maxx,maxy)\n"
+                     "  mas su RID (8 B) en las hojas o su page_id (4 B) en los internos.\n\n";
+        linea();
+        volcadoHex(b, 0, 32);
+        std::cout << "\n";
+        return;
+    }
+
+    const bool hoja = readAt<std::uint8_t>(b, 0) != 0;
+    const int  n    = readAt<std::uint16_t>(b, 1);
+    const int  cap  = hoja ? RT_LEAF_MAX : RT_INT_MAX;
+
+    std::cout << "\nCABECERA DE NODO (" << RT_HDR << " bytes)\n";
+    std::cout << "  off  tam  campo                valor               bytes en disco\n";
+    linea();
+    campo("es_hoja",   0, 1, hoja ? "1 (HOJA)" : "0 (INTERNO)", b);
+    campo("n_entradas", 1, 2, std::to_string(n), b);
+
+    std::cout << "\n" << (hoja ? "CAJAS + RID" : "CAJAS + HIJO")
+              << "  (" << n << " de " << cap << " posibles)\n";
+    std::cout << "    i          minx        miny        maxx        maxy   "
+              << (hoja ? "    RID" : "   hijo") << "   off_mbr\n";
+    linea();
+    const int tope = (n < 10) ? n : 10;
+    for (int i = 0; i < tope; ++i) {
+        const int om = RT_HDR + i * RT_MBR;
+        std::cout << "  " << std::setw(3) << std::right << i << "  ";
+        for (int c = 0; c < 4; ++c)
+            std::cout << std::setw(11) << std::right << std::fixed << std::setprecision(3)
+                      << readAt<double>(b, om + c * 8) << " ";
+        if (hoja) {
+            const RID r = readAt<RID>(b, RT_HDR + RT_LEAF_MAX * RT_MBR + i * 8);
+            std::cout << "  " << std::setw(9) << std::left << r.str();
+        } else {
+            const page_id_t h = readAt<page_id_t>(b, RT_HDR + RT_INT_MAX * RT_MBR + i * 4);
+            std::cout << "  " << std::setw(9) << std::left << pid(h);
+        }
+        std::cout << "  " << om << "\n";
+    }
+    if (n > tope) std::cout << "  ... y " << (n - tope) << " entrada(s) mas\n";
+
+    std::cout << "\n  Un MBR con minx==maxx y miny==maxy es un PUNTO; si difieren,\n"
+                 "  es la caja envolvente de un poligono (o de un subarbol entero).\n\n";
+    linea();
+    volcadoHex(b, 0, hex_completo ? PAGE_SIZE : 96);
+    std::cout << "\n";
+}
+
 void uso() {
     std::cout <<
       "uso: dump_page <archivo> [pagina] [--hex]\n"
@@ -360,9 +433,10 @@ void uso() {
       "  --hex        volcado hexadecimal de los " << PAGE_SIZE << " bytes\n"
       "  --resumen    una linea por pagina del archivo\n"
       "  --bplus      forzar la lectura como indice B+\n"
-      "  --hash       forzar la lectura como indice hash extensible\n\n"
-      "  Los .idx se detectan solos; --bplus/--hash solo hacen falta si el\n"
-      "  archivo tiene otro nombre.\n";
+      "  --hash       forzar la lectura como indice hash extensible\n"
+      "  --rtree      forzar la lectura como indice espacial R-Tree\n\n"
+      "  Los .idx se detectan solos; --bplus/--hash/--rtree solo hacen falta si\n"
+      "  el archivo tiene otro nombre.\n";
 }
 
 }  // namespace
@@ -372,7 +446,7 @@ int main(int argc, char** argv) {
 
     const std::string ruta = argv[1];
     bool quiere_resumen = false, hex_completo = false;
-    enum class Formato { SLOTTED, BPLUS, HASH } formato = Formato::SLOTTED;
+    enum class Formato { SLOTTED, BPLUS, HASH, RTREE } formato = Formato::SLOTTED;
     long long numero = 0;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -380,6 +454,7 @@ int main(int argc, char** argv) {
         else if (a == "--hex")     hex_completo   = true;
         else if (a == "--bplus")   formato        = Formato::BPLUS;
         else if (a == "--hash")    formato        = Formato::HASH;
+        else if (a == "--rtree")   formato        = Formato::RTREE;
         else if (a == "--help" || a == "-h") { uso(); return 0; }
         else                       numero = std::atoll(a.c_str());
     }
@@ -411,15 +486,23 @@ int main(int argc, char** argv) {
         //   B+   -> es un NODO: el byte 0 es la bandera es_hoja, 0 o 1.
         //   hash -> es el DIRECTORIO: el byte 0 es el page_id de un bucket,
         //           y los buckets viven de la pagina 2 en adelante.
-        formato = Formato::BPLUS;
-        if (paginas > 1) {
-            std::vector<char> p1(PAGE_SIZE);
-            f.clear(); f.seekg(PAGE_SIZE, std::ios::beg); f.read(p1.data(), PAGE_SIZE);
-            if (static_cast<unsigned char>(p1[0]) >= 2) formato = Formato::HASH;
+        // El R-Tree si deja firma: MAGIC "RTRE" en el offset 16 de la META.
+        std::vector<char> p0(PAGE_SIZE);
+        f.clear(); f.seekg(0, std::ios::beg); f.read(p0.data(), PAGE_SIZE);
+        if (readAt<std::int32_t>(p0.data(), 16) == RT_MAGIC) {
+            formato = Formato::RTREE;
+        } else {
+            formato = Formato::BPLUS;
+            if (paginas > 1) {
+                std::vector<char> p1(PAGE_SIZE);
+                f.clear(); f.seekg(PAGE_SIZE, std::ios::beg); f.read(p1.data(), PAGE_SIZE);
+                if (static_cast<unsigned char>(p1[0]) >= 2) formato = Formato::HASH;
+            }
         }
         std::cout << "  formato detectado: indice "
-                  << (formato == Formato::HASH ? "HASH EXTENSIBLE" : "ARBOL B+")
-                  << "   (--bplus / --hash para forzarlo)\n";
+                  << (formato == Formato::RTREE ? "R-TREE ESPACIAL"
+                      : formato == Formato::HASH ? "HASH EXTENSIBLE" : "ARBOL B+")
+                  << "   (--bplus / --hash / --rtree para forzarlo)\n";
     }
 
     if (quiere_resumen) {
@@ -444,6 +527,7 @@ int main(int argc, char** argv) {
     switch (formato) {
         case Formato::BPLUS: dumpBPlus(buf.data(), static_cast<int>(numero), hex_completo); break;
         case Formato::HASH:  dumpHash (buf.data(), static_cast<int>(numero), hex_completo); break;
+        case Formato::RTREE: dumpRTree(buf.data(), static_cast<int>(numero), hex_completo); break;
         default:             mostrarPagina(buf.data(), static_cast<int>(numero), hex_completo);
     }
     return 0;

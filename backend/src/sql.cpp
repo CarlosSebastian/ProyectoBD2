@@ -172,6 +172,28 @@ private:
         return v;
     }
 
+    // POLYGON((x1,y1),(x2,y2),...). Anillo cerrado; no hace falta repetir el
+    // primer vertice al final.
+    Value esperaPoligono() {
+        esperaPalabra("POLYGON");
+        esperaSimbolo("(");
+        std::vector<double> vs;
+        while (true) {
+            esperaSimbolo("(");
+            vs.push_back(esperaDouble());
+            esperaSimbolo(",");
+            vs.push_back(esperaDouble());
+            esperaSimbolo(")");
+            if (esSimbolo(",")) { avanza(); continue; }
+            break;
+        }
+        esperaSimbolo(")");
+        if (vs.size() < 6)
+            throw DBException("Un POLYGON necesita al menos tres vertices; se vieron " +
+                              std::to_string(vs.size() / 2) + ".");
+        return Value::makePolygon(std::move(vs));
+    }
+
     // POINT(x, y). Es el unico literal compuesto del lenguaje.
     Value esperaPunto() {
         esperaPalabra("POINT");
@@ -184,7 +206,8 @@ private:
     }
 
     Value esperaLiteral() {
-        if (esPalabra("POINT")) return esperaPunto();
+        if (esPalabra("POINT"))   return esperaPunto();
+        if (esPalabra("POLYGON")) return esperaPoligono();
         if (cur().tipo == Tok::NUMBER) {
             Value v = cur().decimal ? Value::makeDouble(std::atof(cur().texto.c_str()))
                                     : Value::makeInt(std::atoll(cur().texto.c_str()));
@@ -210,8 +233,9 @@ private:
             return Type::VARCHAR;
         }
         if (t == "POINT" || t == "GEOPOINT") return Type::POINT;
+        if (t == "POLYGON" || t == "GEOMETRY") return Type::POLYGON;
         throw DBException("Tipo no soportado: '" + t +
-                          "'. Use INT, FLOAT/DOUBLE, CHAR(n)/VARCHAR(n) o POINT.");
+                          "'. Use INT, FLOAT/DOUBLE, CHAR(n)/VARCHAR(n), POINT o POLYGON.");
     }
 
     Statement parseCreateTable() {
@@ -303,20 +327,28 @@ Statement parseInsert() {
         }
         esperaPalabra("FROM");
         st.table = esperaNombre();
-        if (esPalabra("WHERE")) { avanza(); st.where = parseWhere(); }
+        if (esPalabra("WHERE")) { avanza(); st.where = parseWhere(&st.extra); }
         if (esPalabra("ORDER")) {
             avanza();
             esperaPalabra("BY");
-            st.knn_column = esperaNombre();
-            if (!esSimbolo("<->"))
-                throw DBException(
-                    "Solo se admite ordenar por distancia: ORDER BY " + st.knn_column +
-                    " <-> POINT(x, y). Se encontro '" + cur().texto + "'.");
-            avanza();
-            Value p = esperaPunto();
-            st.knn   = true;
-            st.knn_x = p.d;
-            st.knn_y = p.y;
+            if (esPalabra("ST_DISTANCE")) {
+                // Orden por distancia geografica real (metros).
+                esperaStDistance(&st.knn_column, &st.knn_x, &st.knn_y);
+                st.knn     = true;
+                st.knn_geo = true;
+            } else {
+                st.knn_column = esperaNombre();
+                if (!esSimbolo("<->"))
+                    throw DBException(
+                        "Solo se admite ordenar por distancia: ORDER BY " + st.knn_column +
+                        " <-> POINT(x, y), o bien ORDER BY ST_DISTANCE(" + st.knn_column +
+                        ", POINT(lon, lat)). Se encontro '" + cur().texto + "'.");
+                avanza();
+                Value p = esperaPunto();
+                st.knn   = true;
+                st.knn_x = p.d;
+                st.knn_y = p.y;
+            }
         }
         if (esPalabra("LIMIT")) { avanza(); st.limit = esperaEntero(); }
         finSentencia();
@@ -328,23 +360,67 @@ Statement parseInsert() {
         st.kind = StmtKind::DELETE_;
         esperaPalabra("FROM");
         st.table = esperaNombre();
-        if (esPalabra("WHERE")) { avanza(); st.where = parseWhere(); }
+        if (esPalabra("WHERE")) { avanza(); st.where = parseWhere(&st.extra); }
         finSentencia();
         if (st.where.kind == PredKind::NONE)
             throw DBException("DELETE sin WHERE no esta permitido (borraria la tabla entera)");
         return st;
     }
 
-    // col = v | col BETWEEN a AND b | col <op> v [AND col <op> v]
-    Predicate parseWhere() {
+    // Una sola condicion:
+    //    col = v | col BETWEEN a AND b | col WITHIN (...) | col <op> v
+    // ST_DISTANCE(col, POINT(lon, lat)) -> deja en 'col' la columna y en
+    // (*lon,*lat) el punto de referencia.
+    void esperaStDistance(std::string* col, double* lon, double* lat) {
+        esperaPalabra("ST_DISTANCE");
+        esperaSimbolo("(");
+        *col = esperaNombre();
+        esperaSimbolo(",");
+        Value p = esperaPunto();
+        esperaSimbolo(")");
+        *lon = p.d; *lat = p.y;
+    }
+
+    Predicate parseCondicion() {
         Predicate pr;
+
+        // Contencion: ST_CONTAINS(col, POINT(x,y))
+        if (esPalabra("ST_CONTAINS")) {
+            avanza();
+            esperaSimbolo("(");
+            pr.column = esperaNombre();
+            esperaSimbolo(",");
+            Value q = esperaPunto();
+            esperaSimbolo(")");
+            pr.qlon = q.d;
+            pr.qlat = q.y;
+            pr.kind = PredKind::CONTIENE;
+            return pr;
+        }
+
+        // Radio geografico: ST_DISTANCE(col, POINT(lon,lat)) <= metros
+        if (esPalabra("ST_DISTANCE")) {
+            esperaStDistance(&pr.column, &pr.qlon, &pr.qlat);
+            if (cur().tipo != Tok::SYMBOL ||
+                (cur().texto != "<" && cur().texto != "<="))
+                throw DBException(
+                    "ST_DISTANCE solo se compara con < o <= en el WHERE: "
+                    "ST_DISTANCE(" + pr.column + ", POINT(lon,lat)) <= metros. "
+                    "Se encontro '" + cur().texto + "'.");
+            pr.radio_estricto = (cur().texto == "<");
+            avanza();
+            pr.metros = esperaDouble();
+            pr.kind   = PredKind::RADIO;
+            return pr;
+        }
+
         pr.column = esperaNombre();
 
         if (esPalabra("BETWEEN")) {
             avanza();
             pr.kind = PredKind::RANGE;
             pr.lo   = esperaLiteral();
-            esperaPalabra("AND");
+            esperaPalabra("AND");          // este AND pertenece al BETWEEN
             pr.hi = esperaLiteral();
             return pr;
         }
@@ -382,25 +458,37 @@ Statement parseInsert() {
         } else {
             throw DBException("Operador no soportado: '" + op + "'. Use =, <, <=, > o >=.");
         }
-
-        // segunda cota opcional: ... AND col <op> v
-        if (esPalabra("AND")) {
-            avanza();
-            std::string col2 = esperaNombre();
-            if (col2 != pr.column)
-                throw DBException("Solo se admiten predicados sobre una columna; se vio '" +
-                                  pr.column + "' y '" + col2 + "'");
-            if (cur().tipo != Tok::SYMBOL) throw DBException("Se esperaba un operador tras AND");
-            std::string op2 = cur().texto;
-            avanza();
-            Value v2 = esperaLiteral();
-            if (op2 == ">" || op2 == ">=")      { pr.lo = v2; pr.lo_abierto = false;
-                                                  pr.lo_estricto = (op2 == ">"); }
-            else if (op2 == "<" || op2 == "<=") { pr.hi = v2; pr.hi_abierto = false;
-                                                  pr.hi_estricto = (op2 == "<"); }
-            else throw DBException("Operador no soportado tras AND: '" + op2 + "'");
-        }
         return pr;
+    }
+
+    // Lista de condiciones unidas por AND. Las de la MISMA columna que sean
+    // rangos se fusionan en uno solo --'id >= 100 AND id <= 500' tiene que
+    // seguir llegando al B+ como un rango cerrado, no como dos filtros-- y las
+    // de columnas distintas quedan como entradas separadas de la lista.
+    Predicate parseWhere(std::vector<Predicate>* extra) {
+        std::vector<Predicate> todas;
+        while (true) {
+            Predicate p = parseCondicion();
+
+            bool fusionada = false;
+            if (p.kind == PredKind::RANGE) {
+                for (Predicate& q : todas) {
+                    if (q.column != p.column || q.kind != PredKind::RANGE) continue;
+                    if (!p.lo_abierto) { q.lo = p.lo; q.lo_abierto = false; q.lo_estricto = p.lo_estricto; }
+                    if (!p.hi_abierto) { q.hi = p.hi; q.hi_abierto = false; q.hi_estricto = p.hi_estricto; }
+                    fusionada = true;
+                    break;
+                }
+            }
+            if (!fusionada) todas.push_back(p);
+
+            if (esPalabra("AND")) { avanza(); continue; }
+            break;
+        }
+
+        extra->clear();
+        for (std::size_t i = 1; i < todas.size(); ++i) extra->push_back(todas[i]);
+        return todas.front();
     }
 
     void finSentencia() {

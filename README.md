@@ -123,6 +123,104 @@ En `POINT(x, y)` la **x es la longitud** y la **y la latitud**, que es el orden
 (este, norte) de la cartografía; el visor de mapa las invierte al dibujar
 porque Leaflet pide `[lat, lon]`.
 
+#### Distancia geográfica
+
+`<->` es la distancia **euclidiana en grados**, que es lo correcto en un plano
+cartesiano pero no mide nada en la Tierra: un grado de latitud son siempre
+~111 km, pero uno de longitud mide 111 km en el ecuador y cero en el polo.
+`ST_DISTANCE` devuelve **metros reales** (haversine):
+
+```sql
+-- radio: todo lo que esté a menos de 5 km
+SELECT * FROM lugares WHERE ST_DISTANCE(ubic, POINT(-77.0300,-12.0460)) <= 5000;
+
+-- KNN geográfico
+SELECT * FROM lugares ORDER BY ST_DISTANCE(ubic, POINT(-77.0300,-12.0460)) LIMIT 5;
+```
+
+La diferencia no es cosmética. A 60° de latitud, un punto a 1,0° al este está a
+55,6 km y uno a 0,9° al norte está a 100,1 km: en grados gana el segundo, en
+metros el primero. `<->` devuelve el orden equivocado y `ST_DISTANCE` el
+correcto; hay un test que fija exactamente ese caso.
+
+#### Polígonos
+
+Además de `POINT` hay `POLYGON`, un anillo de vértices de longitud variable:
+
+```sql
+CREATE TABLE zonas (id INT PRIMARY KEY, nombre CHAR(24), area POLYGON);
+INSERT INTO zonas VALUES (1,'Centro', POLYGON((-77.05,-12.06),(-77.01,-12.06),(-77.01,-12.03)));
+CREATE INDEX ix_area ON zonas (area) USING RTREE;
+
+SELECT * FROM zonas WHERE ST_CONTAINS(area, POINT(-77.03,-12.05));
+SELECT * FROM zonas WHERE area WITHIN (-77.1,-12.2,-77.0,-12.0);
+```
+
+Acá aparece algo que con puntos no se ve. El R-Tree indexa un polígono por su
+**caja envolvente**, que es solo una aproximación: un triángulo ocupa la mitad
+de su caja, y una diagonal fina ocupa casi nada de la suya. Por eso toda
+consulta sobre polígonos tiene **dos pasos**, igual que en los motores
+espaciales reales:
+
+1. **Filtrado** — el índice devuelve los candidatos cuya caja interseca.
+2. **Refinamiento** — se comprueba la geometría de verdad (punto en polígono
+   por lanzamiento de rayo, o intersección polígono-rectángulo) y se descartan
+   los falsos positivos.
+
+El plan lo declara: `INDEX RTREE (contiene + refinamiento)`, con una línea
+`Refinamiento geométrico` que dice cuántos candidatos del índice se cayeron al
+mirar la geometría. En el test con 600 triángulos, el índice entrega 222
+candidatos y el refinamiento deja 205.
+
+Las consultas de distancia (`<->`, `ST_DISTANCE`) son solo para `POINT`: el
+best-first supone que las hojas son puntos, y con polígonos esa suposición no
+vale.
+
+Las consultas de distancia las resuelve el R-Tree, y el resultado es **exacto**. Eso
+exige que el MINDIST usado para podar sea una **cota inferior** de la distancia
+real: si se pasara, el best-first descartaría un nodo que sí contenía un vecino
+más cercano. La aproximación plana (`Δlon × metros_por_grado`) no sirve — se
+pasa cuando la diferencia de longitud es grande, porque el plano estira lo que
+la esfera acorta. La cota que usa el motor va por el **acorde en 3D**: se
+construye una caja alineada a los ejes en el espacio que contiene al parche
+esférico y se mide del punto de consulta a esa caja; como la caja contiene al
+parche, esa distancia nunca supera el acorde real. Hay un test que lo verifica
+por fuerza bruta sobre cajas al azar.
+
+Una tabla admite **un índice por columna**, no uno en total: lo normal es tener
+un B+ sobre la clave primaria y además un R-Tree sobre la columna `POINT`. Cada
+índice vive en su propio archivo con su gestor de disco y su buffer pool, y la
+tabla los mantiene coherentes: un `INSERT` entra en todos y un `DELETE` sale de
+todos.
+
+### Consultas híbridas
+
+Un `WHERE` admite varias condiciones unidas por `AND` sobre **columnas
+distintas**. Las que caen sobre la misma columna se fusionan en un solo rango
+(`id >= 100 AND id <= 500` sigue llegando al B+ como un rango cerrado); las de
+columnas distintas quedan como una lista, y el planificador elige **una** para
+resolver el acceso y aplica el resto como filtro sobre las filas recuperadas.
+
+```sql
+SELECT * FROM lugares WHERE id > 100 AND ubic WITHIN (0,0,9,9);
+```
+
+El criterio es la selectividad esperada por la forma del predicado, que es lo
+único que se puede saber sin estadísticas: una igualdad sobre columna indexada
+devuelve del orden de una fila, una ventana espacial un área acotada, y un rango
+puede devolver media tabla. Por eso una igualdad manda sobre un `WITHIN` aunque
+el R-Tree sea barato de recorrer — lo que se minimiza no es el costo del índice
+sino cuántas filas llegan al filtro. El panel de plan lo dice explícitamente:
+
+```
+Planificacion: IndexScan | BPLUS sobre id  [conduce id; filtra ubic]
+Filtro residual | 1 filas del indice -> 1 tras aplicar 1 condicion(es) en memoria
+```
+
+Es una heurística, no una estimación: no mira histogramas ni cardinalidades.
+Sustituirla por una estimación real de selectividad es la mejora que el
+Experimento 3 dejó identificada.
+
 El KNN usa búsqueda *best-first* con una cola de prioridad por MINDIST, así que
 el resultado es **exacto**, no aproximado: visita el mínimo de nodos necesario.
 Sobre 20 000 puntos, un KNN con k=10 cuesta 18 accesos a página frente a los

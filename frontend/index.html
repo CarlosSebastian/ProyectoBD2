@@ -231,6 +231,9 @@ const EJEMPLOS = [
   ["Espacial: crear", "CREATE TABLE lugares (id INT PRIMARY KEY, nombre CHAR(40), ubic POINT);\nINSERT INTO lugares VALUES (1,'UTEC Barranco',POINT(-77.0220,-12.1350)),(2,'Plaza de Armas',POINT(-77.0300,-12.0460)),(3,'Miraflores',POINT(-77.0300,-12.1200)),(4,'Callao',POINT(-77.1180,-12.0560)),(5,'Cusco',POINT(-71.9780,-13.5320));\nCREATE INDEX idx_ubic ON lugares (ubic) USING RTREE;"],
   ["Ventana",      "SELECT * FROM lugares WHERE ubic WITHIN (-77.2, -12.2, -76.9, -12.0);"],
   ["KNN",          "SELECT * FROM lugares ORDER BY ubic <-> POINT(-77.0300,-12.0460) LIMIT 3;"],
+  ["KNN geográfico", "SELECT * FROM lugares ORDER BY ST_DISTANCE(ubic, POINT(-77.0300,-12.0460)) LIMIT 3;"],
+  ["Radio (metros)", "SELECT * FROM lugares WHERE ST_DISTANCE(ubic, POINT(-77.0300,-12.0460)) <= 12000;"],
+  ["Polígonos",    "CREATE TABLE zonas (id INT PRIMARY KEY, nombre CHAR(24), area POLYGON);\nINSERT INTO zonas VALUES (1,'Centro',POLYGON((-77.05,-12.06),(-77.01,-12.06),(-77.01,-12.03),(-77.05,-12.03))),(2,'Sur',POLYGON((-77.05,-12.16),(-77.00,-12.16),(-77.00,-12.10),(-77.05,-12.10)));\nCREATE INDEX ix_area ON zonas (area) USING RTREE;\nSELECT * FROM zonas WHERE ST_CONTAINS(area, POINT(-77.0300,-12.0460));"],
 ];
 
 function escapar(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -423,11 +426,31 @@ function parsePunto(txt){
   return m ? {x: parseFloat(m[1]), y: parseFloat(m[2])} : null;
 }
 
-// Columna del resultado cuyos valores parecen puntos.
+// POLYGON((x1,y1),(x2,y2),...) -> lista de vertices
+function parsePoligono(txt){
+  const s = String(txt).trim();
+  if(!s.startsWith('POLYGON(')) return null;
+  const vs = [];
+  const re = /\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)/g;
+  let m;
+  while((m = re.exec(s.slice(8))) !== null) vs.push({x: parseFloat(m[1]), y: parseFloat(m[2])});
+  return vs.length >= 3 ? vs : null;
+}
+
+// Un valor geometrico es un punto o un poligono.
+function parseGeom(txt){
+  const p = parsePunto(txt);
+  if(p) return {tipo:'punto', punto:p};
+  const g = parsePoligono(txt);
+  if(g) return {tipo:'poligono', vertices:g};
+  return null;
+}
+
+// Columna del resultado cuyos valores son todos geometrias.
 function columnaPunto(d){
   if(!d.columns || !d.rows.length) return -1;
   for(let c = 0; c < d.columns.length; c++){
-    if(d.rows.every(f => parsePunto(f[c]))) return c;
+    if(d.rows.every(f => parseGeom(f[c]))) return c;
   }
   return -1;
 }
@@ -458,19 +481,33 @@ function pintarMapa(resp, sql){
   for(let c = 0; c < d.columns.length; c++) if(c !== ci){ cEtiqueta = c; break; }
 
   const puntos = [];
+  let nPuntos = 0, nPoligonos = 0;
   d.rows.forEach((f, i) => {
-    const p = parsePunto(f[ci]); if(!p) return;
-    puntos.push([p.y, p.x]);
-    L.circleMarker([p.y, p.x], {radius:6, color:'#d97706', weight:2,
-                                fillColor:'#d97706', fillOpacity:.65})
-      .bindPopup(`<b>${escapar(cEtiqueta >= 0 ? f[cEtiqueta] : '#' + (i+1))}</b><br>` +
-                 `${escapar(d.columns[ci])} = ${escapar(f[ci])}`)
-      .addTo(capaMapa);
+    const g = parseGeom(f[ci]); if(!g) return;
+    const etiqueta = escapar(cEtiqueta >= 0 ? f[cEtiqueta] : '#' + (i+1));
+    if(g.tipo === 'punto'){
+      const p = g.punto;
+      puntos.push([p.y, p.x]);
+      nPuntos++;
+      L.circleMarker([p.y, p.x], {radius:6, color:'#d97706', weight:2,
+                                  fillColor:'#d97706', fillOpacity:.65})
+        .bindPopup(`<b>${etiqueta}</b><br>${escapar(d.columns[ci])} = ${escapar(f[ci])}`)
+        .addTo(capaMapa);
+    } else {
+      // Leaflet pide [lat, lon]: se invierte cada vertice igual que un punto.
+      const anillo = g.vertices.map(v => [v.y, v.x]);
+      anillo.forEach(v => puntos.push(v));
+      nPoligonos++;
+      L.polygon(anillo, {color:'#d97706', weight:2, fillColor:'#d97706', fillOpacity:.25})
+        .bindPopup(`<b>${etiqueta}</b><br>${g.vertices.length} vértices`)
+        .addTo(capaMapa);
+    }
   });
 
   // Dibujar tambien la geometria de la consulta: el rectangulo del WITHIN o el
   // punto de referencia del KNN. Se leen del SQL que se acaba de ejecutar.
-  let nota = `${puntos.length} punto(s)`;
+  let nota = nPoligonos ? `${nPuntos} punto(s), ${nPoligonos} polígono(s)`
+                        : `${nPuntos} punto(s)`;
   const w = /WITHIN\s*\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)/i.exec(sql);
   if(w){
     const x0=+w[1], y0=+w[2], x1=+w[3], y1=+w[4];

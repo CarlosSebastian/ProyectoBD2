@@ -28,7 +28,8 @@ static std::string joinPath(const std::string& dir, const std::string& file) {
 }
 
 // ---------------------------------------------------------------------------
-Table::Table(const std::string& data_dir, const TableInfo& info, int pool_size) : info_(info) {
+Table::Table(const std::string& data_dir, const TableInfo& info, int pool_size)
+    : info_(info), data_dir_(data_dir), pool_size_(pool_size) {
     store_disk_ = std::make_unique<DiskManager>(joinPath(data_dir, info_.heap_file));
     store_bp_   = std::make_unique<BufferPool>(store_disk_.get(), pool_size);
 
@@ -53,57 +54,81 @@ Table::Table(const std::string& data_dir, const TableInfo& info, int pool_size) 
         engine_ = std::make_unique<HeapFile>(store_bp_.get());
     }
 
-    if (!info_.indexes.empty()) {
-        const IndexInfo& ix = info_.indexes.front();   // un indice por tabla
-        key_col_ = info_.schema.indexOf(ix.column);
-        if (key_col_ < 0) throw DBException("La columna indexada no existe: " + ix.column);
+    // Un indice por cada entrada del catalogo. Cada uno con su archivo, su
+    // DiskManager y su BufferPool propios.
+    for (const IndexInfo& meta : info_.indexes) {
+        Indice ix;
+        ix.col     = info_.schema.indexOf(meta.column);
+        ix.kind    = meta.kind;
+        ix.columna = meta.column;
+        if (ix.col < 0) throw DBException("La columna indexada no existe: " + meta.column);
 
-        Type kt = info_.schema[key_col_].type;
-        if (ix.kind == IndexKind::RTREE) {
-            if (kt != Type::POINT)
-                throw DBException("Un indice RTREE solo se puede crear sobre una columna POINT: '" +
-                                  ix.column + "' es " + typeName(kt));
+        const Type kt = info_.schema[static_cast<std::size_t>(ix.col)].type;
+        if (meta.kind == IndexKind::RTREE) {
+            if (kt != Type::POINT && kt != Type::POLYGON)
+                throw DBException("Un indice RTREE solo se crea sobre POINT o POLYGON: '" +
+                                  meta.column + "' es " + typeName(kt));
         } else {
             if (kt == Type::DOUBLE)
                 throw DBException("Aun no se indexan columnas DOUBLE");
-            if (kt == Type::POINT)
-                throw DBException("Una columna POINT solo admite un indice RTREE: '" + ix.column + "'");
+            if (kt == Type::POINT || kt == Type::POLYGON)
+                throw DBException("Una columna " + typeName(kt) +
+                                  " solo admite un indice RTREE: '" + meta.column + "'");
         }
 
-        idx_disk_ = std::make_unique<DiskManager>(joinPath(data_dir, ix.file));
-        idx_bp_   = std::make_unique<BufferPool>(idx_disk_.get(), pool_size);
+        ix.disk = std::make_unique<DiskManager>(joinPath(data_dir, meta.file));
+        ix.bp   = std::make_unique<BufferPool>(ix.disk.get(), pool_size);
 
+        bool hay_que_repoblar = false;
         try {
-            if (ix.kind == IndexKind::RTREE) {
-                rt_ = std::make_unique<RTree>(idx_bp_.get());
-            } else if (ix.kind == IndexKind::BPLUS) {
-                if (kt == Type::INT) bt_int_ = std::make_unique<BPlusTree<std::int64_t>>(idx_bp_.get());
-                else                 bt_str_ = std::make_unique<BPlusTree<Key32>>(idx_bp_.get());
-            } else {
-                if (kt == Type::INT) hs_int_ = std::make_unique<ExtendibleHash<std::int64_t>>(idx_bp_.get());
-                else                 hs_str_ = std::make_unique<ExtendibleHash<Key32>>(idx_bp_.get());
-            }
+            abrirIndice(ix);
         } catch (const DBException&) {
             // El .idx que hay en disco no es del tipo que declara el catalogo:
             // es un archivo viejo que quedo de un indice anterior. El catalogo
             // manda, y un indice siempre se puede reconstruir desde los datos,
             // asi que se tira el archivo y se repuebla en vez de dejar la tabla
             // inaccesible.
-            buildIndex();
+            hay_que_repoblar = true;
         }
+        indices_.push_back(std::move(ix));
+        if (hay_que_repoblar) buildIndex();
     }
 }
 
-bool Table::indexedColumn(const std::string& col) const {
-    return key_col_ >= 0 && info_.schema[key_col_].name == col;
+// Crea (o abre) la estructura concreta segun el tipo de indice y el de la columna.
+void Table::abrirIndice(Indice& ix) {
+    const Type kt = info_.schema[static_cast<std::size_t>(ix.col)].type;
+    switch (ix.kind) {
+        case IndexKind::RTREE:
+            ix.rt = std::make_unique<RTree>(ix.bp.get());
+            break;
+        case IndexKind::BPLUS:
+            if (kt == Type::INT) ix.bt_int = std::make_unique<BPlusTree<std::int64_t>>(ix.bp.get());
+            else                 ix.bt_str = std::make_unique<BPlusTree<Key32>>(ix.bp.get());
+            break;
+        case IndexKind::HASH:
+            if (kt == Type::INT) ix.hs_int = std::make_unique<ExtendibleHash<std::int64_t>>(ix.bp.get());
+            else                 ix.hs_str = std::make_unique<ExtendibleHash<Key32>>(ix.bp.get());
+            break;
+    }
 }
+
+const Table::Indice* Table::indicePara(const std::string& col) const {
+    for (const Indice& ix : indices_) if (ix.columna == col) return &ix;
+    return nullptr;
+}
+Table::Indice* Table::indicePara(const std::string& col) {
+    for (Indice& ix : indices_) if (ix.columna == col) return &ix;
+    return nullptr;
+}
+
 bool Table::claveSecuencial(const std::string& col) const {
     return seq_ != nullptr && seq_col_ >= 0 && info_.schema[seq_col_].name == col;
 }
 long long Table::lecturasTotales() const {
-    return store_disk_->readCount()
-         + (ovf_disk_ ? ovf_disk_->readCount() : 0)
-         + (idx_disk_ ? idx_disk_->readCount() : 0);
+    long long n = store_disk_->readCount() + (ovf_disk_ ? ovf_disk_->readCount() : 0);
+    for (const Indice& ix : indices_) n += ix.disk->readCount();
+    return n;
 }
 
 // Indice de la columna si es de tipo POINT; -1 en cualquier otro caso.
@@ -113,31 +138,55 @@ int Table::columnaPunto(const std::string& col) const {
     return info_.schema[static_cast<std::size_t>(ci)].type == Type::POINT ? ci : -1;
 }
 
-void Table::insertIntoIndex(const Value& key, const RID& rid) {
-    if (rt_)          rt_->insert(MBR::point(key.d, key.y), rid);
-    else if (bt_int_) bt_int_->insert(key.i, rid);
-    else if (hs_int_) hs_int_->insert(key.i, rid);
-    else if (bt_str_) bt_str_->insert(Key32(key.s), rid);
-    else if (hs_str_) hs_str_->insert(Key32(key.s), rid);
+int Table::columnaGeom(const std::string& col) const {
+    int ci = info_.schema.indexOf(col);
+    if (ci < 0) return -1;
+    const Type t = info_.schema[static_cast<std::size_t>(ci)].type;
+    return (t == Type::POINT || t == Type::POLYGON) ? ci : -1;
 }
-void Table::removeFromIndex(const Value& key, const RID& rid) {
-    if (rt_)          rt_->remove(MBR::point(key.d, key.y), rid);
-    else if (bt_int_) bt_int_->remove(key.i, rid);
-    else if (hs_int_) hs_int_->remove(key.i, rid);
-    else if (bt_str_) bt_str_->remove(Key32(key.s), rid);
-    else if (hs_str_) hs_str_->remove(Key32(key.s), rid);
+
+// Lo que el R-Tree guarda de una geometria: el punto mismo, o la envolvente
+// del poligono. Para el poligono es solo una aproximacion, y de ahi que las
+// consultas tengan que refinar.
+MBR Table::cajaDe(const Value& v) {
+    if (v.type == Type::POLYGON) return poly::envolvente(v.poly);
+    return MBR::point(v.d, v.y);
 }
-std::vector<RID> Table::indexLookup(const Value& v) {
-    if (bt_int_) return bt_int_->search(v.i);
-    if (hs_int_) return hs_int_->search(v.i);
-    if (bt_str_) return bt_str_->search(Key32(v.s));
-    if (hs_str_) return hs_str_->search(Key32(v.s));
+
+// Mantener los indices al dia es responsabilidad de la tabla: una insercion
+// toca TODOS los indices, no solo el de la clave primaria.
+void Table::insertIntoIndex(const Tuple& t, const RID& rid) {
+    for (Indice& ix : indices_) {
+        const Value& key = t.values[static_cast<std::size_t>(ix.col)];
+        if (ix.rt)          ix.rt->insert(cajaDe(key), rid);
+        else if (ix.bt_int) ix.bt_int->insert(key.i, rid);
+        else if (ix.hs_int) ix.hs_int->insert(key.i, rid);
+        else if (ix.bt_str) ix.bt_str->insert(Key32(key.s), rid);
+        else if (ix.hs_str) ix.hs_str->insert(Key32(key.s), rid);
+    }
+}
+void Table::removeFromIndex(const Tuple& t, const RID& rid) {
+    for (Indice& ix : indices_) {
+        const Value& key = t.values[static_cast<std::size_t>(ix.col)];
+        if (ix.rt)          ix.rt->remove(cajaDe(key), rid);
+        else if (ix.bt_int) ix.bt_int->remove(key.i, rid);
+        else if (ix.hs_int) ix.hs_int->remove(key.i, rid);
+        else if (ix.bt_str) ix.bt_str->remove(Key32(key.s), rid);
+        else if (ix.hs_str) ix.hs_str->remove(Key32(key.s), rid);
+    }
+}
+std::vector<RID> Table::indexLookup(const Indice& ix, const Value& v) {
+    if (ix.bt_int) return ix.bt_int->search(v.i);
+    if (ix.hs_int) return ix.hs_int->search(v.i);
+    if (ix.bt_str) return ix.bt_str->search(Key32(v.s));
+    if (ix.hs_str) return ix.hs_str->search(Key32(v.s));
+    if (ix.rt)     return ix.rt->search(cajaDe(v));   // punto o envolvente del poligono
     return {};
 }
-std::vector<RID> Table::indexRange(const Value& lo, const Value& hi) {
-    if (bt_int_) return bt_int_->rangeSearch(lo.i, hi.i);
-    if (bt_str_) return bt_str_->rangeSearch(Key32(lo.s), Key32(hi.s));
-    return {};   // el hash no ordena: no puede resolver rangos
+std::vector<RID> Table::indexRange(const Indice& ix, const Value& lo, const Value& hi) {
+    if (ix.bt_int) return ix.bt_int->rangeSearch(lo.i, hi.i);
+    if (ix.bt_str) return ix.bt_str->rangeSearch(Key32(lo.s), Key32(hi.s));
+    return {};   // ni el hash ni el R-Tree ordenan: no resuelven rangos 1D
 }
 
 RID Table::insert(const Tuple& t) {
@@ -156,7 +205,7 @@ RID Table::insert(const Tuple& t) {
 
     std::string bytes = serializeTuple(info_.schema, t);
     RID rid = engine_->insert(bytes);
-    if (key_col_ >= 0) insertIntoIndex(t.values[key_col_], rid);
+    insertIntoIndex(t, rid);
     return rid;
 }
 
@@ -170,13 +219,13 @@ bool Table::getByRID(const RID& rid, Tuple& out) const {
 void Table::flush() {
     if (store_bp_) store_bp_->flushAll();
     if (ovf_bp_)   ovf_bp_->flushAll();
-    if (idx_bp_)   idx_bp_->flushAll();
+    for (Indice& ix : indices_) ix.bp->flushAll();
 }
 
 bool Table::removeByRID(const RID& rid) {
     Tuple t;
     if (!getByRID(rid, t)) return false;
-    if (key_col_ >= 0) removeFromIndex(t.values[key_col_], rid);
+    removeFromIndex(t, rid);
     return engine_->erase(rid);
 }
 
@@ -191,13 +240,28 @@ std::vector<RID> Table::searchRIDsEq(const std::string& col, const Value& v) {
     int ci = info_.schema.indexOf(col);
     if (ci < 0) throw DBException("No existe la columna: " + col);
 
-    if (indexedColumn(col) && rt_) {
+    const Indice* ix = indicePara(col);
+    const bool geom_poly = info_.schema[static_cast<std::size_t>(ci)].type == Type::POLYGON;
+    if (ix) {
         // Igualdad sobre un punto: es una ventana degenerada de area cero.
-        last_plan_.metodo = "INDEX RTREE (punto)";
-        out = rt_->search(MBR::point(v.d, v.y));
-    } else if (indexedColumn(col)) {
-        last_plan_.metodo = (bt_int_ || bt_str_) ? "INDEX BPLUS" : "INDEX HASH";
-        out = indexLookup(v);
+        // Sobre un poligono el indice solo puede buscar por caja envolvente, y
+        // dos poligonos distintos pueden compartirla: hay que refinar.
+        last_plan_.metodo = (ix->kind != IndexKind::RTREE)
+                              ? ((ix->kind == IndexKind::BPLUS) ? "INDEX BPLUS" : "INDEX HASH")
+                              : (geom_poly ? "INDEX RTREE (igualdad + refinamiento)"
+                                           : "INDEX RTREE (punto)");
+        out = indexLookup(*ix, v);
+        if (ix->kind == IndexKind::RTREE && geom_poly) {
+            std::vector<RID> exactos;
+            exactos.reserve(out.size());
+            for (const RID& rid : out) {
+                Tuple t;
+                if (getByRID(rid, t) && t.values[static_cast<std::size_t>(ci)] == v)
+                    exactos.push_back(rid);
+            }
+            last_plan_.descartados = static_cast<long long>(out.size() - exactos.size());
+            out.swap(exactos);
+        }
     } else if (claveSecuencial(col)) {
         last_plan_.metodo = "SEQ BINARY SEARCH";
         out = seq_->searchEq(v);
@@ -224,18 +288,19 @@ std::vector<RID> Table::searchRIDsRange(const std::string& col, const Value& lo,
     int ci = info_.schema.indexOf(col);
     if (ci < 0) throw DBException("No existe la columna: " + col);
 
-    if (indexedColumn(col) && (bt_int_ || bt_str_)) {
+    const Indice* ix = indicePara(col);
+    if (ix && ix->kind == IndexKind::BPLUS) {
         last_plan_.metodo = "INDEX BPLUS (rango)";
-        out = indexRange(lo, hi);
+        out = indexRange(*ix, lo, hi);
     } else if (claveSecuencial(col)) {
         // El archivo esta ordenado por esta columna: se ubica el inicio con
         // busqueda binaria y se recorre hacia adelante. No hay full scan.
         last_plan_.metodo = "SEQ BINARY SEARCH (rango)";
         out = seq_->searchRange(lo, hi);
     } else {
-        if (indexedColumn(col) && rt_)
+        if (ix && ix->kind == IndexKind::RTREE)
             last_plan_.metodo = "SEQ SCAN (el R-Tree no ordena: use WITHIN)";
-        else if (indexedColumn(col))
+        else if (ix)
             last_plan_.metodo = "SEQ SCAN (hash no soporta rango)";
         else
             last_plan_.metodo = "SEQ SCAN";
@@ -299,23 +364,43 @@ std::vector<RID> Table::searchRIDsWithin(const std::string& col,
     auto t0 = Clock::now();
     long long r0 = lecturasTotales();
 
-    int ci = columnaPunto(col);
-    if (ci < 0) throw DBException("La columna '" + col + "' no es de tipo POINT");
+    int ci = columnaGeom(col);
+    if (ci < 0) throw DBException("La columna '" + col + "' no es de tipo POINT ni POLYGON");
+    const bool es_poligono = info_.schema[static_cast<std::size_t>(ci)].type == Type::POLYGON;
     const MBR ventana(x0, y0, x1, y1);
 
     std::vector<RID> out;
-    if (indexedColumn(col) && rt_) {
-        last_plan_.metodo = "INDEX RTREE (ventana)";
-        out = rt_->search(ventana);
+    const Indice* ix = indicePara(col);
+    if (ix && ix->rt) {
+        last_plan_.metodo = es_poligono ? "INDEX RTREE (ventana + refinamiento)"
+                                        : "INDEX RTREE (ventana)";
+        out = ix->rt->search(ventana);
+        if (es_poligono) {
+            // PASO DE REFINAMIENTO. El indice solo sabe de cajas envolventes:
+            // devuelve poligonos cuya caja toca la ventana aunque la geometria
+            // real no la toque. Hay que mirar la geometria y descartarlos.
+            std::vector<RID> exactos;
+            exactos.reserve(out.size());
+            for (const RID& rid : out) {
+                Tuple t;
+                if (!getByRID(rid, t)) continue;
+                if (poly::intersecaRect(t.values[static_cast<std::size_t>(ci)].poly, ventana))
+                    exactos.push_back(rid);
+            }
+            last_plan_.descartados = static_cast<long long>(out.size() - exactos.size());
+            out.swap(exactos);
+        }
     } else {
-        // Sin indice espacial hay que mirar punto por punto: es exactamente el
-        // full scan contra el que se compara el R-Tree en el experimento.
+        // Sin indice espacial hay que mirar geometria por geometria: es el full
+        // scan contra el que se compara el R-Tree en el experimento.
         last_plan_.metodo = "SEQ SCAN (ventana)";
         for (const RID& rid : engine_->scanAll()) {
             Tuple t;
             if (!getByRID(rid, t)) continue;
             const Value& v = t.values[static_cast<std::size_t>(ci)];
-            if (MBR::point(v.d, v.y).interseca(ventana)) out.push_back(rid);
+            const bool ok = es_poligono ? poly::intersecaRect(v.poly, ventana)
+                                        : MBR::point(v.d, v.y).interseca(ventana);
+            if (ok) out.push_back(rid);
         }
     }
 
@@ -345,9 +430,10 @@ std::vector<Tuple> Table::searchKNN(const std::string& col, double px, double py
     if (ci < 0) throw DBException("La columna '" + col + "' no es de tipo POINT");
 
     std::vector<Tuple> out;
-    if (indexedColumn(col) && rt_ && k >= 0) {
+    const Indice* ix = indicePara(col);
+    if (ix && ix->rt && k >= 0) {
         last_plan_.metodo = "INDEX RTREE (knn)";
-        for (const auto& par : rt_->knn(px, py, k)) {
+        for (const auto& par : ix->rt->knn(px, py, k)) {
             Tuple t;
             if (getByRID(par.second, t)) out.push_back(t);
         }
@@ -384,6 +470,147 @@ std::vector<Tuple> Table::searchKNN(const std::string& col, double px, double py
     return out;
 }
 
+// --- ST_CONTAINS: poligonos que contienen a un punto ----------------------
+//  Es el ejemplo mas claro del esquema filtrar + refinar: el R-Tree reduce
+//  millones de poligonos a un punado de candidatos en dos o tres accesos a
+//  pagina, y el lanzamiento de rayo decide cuales de esos lo contienen de
+//  verdad.
+std::vector<RID> Table::searchRIDsContains(const std::string& col, double px, double py) {
+    auto t0 = Clock::now();
+    long long r0 = lecturasTotales();
+
+    int ci = info_.schema.indexOf(col);
+    if (ci < 0) throw DBException("No existe la columna: " + col);
+    if (info_.schema[static_cast<std::size_t>(ci)].type != Type::POLYGON)
+        throw DBException("ST_CONTAINS exige una columna POLYGON: '" + col + "' es " +
+                          typeName(info_.schema[static_cast<std::size_t>(ci)].type));
+
+    const MBR punto = MBR::point(px, py);
+    std::vector<RID> candidatos;
+    const Indice* ix = indicePara(col);
+    if (ix && ix->rt) {
+        last_plan_.metodo = "INDEX RTREE (contiene + refinamiento)";
+        candidatos = ix->rt->search(punto);
+    } else {
+        last_plan_.metodo = "SEQ SCAN (contiene)";
+        candidatos = engine_->scanAll();
+    }
+
+    std::vector<RID> out;
+    long long descartados = 0;
+    for (const RID& rid : candidatos) {
+        Tuple t;
+        if (!getByRID(rid, t)) continue;
+        if (poly::contienePunto(t.values[static_cast<std::size_t>(ci)].poly, px, py))
+            out.push_back(rid);
+        else
+            ++descartados;
+    }
+    last_plan_.descartados = (ix && ix->rt) ? descartados : 0;
+
+    last_plan_.columna        = col;
+    last_plan_.registros      = static_cast<long long>(out.size());
+    last_plan_.paginas_leidas = lecturasTotales() - r0;
+    last_plan_.ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    return out;
+}
+
+std::vector<Tuple> Table::searchContains(const std::string& col, double px, double py) {
+    std::vector<Tuple> out;
+    for (const RID& rid : searchRIDsContains(col, px, py)) {
+        Tuple t;
+        if (getByRID(rid, t)) out.push_back(t);
+    }
+    last_plan_.registros = static_cast<long long>(out.size());
+    return out;
+}
+
+// --- Variantes geograficas: distancia real en metros sobre la esfera -------
+std::vector<Tuple> Table::searchKNNGeo(const std::string& col, double lon, double lat, int k) {
+    auto t0 = Clock::now();
+    long long r0 = lecturasTotales();
+
+    int ci = columnaPunto(col);
+    if (ci < 0) throw DBException("La columna '" + col + "' no es de tipo POINT");
+
+    std::vector<Tuple> out;
+    const Indice* ix = indicePara(col);
+    if (ix && ix->rt && k >= 0) {
+        last_plan_.metodo = "INDEX RTREE (knn geo)";
+        for (const auto& par : ix->rt->knnGeo(lon, lat, k)) {
+            Tuple t;
+            if (getByRID(par.second, t)) out.push_back(t);
+        }
+    } else {
+        last_plan_.metodo = (k >= 0) ? "SEQ SCAN (knn geo)" : "SEQ SCAN (orden por distancia geo)";
+        std::vector<std::pair<double, Tuple>> todos;
+        for (const RID& rid : engine_->scanAll()) {
+            Tuple t;
+            if (!getByRID(rid, t)) continue;
+            const Value& v = t.values[static_cast<std::size_t>(ci)];
+            todos.emplace_back(geo::haversine(lon, lat, v.d, v.y), std::move(t));
+        }
+        auto antes = [](const std::pair<double, Tuple>& a, const std::pair<double, Tuple>& b) {
+            return a.first < b.first;
+        };
+        std::size_t tope = (k >= 0 && static_cast<std::size_t>(k) < todos.size())
+                         ? static_cast<std::size_t>(k) : todos.size();
+        if (tope < todos.size()) {
+            std::nth_element(todos.begin(), todos.begin() + static_cast<long>(tope), todos.end(), antes);
+            todos.resize(tope);
+        }
+        std::sort(todos.begin(), todos.end(), antes);
+        for (auto& par : todos) out.push_back(std::move(par.second));
+    }
+
+    last_plan_.columna        = col;
+    last_plan_.registros      = static_cast<long long>(out.size());
+    last_plan_.paginas_leidas = lecturasTotales() - r0;
+    last_plan_.ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    return out;
+}
+
+std::vector<RID> Table::searchRIDsRadio(const std::string& col, double lon, double lat,
+                                        double metros) {
+    auto t0 = Clock::now();
+    long long r0 = lecturasTotales();
+
+    int ci = columnaPunto(col);
+    if (ci < 0) throw DBException("La columna '" + col + "' no es de tipo POINT");
+
+    std::vector<RID> out;
+    const Indice* ix = indicePara(col);
+    if (ix && ix->rt) {
+        last_plan_.metodo = "INDEX RTREE (radio)";
+        out = ix->rt->searchRadio(lon, lat, metros);
+    } else {
+        last_plan_.metodo = "SEQ SCAN (radio)";
+        for (const RID& rid : engine_->scanAll()) {
+            Tuple t;
+            if (!getByRID(rid, t)) continue;
+            const Value& v = t.values[static_cast<std::size_t>(ci)];
+            if (geo::haversine(lon, lat, v.d, v.y) <= metros) out.push_back(rid);
+        }
+    }
+
+    last_plan_.columna        = col;
+    last_plan_.registros      = static_cast<long long>(out.size());
+    last_plan_.paginas_leidas = lecturasTotales() - r0;
+    last_plan_.ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    return out;
+}
+
+std::vector<Tuple> Table::searchRadio(const std::string& col, double lon, double lat,
+                                      double metros) {
+    std::vector<Tuple> out;
+    for (const RID& rid : searchRIDsRadio(col, lon, lat, metros)) {
+        Tuple t;
+        if (getByRID(rid, t)) out.push_back(t);
+    }
+    last_plan_.registros = static_cast<long long>(out.size());
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Vacia el archivo de indice y recrea la estructura desde cero.
 // Es OBLIGATORIO antes de repoblar: si el .idx ya existia, el constructor del
@@ -392,30 +619,21 @@ std::vector<Tuple> Table::searchKNN(const std::string& col, double px, double py
 // ejemplo un indice hash que se vuelve a declarar como BTREE-- eso hace que el
 // arbol lea bytes de otra estructura y termine pidiendo una pagina inexistente.
 void Table::recrearIndiceVacio() {
-    if (key_col_ < 0 || !idx_disk_ || info_.indexes.empty()) return;
-    idx_bp_->invalidateAll();
-    idx_disk_->truncate();
-    bt_int_.reset(); bt_str_.reset(); hs_int_.reset(); hs_str_.reset(); rt_.reset();
-
-    const IndexInfo& ix = info_.indexes.front();
-    const Type kt = info_.schema[key_col_].type;
-    if (ix.kind == IndexKind::RTREE) {
-        rt_ = std::make_unique<RTree>(idx_bp_.get());
-    } else if (ix.kind == IndexKind::BPLUS) {
-        if (kt == Type::INT) bt_int_ = std::make_unique<BPlusTree<std::int64_t>>(idx_bp_.get());
-        else                 bt_str_ = std::make_unique<BPlusTree<Key32>>(idx_bp_.get());
-    } else {
-        if (kt == Type::INT) hs_int_ = std::make_unique<ExtendibleHash<std::int64_t>>(idx_bp_.get());
-        else                 hs_str_ = std::make_unique<ExtendibleHash<Key32>>(idx_bp_.get());
+    for (Indice& ix : indices_) {
+        ix.bp->invalidateAll();
+        ix.disk->truncate();
+        ix.soltarEstructuras();
+        abrirIndice(ix);
     }
 }
 
 void Table::buildIndex() {
-    if (key_col_ < 0) return;
+    if (indices_.empty()) return;
     recrearIndiceVacio();
+    // Una sola pasada por el heap repuebla TODOS los indices a la vez.
     for (const RID& rid : engine_->scanAll()) {
         Tuple t;
-        if (getByRID(rid, t)) insertIntoIndex(t.values[key_col_], rid);
+        if (getByRID(rid, t)) insertIntoIndex(t, rid);
     }
 }
 
@@ -426,20 +644,41 @@ bool Table::reorganize(double fill_factor) {
     // reorganize() reescribe el area principal, asi que TODOS los RID cambian.
     // Cualquier indice que apunte a esta tabla queda invalido y hay que
     // reconstruirlo desde cero.
-    // buildIndex() ya vacia y recrea el indice antes de repoblarlo.
-    if (key_col_ >= 0 && idx_disk_) buildIndex();
+    // buildIndex() ya vacia y recrea cada indice antes de repoblarlo.
+    if (!indices_.empty()) buildIndex();
     return true;
 }
 
-int Table::indexPages() const { return idx_disk_ ? idx_disk_->numPages() : 0; }
+int Table::indexPages() const {
+    int n = 0;
+    for (const Indice& ix : indices_) n += ix.disk->numPages();
+    return n;
+}
+
+int Table::indexHeight() const {
+    for (const Indice& ix : indices_) {
+        if (ix.bt_int) return ix.bt_int->getHeight();
+        if (ix.bt_str) return ix.bt_str->getHeight();
+        if (ix.rt)     return ix.rt->getHeight();
+    }
+    return 0;
+}
+
+int Table::indexHeight(const std::string& col) const {
+    const Indice* ix = indicePara(col);
+    if (!ix) return 0;
+    if (ix->bt_int) return ix->bt_int->getHeight();
+    if (ix->bt_str) return ix->bt_str->getHeight();
+    if (ix->rt)     return ix->rt->getHeight();
+    return 0;
+}
 
 void Table::resetStats() {
     store_disk_->resetStats();
     store_bp_->resetStats();
     if (ovf_disk_) ovf_disk_->resetStats();
     if (ovf_bp_)   ovf_bp_->resetStats();
-    if (idx_disk_) idx_disk_->resetStats();
-    if (idx_bp_)   idx_bp_->resetStats();
+    for (Indice& ix : indices_) { ix.disk->resetStats(); ix.bp->resetStats(); }
 }
 
 }  // namespace db

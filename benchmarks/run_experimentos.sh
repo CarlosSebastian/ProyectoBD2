@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  run_experimentos.sh - Ejecuta los cuatro experimentos del enunciado y
-#  guarda la salida en benchmarks/resultados.md
+#  run_experimentos.sh - Ejecuta los experimentos del enunciado y guarda la
+#  salida en benchmarks/resultados.md
+#
+#  Experimentos 1 a 4: motor relacional (Entregable 1).
+#  Experimento 5: escalabilidad del modulo espacial (Entregable 2). No usa el
+#  dataset de empleados: genera sus propios puntos con semilla fija.
 #
 #     ./benchmarks/run_experimentos.sh [N_dataset]
 #
@@ -80,6 +84,11 @@ transferencia mueve mas bytes: la columna de bytes por consulta muestra el
 costo real. El optimo no es "la pagina mas grande posible" sino el punto donde
 dejar de bajar la altura ya no compensa mover bloques mas grandes.
 TXT
+
+echo "==> exp5 (modulo espacial)"
+g++ -std=c++17 -O2 -Ibackend/include -Ibenchmarks -DDB_PAGE_SIZE=$PAGE \
+    benchmarks/exp5_espacial.cpp $LIB -o "build/exp5_espacial$EXE"
+"./build/exp5_espacial$EXE" data 100000 20 >> "$SALIDA"
 
 echo ""
 echo "==> listo: $SALIDA"

@@ -3,6 +3,7 @@
 // ============================================================================
 #include <cstdio>
 #include <string>
+#include <vector>
 
 #include "db/disk_manager.hpp"
 #include "db/catalog.hpp"
@@ -115,6 +116,105 @@ int main() {
             }
         CHECK(borrado, "se borro la fila");
         CHECK(t.searchEq("id", Value::makeInt(500)).empty(), "el indice ya no la devuelve");
+    }
+
+    // ------------------------------------------------------------------
+    //  Varios indices sobre la MISMA tabla (Entregable 2).
+    //  Lo que se verifica aqui no es que cada indice funcione por separado
+    //  --eso ya lo hacen test_bplus y test_rtree-- sino que la tabla los
+    //  mantenga COHERENTES entre si: un INSERT tiene que entrar en todos y
+    //  un DELETE tiene que salir de todos.
+    // ------------------------------------------------------------------
+    SECTION("dos indices a la vez: B+ sobre la clave y R-Tree sobre un POINT");
+    {
+        resetFile("data/t_sitios.dat");
+        resetFile("data/t_sitios_id.idx");
+        resetFile("data/t_sitios_ubic.idx");
+
+        TableInfo ti;
+        ti.name       = "sitios";
+        ti.heap_file  = "t_sitios.dat";
+        ti.key_column = "id";
+        ti.schema     = Schema({Column("id", Type::INT),
+                                Column("nombre", Type::VARCHAR, 20),
+                                Column("ubic", Type::POINT)});
+        ti.indexes.push_back(IndexInfo{"id",   IndexKind::BPLUS, "t_sitios_id.idx"});
+        ti.indexes.push_back(IndexInfo{"ubic", IndexKind::RTREE, "t_sitios_ubic.idx"});
+
+        const MBR ventana(0.0, 0.0, 100.0, 100.0);
+        const int N = 400;
+        {
+            Table t("data", ti, 32);
+            CHECK_EQ(t.numIndices(), static_cast<std::size_t>(2), "la tabla abrio dos indices");
+
+            for (int i = 0; i < N; ++i) {
+                // la mitad dentro de la ventana, la mitad fuera
+                double x = (i % 2 == 0) ? (i % 100) : (500.0 + i);
+                double y = (i % 2 == 0) ? (i % 100) : (500.0 + i);
+                t.insert(Tuple{{Value::makeInt(i),
+                                Value::makeStr("s" + std::to_string(i)),
+                                Value::makePoint(x, y)}});
+            }
+
+            SECTION("cada columna usa su propio indice");
+            CHECK_EQ(t.searchEq("id", Value::makeInt(123)).size(),
+                     static_cast<std::size_t>(1), "busqueda por el B+");
+            CHECK_EQ(std::string(t.lastPlan().metodo), std::string("INDEX BPLUS"),
+                     "la ruta elegida para 'id' es el B+");
+            CHECK_EQ(t.searchWithin("ubic", 0, 0, 100, 100).size(),
+                     static_cast<std::size_t>(N / 2), "ventana por el R-Tree");
+            CHECK_EQ(std::string(t.lastPlan().metodo), std::string("INDEX RTREE (ventana)"),
+                     "la ruta elegida para 'ubic' es el R-Tree");
+            CHECK_EQ(t.searchRange("id", Value::makeInt(10), Value::makeInt(19)).size(),
+                     static_cast<std::size_t>(10), "rango por el B+");
+
+            SECTION("un INSERT entra en LOS DOS indices");
+            t.insert(Tuple{{Value::makeInt(9000), Value::makeStr("nuevo"),
+                            Value::makePoint(50.0, 50.0)}});
+            CHECK_EQ(t.searchEq("id", Value::makeInt(9000)).size(),
+                     static_cast<std::size_t>(1), "lo ve el B+");
+            CHECK_EQ(t.searchWithin("ubic", 0, 0, 100, 100).size(),
+                     static_cast<std::size_t>(N / 2 + 1), "lo ve el R-Tree");
+
+            SECTION("un DELETE sale de LOS DOS indices");
+            std::vector<RID> r = t.searchRIDsEq("id", Value::makeInt(9000));
+            CHECK_EQ(r.size(), static_cast<std::size_t>(1), "se localizo la fila a borrar");
+            CHECK(t.removeByRID(r[0]), "se borro del heap");
+            CHECK(t.searchEq("id", Value::makeInt(9000)).empty(), "el B+ ya no la devuelve");
+            CHECK_EQ(t.searchWithin("ubic", 0, 0, 100, 100).size(),
+                     static_cast<std::size_t>(N / 2),
+                     "el R-Tree tampoco: si quedara, los indices estarian incoherentes");
+
+            SECTION("KNN convive con el indice de la clave");
+            CHECK_EQ(t.searchKNN("ubic", 0.0, 0.0, 5).size(),
+                     static_cast<std::size_t>(5), "KNN sobre la tabla con dos indices");
+            CHECK_EQ(std::string(t.lastPlan().metodo), std::string("INDEX RTREE (knn)"),
+                     "el KNN usa el R-Tree, no un escaneo");
+
+            CHECK(t.indexPages() > 0, "indexPages suma las paginas de los dos archivos");
+            t.flush();
+        }
+
+        SECTION("los dos indices sobreviven a cerrar y reabrir la tabla");
+        {
+            Table t("data", ti, 32);
+            CHECK_EQ(t.numIndices(), static_cast<std::size_t>(2), "dos indices tras reabrir");
+            CHECK_EQ(t.searchEq("id", Value::makeInt(123)).size(),
+                     static_cast<std::size_t>(1), "el B+ sigue respondiendo");
+            CHECK_EQ(t.searchWithin("ubic", 0, 0, 100, 100).size(),
+                     static_cast<std::size_t>(N / 2), "el R-Tree sigue respondiendo");
+        }
+
+        SECTION("buildIndex reconstruye AMBOS en una sola pasada del heap");
+        {
+            Table t("data", ti, 32);
+            t.buildIndex();
+            CHECK_EQ(t.searchEq("id", Value::makeInt(77)).size(),
+                     static_cast<std::size_t>(1), "B+ repoblado");
+            CHECK_EQ(t.searchWithin("ubic", 0, 0, 100, 100).size(),
+                     static_cast<std::size_t>(N / 2), "R-Tree repoblado");
+            (void)ventana;
+        }
     }
 
     DONE("test_catalog");
