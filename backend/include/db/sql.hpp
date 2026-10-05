@@ -15,16 +15,31 @@
 //             | col >= a AND col <= b     (cualquier combinacion de < <= > >=)
 //             | col > a                   (rango abierto por un extremo)
 //             | col WITHIN (minx, miny, maxx, maxy)   -- ventana espacial
+//             | <cond> AND <cond>         sobre columnas DISTINTAS
 //
-//  Tipos: INT | FLOAT | DOUBLE | CHAR(n) | VARCHAR(n) | POINT
+//  Varias condiciones unidas por AND: las que caen sobre la misma columna se
+//  fusionan en un solo rango; las de columnas distintas quedan como una lista.
+//  El planificador elige UNA para resolver el acceso y aplica el resto como
+//  filtro sobre las filas recuperadas.
+//
+//  Tipos: INT | FLOAT | DOUBLE | CHAR(n) | VARCHAR(n) | POINT | POLYGON
 //         FLOAT se mapea a DOUBLE y CHAR(n) a VARCHAR(n).
 //
 //  Espacial (Entregable 2):
 //    Un literal POINT se escribe POINT(x, y).
 //    'col WITHIN (...)' es la consulta de ventana que resuelve el R-Tree.
 //    'ORDER BY col <-> POINT(x,y) LIMIT k' es la consulta de k vecinos mas
-//    cercanos; el operador <-> es la distancia euclidiana, igual que en
-//    PostGIS/pgvector.
+//    cercanos; el operador <-> es la distancia euclidiana EN GRADOS, igual que
+//    en pgvector.
+//    ST_DISTANCE(col, POINT(lon,lat)) es la distancia geografica real EN
+//    METROS (haversine), e interpreta x = longitud e y = latitud. Sirve en dos
+//    sitios:
+//       WHERE ST_DISTANCE(ubic, POINT(-77.03,-12.05)) <= 5000     -- radio
+//       ORDER BY ST_DISTANCE(ubic, POINT(-77.03,-12.05)) LIMIT 5  -- KNN
+//    Un POLYGON se escribe POLYGON((x1,y1),(x2,y2),...) y el anillo se cierra
+//    solo. ST_CONTAINS(col, POINT(x,y)) devuelve los poligonos que contienen
+//    al punto; el R-Tree filtra por caja envolvente y despues se refina con la
+//    geometria real.
 // ============================================================================
 #pragma once
 
@@ -49,7 +64,7 @@ struct ColumnDef {
     bool        primary_key = false;
 };
 
-enum class PredKind { NONE, EQ, RANGE, WITHIN };
+enum class PredKind { NONE, EQ, RANGE, WITHIN, RADIO, CONTIENE };
 
 struct Predicate {
     PredKind    kind = PredKind::NONE;
@@ -66,6 +81,10 @@ struct Predicate {
     // WITHIN: rectangulo de busqueda. Se guardan como doubles sueltos para no
     // arrastrar rtree.hpp (y con el buffer_pool) hasta el parser.
     double      wx0 = 0.0, wy0 = 0.0, wx1 = 0.0, wy1 = 0.0;
+
+    // RADIO: ST_DISTANCE(col, POINT(lon,lat)) <= metros
+    double      qlon = 0.0, qlat = 0.0, metros = 0.0;
+    bool        radio_estricto = false;      // true => '<' en vez de '<='
 };
 
 struct Statement {
@@ -86,7 +105,11 @@ struct Statement {
 
     // SELECT / DELETE
     std::vector<std::string> select_columns;   // vacio => SELECT *
-    Predicate                where;
+    Predicate                where;            // primera condicion
+    // Condiciones adicionales sobre OTRAS columnas. El planificador puede
+    // ascender cualquiera de ellas a conductora del acceso; las que queden
+    // se evaluan como filtro en memoria.
+    std::vector<Predicate>   extra;
     long long                limit = -1;
 
     // ORDER BY col <-> POINT(x,y):  k vecinos mas cercanos.
@@ -94,6 +117,9 @@ struct Statement {
     bool        knn = false;
     std::string knn_column;
     double      knn_x = 0.0, knn_y = 0.0;
+    // true si se ordeno por ST_DISTANCE (metros sobre la esfera) en vez de por
+    // <-> (euclidiana en grados).
+    bool        knn_geo = false;
 };
 
 // Lanza DBException con un mensaje legible si la sentencia no es valida.

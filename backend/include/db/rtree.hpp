@@ -48,6 +48,33 @@
 namespace db {
 
 // ---------------------------------------------------------------------------
+//  Distancias sobre la esfera.
+//
+//  El operador <-> del motor es euclidiano y trabaja en GRADOS, que es lo que
+//  corresponde a un plano cartesiano. Para datos geograficos eso no sirve como
+//  medida: un grado de latitud son siempre ~111 km, pero un grado de longitud
+//  mide 111 km en el ecuador y cero en el polo. ST_DISTANCE devuelve metros
+//  reales usando la formula del haversine sobre una esfera de radio medio.
+// ---------------------------------------------------------------------------
+namespace geo {
+
+// Radio medio terrestre (IUGG R1), en metros.
+constexpr double R_TIERRA = 6371008.8;
+constexpr double GRADO    = 3.14159265358979323846 / 180.0;
+
+// Distancia de circulo maximo entre dos puntos (lon, lat) en grados -> metros.
+inline double haversine(double lon1, double lat1, double lon2, double lat2) {
+    const double f1 = lat1 * GRADO, f2 = lat2 * GRADO;
+    const double df = (lat2 - lat1) * GRADO;
+    const double dl = (lon2 - lon1) * GRADO;
+    const double a  = std::sin(df / 2) * std::sin(df / 2) +
+                      std::cos(f1) * std::cos(f2) * std::sin(dl / 2) * std::sin(dl / 2);
+    return 2.0 * R_TIERRA * std::asin(std::min(1.0, std::sqrt(a)));
+}
+
+}  // namespace geo
+
+// ---------------------------------------------------------------------------
 //  MBR: Minimum Bounding Rectangle, la caja envolvente minima.
 //  Un punto es una caja degenerada con min == max en ambos ejes.
 // ---------------------------------------------------------------------------
@@ -113,12 +140,165 @@ struct MBR {
         return dx * dx + dy * dy;
     }
 
+    // MINDIST GEOGRAFICO: cota INFERIOR, en metros, de la distancia de circulo
+    // maximo entre el punto (lon, lat) y cualquier cosa dentro de esta caja,
+    // interpretando x = longitud e y = latitud en grados.
+    //
+    // Que sea cota INFERIOR es lo que hace EXACTO al KNN best-first: si se
+    // pasara de largo, el algoritmo podria descartar un nodo que si contenia un
+    // vecino mas cercano, y el resultado seria silenciosamente incorrecto.
+    //
+    // Dos candidatos obvios NO sirven:
+    //   - el haversine al punto de la caja mas cercano en lon/lat: sobre la
+    //     esfera ese punto no es el mas cercano cuando la consulta cae fuera de
+    //     la banda de longitudes, asi que el valor queda POR ENCIMA del minimo;
+    //   - la aproximacion equirectangular (dlon * metros_por_grado): se pasa
+    //     cuando la diferencia de longitud es grande, porque el plano estira lo
+    //     que la esfera acorta.
+    //
+    // La que si vale pasa por el ACORDE en el espacio. Se construye una caja
+    // alineada a los ejes en 3D que CONTIENE al parche esferico, y se mide del
+    // punto de consulta a esa caja. Como la caja contiene al parche, esa
+    // distancia es <= el acorde real; y como el angulo es creciente en el
+    // acorde, 2R*asin(acorde/2) es una cota inferior de la distancia real.
+    double mindistGeo(double lon, double lat) const {
+        if (esPunto()) return geo::haversine(lon, lat, minx, miny);
+
+        // ---- caja 3D que envuelve al parche (esfera unitaria) ----
+        // z = sin(lat) es creciente: su rango es exacto.
+        const double z_lo = std::sin(miny * geo::GRADO);
+        const double z_hi = std::sin(maxy * geo::GRADO);
+        // c = cos(lat) >= 0; vale 1 si la banda cruza el ecuador.
+        const double c0 = std::cos(miny * geo::GRADO), c1 = std::cos(maxy * geo::GRADO);
+        const double c_lo = std::min(c0, c1);
+        const double c_hi = (miny <= 0.0 && 0.0 <= maxy) ? 1.0 : std::max(c0, c1);
+        // u = cos(lon), v = sin(lon): extremos en los angulos criticos.
+        const bool cruza0   = (minx <= 0.0   && 0.0   <= maxx);
+        const bool cruza180 = (minx <= -180.0 && -180.0 <= maxx) || (minx <= 180.0 && 180.0 <= maxx);
+        const bool cruza90  = (minx <= 90.0  && 90.0  <= maxx);
+        const bool cruzam90 = (minx <= -90.0 && -90.0 <= maxx);
+        const double u0 = std::cos(minx * geo::GRADO), u1 = std::cos(maxx * geo::GRADO);
+        const double v0 = std::sin(minx * geo::GRADO), v1 = std::sin(maxx * geo::GRADO);
+        const double u_lo = cruza180 ? -1.0 : std::min(u0, u1);
+        const double u_hi = cruza0   ?  1.0 : std::max(u0, u1);
+        const double v_lo = cruzam90 ? -1.0 : std::min(v0, v1);
+        const double v_hi = cruza90  ?  1.0 : std::max(v0, v1);
+        // x = c*u, y = c*v con c >= 0: producto de intervalos.
+        const double xs[4] = {c_lo * u_lo, c_lo * u_hi, c_hi * u_lo, c_hi * u_hi};
+        const double ys[4] = {c_lo * v_lo, c_lo * v_hi, c_hi * v_lo, c_hi * v_hi};
+        const double x_lo = *std::min_element(xs, xs + 4), x_hi = *std::max_element(xs, xs + 4);
+        const double y_lo = *std::min_element(ys, ys + 4), y_hi = *std::max_element(ys, ys + 4);
+
+        // ---- punto de consulta y distancia a la caja 3D ----
+        const double cl = std::cos(lat * geo::GRADO);
+        const double qx = cl * std::cos(lon * geo::GRADO);
+        const double qy = cl * std::sin(lon * geo::GRADO);
+        const double qz = std::sin(lat * geo::GRADO);
+        const double dx = (qx < x_lo) ? x_lo - qx : (qx > x_hi ? qx - x_hi : 0.0);
+        const double dy = (qy < y_lo) ? y_lo - qy : (qy > y_hi ? qy - y_hi : 0.0);
+        const double dz = (qz < z_lo) ? z_lo - qz : (qz > z_hi ? qz - z_hi : 0.0);
+        const double acorde = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+        return 2.0 * geo::R_TIERRA * std::asin(std::min(1.0, acorde / 2.0));
+    }
+
+    bool esPunto() const { return minx == maxx && miny == maxy; }
+
     bool operator==(const MBR& o) const {
         return minx == o.minx && miny == o.miny && maxx == o.maxx && maxy == o.maxy;
     }
 };
 
 static_assert(sizeof(MBR) == 32, "El MBR debe ocupar exactamente cuatro doubles");
+
+// ---------------------------------------------------------------------------
+//  Geometria exacta sobre un anillo de vertices [x1,y1,x2,y2,...].
+//
+//  El R-Tree indexa poligonos por su CAJA ENVOLVENTE, que es una aproximacion
+//  grosera: una diagonal delgada tiene una caja enorme. Por eso una consulta
+//  espacial sobre poligonos tiene DOS PASOS, que es como trabajan los motores
+//  reales:
+//
+//     1. FILTRADO   el indice devuelve los candidatos cuyo MBR interseca.
+//     2. REFINAMIENTO  se comprueba la geometria de verdad y se descartan los
+//                      falsos positivos que el MBR dejo pasar.
+//
+//  Estas funciones son el paso 2. El paso 1 ya lo hace search().
+// ---------------------------------------------------------------------------
+namespace poly {
+
+inline MBR envolvente(const std::vector<double>& v) {
+    MBR m = MBR::vacia();
+    for (std::size_t i = 0; i + 1 < v.size(); i += 2)
+        m = m.unionCon(MBR::point(v[i], v[i + 1]));
+    return m;
+}
+
+// Punto dentro del poligono por lanzamiento de rayo: se cuenta cuantas aristas
+// cruza un rayo horizontal hacia la derecha; impar = dentro. Los vertices que
+// caen justo sobre el rayo se resuelven con la comparacion asimetrica de los
+// extremos (uno estricto y otro no), que es lo que evita contar dos veces.
+inline bool contienePunto(const std::vector<double>& v, double px, double py) {
+    const std::size_t n = v.size() / 2;
+    if (n < 3) return false;
+    bool dentro = false;
+    for (std::size_t i = 0, j = n - 1; i < n; j = i++) {
+        const double xi = v[2 * i], yi = v[2 * i + 1];
+        const double xj = v[2 * j], yj = v[2 * j + 1];
+        if (((yi > py) != (yj > py)) &&
+            (px < (xj - xi) * (py - yi) / (yj - yi) + xi))
+            dentro = !dentro;
+    }
+    return dentro;
+}
+
+// Interseccion de dos segmentos (incluye los toques en los extremos).
+inline bool segmentosCruzan(double ax, double ay, double bx, double by,
+                            double cx, double cy, double dx, double dy) {
+    auto orient = [](double x1, double y1, double x2, double y2, double x3, double y3) {
+        const double v2 = (x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1);
+        if (v2 > 1e-12) return 1;
+        if (v2 < -1e-12) return -1;
+        return 0;
+    };
+    auto enCaja = [](double x1, double y1, double x2, double y2, double x3, double y3) {
+        return std::min(x1, x2) <= x3 && x3 <= std::max(x1, x2) &&
+               std::min(y1, y2) <= y3 && y3 <= std::max(y1, y2);
+    };
+    const int o1 = orient(ax, ay, bx, by, cx, cy);
+    const int o2 = orient(ax, ay, bx, by, dx, dy);
+    const int o3 = orient(cx, cy, dx, dy, ax, ay);
+    const int o4 = orient(cx, cy, dx, dy, bx, by);
+    if (o1 != o2 && o3 != o4) return true;
+    if (o1 == 0 && enCaja(ax, ay, bx, by, cx, cy)) return true;
+    if (o2 == 0 && enCaja(ax, ay, bx, by, dx, dy)) return true;
+    if (o3 == 0 && enCaja(cx, cy, dx, dy, ax, ay)) return true;
+    if (o4 == 0 && enCaja(cx, cy, dx, dy, bx, by)) return true;
+    return false;
+}
+
+// Interseccion EXACTA entre el poligono y un rectangulo. Hay tres casos y los
+// tres hacen falta: que se crucen los bordes, que el rectangulo este contenido
+// en el poligono, o que el poligono este contenido en el rectangulo.
+inline bool intersecaRect(const std::vector<double>& v, const MBR& r) {
+    const std::size_t n = v.size() / 2;
+    if (n < 3) return false;
+    if (!envolvente(v).interseca(r)) return false;          // descarte barato
+
+    const double rx[5] = {r.minx, r.maxx, r.maxx, r.minx, r.minx};
+    const double ry[5] = {r.miny, r.miny, r.maxy, r.maxy, r.miny};
+    for (std::size_t i = 0, j = n - 1; i < n; j = i++) {
+        for (int k = 0; k < 4; ++k)
+            if (segmentosCruzan(v[2 * j], v[2 * j + 1], v[2 * i], v[2 * i + 1],
+                                rx[k], ry[k], rx[k + 1], ry[k + 1]))
+                return true;
+    }
+    if (contienePunto(v, r.minx, r.miny)) return true;      // rectangulo dentro
+    if (r.contiene(envolvente(v))) return true;             // poligono dentro
+    return false;
+}
+
+}  // namespace poly
 
 // ---------------------------------------------------------------------------
 class RTree {
@@ -242,6 +422,56 @@ public:
         return out;
     }
 
+    // k vecinos mas cercanos por DISTANCIA GEOGRAFICA (metros), interpretando
+    // x = longitud e y = latitud. Mismo algoritmo best-first que knn(), pero la
+    // cola se ordena por mindistGeo y las entradas de hoja se puntuan con el
+    // haversine exacto. La poda sigue siendo correcta porque mindistGeo es una
+    // cota inferior del haversine.
+    std::vector<std::pair<double, RID>> knnGeo(double lon, double lat, int k) const {
+        std::vector<std::pair<double, RID>> out;
+        if (k <= 0) return out;
+        page_id_t raiz = getRoot();
+        if (raiz == INVALID_PAGE_ID) return out;
+
+        std::priority_queue<Cand, std::vector<Cand>, MasCerca> cola;
+        cola.push(Cand{0.0, false, raiz, RID()});
+
+        while (!cola.empty() && static_cast<int>(out.size()) < k) {
+            Cand c = cola.top();
+            cola.pop();
+            if (c.es_entrada) { out.emplace_back(c.dist2, c.rid); continue; }
+
+            const char* b = bp_->fetchPage(c.pid);
+            const bool hoja = esHoja(b);
+            const int  n    = getN(b);
+            for (int i = 0; i < n; ++i) {
+                MBR m = readAt<MBR>(b, mbrOff(i));
+                if (hoja) {
+                    // La entrada de hoja de una columna POINT es una caja
+                    // degenerada, asi que aqui el haversine ya es exacto.
+                    const double d = geo::haversine(lon, lat, m.minx, m.miny);
+                    cola.push(Cand{d, true, INVALID_PAGE_ID, readAt<RID>(b, ridOff(i, true))});
+                } else {
+                    cola.push(Cand{m.mindistGeo(lon, lat), false,
+                                   readAt<page_id_t>(b, hijoOff(i, false)), RID()});
+                }
+            }
+            bp_->unpinPage(c.pid, false);
+        }
+        return out;
+    }
+
+    // Todos los puntos a no mas de 'metros' del punto dado. Poda los nodos cuya
+    // cota inferior ya excede el radio; el resultado es EXACTO porque las hojas
+    // se comprueban con el haversine real.
+    std::vector<RID> searchRadio(double lon, double lat, double metros) const {
+        std::vector<RID> out;
+        page_id_t raiz = getRoot();
+        if (raiz != INVALID_PAGE_ID && metros >= 0.0)
+            radioRec(raiz, lon, lat, metros, &out);
+        return out;
+    }
+
     // Borra la entrada (caja, rid). Devuelve false si no estaba.
     bool remove(const MBR& box, const RID& rid) {
         page_id_t raiz = getRoot();
@@ -342,6 +572,29 @@ private:
                 bajar.push_back(readAt<page_id_t>(b, hijoOff(i, false)));
         bp_->unpinPage(pid, false);
         for (page_id_t h : bajar) searchRec(h, ventana, out);
+    }
+
+    void radioRec(page_id_t pid, double lon, double lat, double metros,
+                  std::vector<RID>* out) const {
+        const char* b = bp_->fetchPage(pid);
+        const bool hoja = esHoja(b);
+        const int  n    = getN(b);
+
+        if (hoja) {
+            for (int i = 0; i < n; ++i) {
+                MBR m = readAt<MBR>(b, mbrOff(i));
+                if (geo::haversine(lon, lat, m.minx, m.miny) <= metros)
+                    out->push_back(readAt<RID>(b, ridOff(i, true)));
+            }
+            bp_->unpinPage(pid, false);
+            return;
+        }
+        std::vector<page_id_t> bajar;
+        for (int i = 0; i < n; ++i)
+            if (readAt<MBR>(b, mbrOff(i)).mindistGeo(lon, lat) <= metros)
+                bajar.push_back(readAt<page_id_t>(b, hijoOff(i, false)));
+        bp_->unpinPage(pid, false);
+        for (page_id_t h : bajar) radioRec(h, lon, lat, metros, out);
     }
 
     // ----------------------------------------------------------- insercion

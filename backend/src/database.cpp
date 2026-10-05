@@ -1,5 +1,6 @@
 #include "db/database.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -28,12 +29,15 @@ static Value coerce(const Value& v, Type destino, const std::string& col) {
             throw DBException("La columna '" + col + "' es INT y se recibio el decimal " + v.str());
         return Value::makeInt(static_cast<std::int64_t>(v.d));
     }
-    // Un POINT no se convierte desde ningun otro tipo: o viene de POINT(x,y)
-    // o es un error del usuario. Lo mismo al reves.
-    if (destino == Type::POINT || v.type == Type::POINT)
+    // Una geometria no se convierte desde ningun otro tipo: o viene de
+    // POINT(x,y) / POLYGON((..)) o es un error del usuario. Lo mismo al reves.
+    const bool geo_dest = (destino == Type::POINT || destino == Type::POLYGON);
+    const bool geo_val  = (v.type  == Type::POINT || v.type  == Type::POLYGON);
+    if (geo_dest || geo_val)
         throw DBException("La columna '" + col + "' es de tipo " + typeName(destino) +
                           " y se recibio un valor " + typeName(v.type) +
-                          ". Los puntos se escriben POINT(x, y).");
+                          ". Los puntos se escriben POINT(x, y) y los poligonos "
+                          "POLYGON((x1,y1),(x2,y2),...).");
     if (destino == Type::VARCHAR) return Value::makeStr(v.str());
     throw DBException("Tipo incompatible para la columna '" + col + "': se esperaba " + typeName(destino));
 }
@@ -51,6 +55,11 @@ static bool dentroDelPredicado(const Value& v, const Predicate& w,
     return true;
 }
 
+// Entero como texto, para los detalles del plan.
+static std::string num0(double v) {
+    return std::to_string(static_cast<long long>(std::llround(v)));
+}
+
 static Value cotaMin(Type t) {
     switch (t) {
         case Type::INT:     return Value::makeInt(std::numeric_limits<std::int64_t>::min());
@@ -58,6 +67,7 @@ static Value cotaMin(Type t) {
         case Type::VARCHAR: return Value::makeStr("");
         case Type::POINT:   return Value::makePoint(-std::numeric_limits<double>::infinity(),
                                                     -std::numeric_limits<double>::infinity());
+        case Type::POLYGON: return Value::makePolygon({});
     }
     return Value::makeInt(0);
 }
@@ -68,8 +78,83 @@ static Value cotaMax(Type t) {
         case Type::VARCHAR: return Value::makeStr(std::string(31, '\x7f'));
         case Type::POINT:   return Value::makePoint(std::numeric_limits<double>::infinity(),
                                                     std::numeric_limits<double>::infinity());
+        case Type::POLYGON: return Value::makePolygon({});
     }
     return Value::makeInt(0);
+}
+
+// Evaluacion completa de una condicion sobre un valor ya materializado.
+// Es lo que convierte a las condiciones que NO conducen el acceso en un filtro
+// en memoria sobre las filas que trajo la ruta elegida.
+static bool cumple(const Value& v, const Predicate& w) {
+    switch (w.kind) {
+        case PredKind::NONE:
+            return true;
+        case PredKind::EQ:
+            return v == coerce(w.eq, v.type, w.column);
+        case PredKind::WITHIN:
+            if (v.type == Type::POLYGON)
+                return poly::intersecaRect(v.poly, MBR(w.wx0, w.wy0, w.wx1, w.wy1));
+            return v.type == Type::POINT &&
+                   MBR::point(v.d, v.y).interseca(MBR(w.wx0, w.wy0, w.wx1, w.wy1));
+        case PredKind::CONTIENE:
+            return v.type == Type::POLYGON && poly::contienePunto(v.poly, w.qlon, w.qlat);
+        case PredKind::RADIO: {
+            if (v.type != Type::POINT) return false;
+            const double d = geo::haversine(w.qlon, w.qlat, v.d, v.y);
+            return w.radio_estricto ? (d < w.metros) : (d <= w.metros);
+        }
+        case PredKind::RANGE: {
+            if (!w.lo_abierto) {
+                Value lo = coerce(w.lo, v.type, w.column);
+                if (w.lo_estricto ? !(lo < v) : (v < lo)) return false;
+            }
+            if (!w.hi_abierto) {
+                Value hi = coerce(w.hi, v.type, w.column);
+                if (w.hi_estricto ? !(v < hi) : (hi < v)) return false;
+            }
+            return true;
+        }
+    }
+    return true;
+}
+
+// Cuanto le conviene al motor dejar que ESTA condicion conduzca el acceso.
+// Menor es mejor. Es la regla del planificador hibrido: entre varias
+// condiciones gana la de ruta mas barata, y las demas se degradan a filtro.
+//
+// El orden sale de la SELECTIVIDAD ESPERADA por la forma del predicado, que es
+// lo unico que se puede saber sin estadisticas: una igualdad sobre una columna
+// indexada devuelve del orden de una fila, mientras que una ventana espacial o
+// un rango pueden devolver miles. Por eso la igualdad manda sobre el WITHIN
+// aunque el R-Tree sea muy barato de recorrer: lo que se quiere minimizar no es
+// el costo del indice sino el numero de filas que pasan al filtro.
+//
+// Es una heuristica, no una estimacion: no mira histogramas ni cardinalidades.
+// Sustituirla por una estimacion real de selectividad es la mejora que el
+// Experimento 3 del Entregable 1 ya dejaba identificada.
+static int puntajeRuta(const TableInfo& ti, const std::string& clave_seq, const Predicate& p) {
+    const IndexInfo* ix = ti.findIndex(p.column);
+    const bool es_clave_seq = (!clave_seq.empty() && clave_seq == p.column);
+    switch (p.kind) {
+        case PredKind::EQ:                                  // ~1 fila
+            if (ix && ix->kind == IndexKind::HASH)  return 0;
+            if (ix && ix->kind == IndexKind::BPLUS) return 1;
+            if (es_clave_seq)                       return 2;
+            return 50;
+        case PredKind::CONTIENE:                            // ~pocos poligonos
+            return (ix && ix->kind == IndexKind::RTREE) ? 2 : 50;
+        case PredKind::WITHIN:                              // area acotada
+        case PredKind::RADIO:                               // circulo acotado
+            return (ix && ix->kind == IndexKind::RTREE) ? 3 : 50;
+        case PredKind::RANGE:                               // puede ser media tabla
+            if (ix && ix->kind == IndexKind::BPLUS) return 4;
+            if (es_clave_seq)                       return 5;
+            return 50;
+        case PredKind::NONE:
+            return 99;
+    }
+    return 99;
 }
 
 // Columna que ordena fisicamente una tabla SEQUENTIAL: la PRIMARY KEY
@@ -233,10 +318,11 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
     auto t0 = Clock::now();
 
     const TableInfo& ti = catalog_.get(st.table);
-    if (!ti.indexes.empty())
-        throw DBException("La tabla '" + st.table + "' ya tiene un indice sobre '" +
-                          ti.indexes.front().column + "'. El motor admite un indice por tabla "
-                          "en esta version.");
+    // Varios indices por tabla, uno por columna: lo normal es tener un B+ sobre
+    // la clave primaria y, ademas, un R-Tree sobre la columna POINT.
+    if (ti.findIndex(st.index_column))
+        throw DBException("La columna '" + st.index_column + "' de '" + st.table +
+                          "' ya tiene un indice. El motor admite un indice por columna.");
     int ci_ix = ti.schema.indexOf(st.index_column);
     if (ci_ix < 0)
         throw DBException("La columna '" + st.index_column + "' no existe en '" + st.table + "'");
@@ -246,16 +332,16 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
     // hay DROP INDEX, solo se recupera editando catalog.txt a mano.
     const Type tipo_ix = ti.schema[static_cast<std::size_t>(ci_ix)].type;
     if (st.index_kind == IndexKind::RTREE) {
-        if (tipo_ix != Type::POINT)
-            throw DBException("Un indice RTREE solo se crea sobre una columna POINT: '" +
+        if (tipo_ix != Type::POINT && tipo_ix != Type::POLYGON)
+            throw DBException("Un indice RTREE solo se crea sobre POINT o POLYGON: '" +
                               st.index_column + "' es " + typeName(tipo_ix) + ". La tabla queda intacta.");
     } else {
         if (tipo_ix == Type::DOUBLE)
             throw DBException("Aun no se indexan columnas DOUBLE: '" + st.index_column +
                               "'. La tabla queda intacta.");
-        if (tipo_ix == Type::POINT)
-            throw DBException("La columna '" + st.index_column + "' es POINT: use USING RTREE. "
-                              "La tabla queda intacta.");
+        if (tipo_ix == Type::POINT || tipo_ix == Type::POLYGON)
+            throw DBException("La columna '" + st.index_column + "' es " + typeName(tipo_ix) +
+                              ": use USING RTREE. La tabla queda intacta.");
     }
 
     IndexInfo ix;
@@ -272,7 +358,8 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
     r.metodo  = "DDL";
     r.message = "Indice '" + st.index_name + "' creado sobre " + st.table + "(" + st.index_column +
                 ") usando " + indexKindName(st.index_kind) + ". " +
-                std::to_string(t->count()) + " filas indexadas.";
+                std::to_string(t->count()) + " filas indexadas. La tabla tiene ahora " +
+                std::to_string(t->numIndices()) + " indice(s).";
     r.exec_ms = msDesde(t0);
     r.plan.push_back(PlanStep{"CREATE INDEX", r.exec_ms, indexKindName(st.index_kind)});
     return r;
@@ -315,6 +402,28 @@ QueryResult Database::ejecutarInsert(const Statement& st) {
     return r;
 }
 
+// Reparte las condiciones del WHERE: devuelve la que conduce el acceso y deja
+// en 'filtros' las que se aplicaran en memoria sobre las filas recuperadas.
+static Predicate repartirCondiciones(const TableInfo& ti, const std::string& clave_seq,
+                                     const Statement& st, std::vector<Predicate>* filtros) {
+    filtros->clear();
+    if (st.where.kind == PredKind::NONE) return st.where;
+
+    std::vector<Predicate> todas;
+    todas.push_back(st.where);
+    for (const Predicate& p : st.extra) todas.push_back(p);
+
+    std::size_t mejor = 0;
+    int mejor_pts = puntajeRuta(ti, clave_seq, todas[0]);
+    for (std::size_t i = 1; i < todas.size(); ++i) {
+        int pts = puntajeRuta(ti, clave_seq, todas[i]);
+        if (pts < mejor_pts) { mejor_pts = pts; mejor = i; }
+    }
+    for (std::size_t i = 0; i < todas.size(); ++i)
+        if (i != mejor) filtros->push_back(todas[i]);
+    return todas[mejor];
+}
+
 QueryResult Database::ejecutarSelect(const Statement& st) {
     QueryResult r;
     Table* t = abrir(st.table);
@@ -323,14 +432,18 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     // ---- Planificacion: elegir la ruta de acceso ----
     auto t_plan = Clock::now();
     const TableInfo& ti = catalog_.get(st.table);
+    std::vector<Predicate> filtros;
+    const Predicate cond = repartirCondiciones(ti, claveSecuencialDe(ti), st, &filtros);
     std::string ruta, detalle_ruta;
     const IndexInfo* ix_knn = st.knn ? ti.findIndex(st.knn_column) : nullptr;
     if (st.knn) {
         // El KNN manda sobre el WHERE: es lo que decide la ruta de acceso.
         if (ix_knn && ix_knn->kind == IndexKind::RTREE && st.limit >= 0) {
-            ruta = "IndexKNN";
-            detalle_ruta = "R-Tree best-first sobre " + st.knn_column +
-                           ", k=" + std::to_string(st.limit);
+            ruta = st.knn_geo ? "IndexKNN (geografico)" : "IndexKNN";
+            detalle_ruta = std::string("R-Tree best-first sobre ") + st.knn_column +
+                           ", k=" + std::to_string(st.limit) +
+                           (st.knn_geo ? ", distancia haversine en metros"
+                                       : ", distancia euclidiana en grados");
         } else if (st.limit < 0) {
             ruta = "SeqScan + orden";
             detalle_ruta = "ORDER BY por distancia sin LIMIT: hay que ordenar todo";
@@ -338,35 +451,55 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
             ruta = "SeqScan + orden parcial";
             detalle_ruta = "no hay indice RTREE sobre " + st.knn_column;
         }
-    } else if (st.where.kind == PredKind::NONE) {
+    } else if (cond.kind == PredKind::NONE) {
         ruta = "SeqScan"; detalle_ruta = "sin predicado";
-    } else if (st.where.kind == PredKind::WITHIN) {
-        const IndexInfo* ix = ti.findIndex(st.where.column);
+    } else if (cond.kind == PredKind::WITHIN || cond.kind == PredKind::RADIO ||
+               cond.kind == PredKind::CONTIENE) {
+        const IndexInfo* ix = ti.findIndex(cond.column);
+        const char* nombre = (cond.kind == PredKind::WITHIN)   ? "IndexWindowScan"
+                           : (cond.kind == PredKind::CONTIENE) ? "IndexContainsScan"
+                                                               : "IndexRadiusScan";
         if (ix && ix->kind == IndexKind::RTREE) {
-            ruta = "IndexWindowScan";
-            detalle_ruta = "R-Tree sobre " + st.where.column;
+            ruta = nombre;
+            detalle_ruta = "R-Tree sobre " + cond.column;
+            if (cond.kind == PredKind::RADIO)
+                detalle_ruta += ", radio de " + num0(cond.metros) + " m";
         } else {
             ruta = "SeqScan";
-            detalle_ruta = "no hay indice RTREE sobre " + st.where.column;
+            detalle_ruta = "no hay indice RTREE sobre " + cond.column;
         }
     } else {
-        const IndexInfo* ix = ti.findIndex(st.where.column);
-        const bool es_clave_seq = (claveSecuencialDe(ti) == st.where.column);
+        const IndexInfo* ix = ti.findIndex(cond.column);
+        const bool es_clave_seq = (claveSecuencialDe(ti) == cond.column);
         if (!ix && es_clave_seq) {
-            ruta = (st.where.kind == PredKind::EQ) ? "BinarySearch" : "BinarySearch (rango)";
-            detalle_ruta = "archivo ordenado por " + st.where.column + " + area de overflow";
+            ruta = (cond.kind == PredKind::EQ) ? "BinarySearch" : "BinarySearch (rango)";
+            detalle_ruta = "archivo ordenado por " + cond.column + " + area de overflow";
         }
-        else if (!ix) { ruta = "SeqScan"; detalle_ruta = "no hay indice sobre " + st.where.column; }
-        else if (st.where.kind == PredKind::EQ) {
+        else if (!ix) { ruta = "SeqScan"; detalle_ruta = "no hay indice sobre " + cond.column; }
+        else if (cond.kind == PredKind::EQ) {
             ruta = "IndexScan";
-            detalle_ruta = indexKindName(ix->kind) + " sobre " + st.where.column;
+            detalle_ruta = indexKindName(ix->kind) + " sobre " + cond.column;
         } else if (ix->kind == IndexKind::BPLUS) {
             ruta = "IndexRangeScan";
-            detalle_ruta = "BPLUS sobre " + st.where.column;
+            detalle_ruta = "BPLUS sobre " + cond.column;
         } else {
             ruta = "SeqScan";
             detalle_ruta = "el indice HASH no ordena: un rango exige recorrido completo";
         }
+    }
+    if (st.knn && cond.kind != PredKind::NONE) {
+        // El KNN conduce y TODO el WHERE queda como filtro, con sobre-peticion.
+        std::string cols = cond.column;
+        for (const Predicate& f : filtros) cols += ", " + f.column;
+        detalle_ruta += "  [conduce la distancia; filtra " + cols +
+                        " con sobre-peticion hasta reunir k]";
+    } else if (!filtros.empty()) {
+        // Plan hibrido: una condicion conduce el acceso y las demas se quedan
+        // como filtro. Decir cual conduce y cuales no es justo lo que hace
+        // legible la decision del planificador.
+        std::string cols;
+        for (const Predicate& f : filtros) { if (!cols.empty()) cols += ", "; cols += f.column; }
+        detalle_ruta += "  [conduce " + cond.column + "; filtra " + cols + "]";
     }
     double plan_ms = msDesde(t_plan);
     r.plan.push_back(PlanStep{"Planificacion: " + ruta, plan_ms, detalle_ruta});
@@ -375,38 +508,108 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     auto t_exec = Clock::now();
     DiskCounter::Snapshot io_exec = DiskCounter::global().snapshot();
     std::vector<Tuple> filas;
+    bool knn_ya_filtrado = false;
     if (st.knn) {
         int ck = sch.indexOf(st.knn_column);
         if (ck < 0) throw DBException("No existe la columna '" + st.knn_column + "'");
         if (sch[ck].type != Type::POINT)
             throw DBException("ORDER BY por distancia exige una columna POINT: '" +
                               st.knn_column + "' es " + typeName(sch[ck].type));
-        filas = t->searchKNN(st.knn_column, st.knn_x, st.knn_y,
-                             st.limit >= 0 ? static_cast<int>(st.limit) : -1);
-    } else if (st.where.kind == PredKind::NONE) {
-        filas = t->scan();
-    } else if (st.where.kind == PredKind::WITHIN) {
-        filas = t->searchWithin(st.where.column, st.where.wx0, st.where.wy0,
-                                st.where.wx1, st.where.wy1);
-    } else {
-        int ci = sch.indexOf(st.where.column);
-        if (ci < 0) throw DBException("No existe la columna '" + st.where.column + "'");
-        Type tipo = sch[ci].type;
-        if (st.where.kind == PredKind::EQ) {
-            filas = t->searchEq(st.where.column, coerce(st.where.eq, tipo, st.where.column));
+        const int k = st.limit >= 0 ? static_cast<int>(st.limit) : -1;
+
+        // Un WHERE junto a un ORDER BY por distancia obliga a SOBRE-PEDIR. El
+        // indice ordena por cercania, no sabe nada del predicado: si se le
+        // piden k vecinos y despues se filtran, pueden quedar menos de k. Se
+        // pide el doble cada vez hasta reunir k supervivientes o hasta que el
+        // indice se agote. Sin esto, 'WHERE id > 100 ORDER BY ... LIMIT 3'
+        // devolveria menos filas de las que existen, o --peor-- las de siempre.
+        std::vector<Predicate> todas;
+        if (cond.kind != PredKind::NONE) todas.push_back(cond);
+        for (const Predicate& f : filtros) todas.push_back(f);
+
+        auto vecinos = [&](int cuantos) {
+            return st.knn_geo ? t->searchKNNGeo(st.knn_column, st.knn_x, st.knn_y, cuantos)
+                              : t->searchKNN(st.knn_column, st.knn_x, st.knn_y, cuantos);
+        };
+        auto pasaTodas = [&](const Tuple& f) {
+            for (const Predicate& w : todas) {
+                int cf = sch.indexOf(w.column);
+                if (cf < 0) throw DBException("No existe la columna '" + w.column + "'");
+                if (!cumple(f.at(static_cast<std::size_t>(cf)), w)) return false;
+            }
+            return true;
+        };
+
+        if (todas.empty()) {
+            filas = vecinos(k);
         } else {
-            Value lo = st.where.lo_abierto ? cotaMin(tipo) : coerce(st.where.lo, tipo, st.where.column);
-            Value hi = st.where.hi_abierto ? cotaMax(tipo) : coerce(st.where.hi, tipo, st.where.column);
-            filas = t->searchRange(st.where.column, lo, hi);
-            if (st.where.lo_estricto || st.where.hi_estricto) {
+            knn_ya_filtrado = true;
+            int pedir = (k < 0) ? -1 : std::max(k, 1);
+            while (true) {
+                std::vector<Tuple> cand = vecinos(pedir);
+                filas.clear();
+                for (const Tuple& f : cand) if (pasaTodas(f)) filas.push_back(f);
+                if (k < 0) break;                                   // orden total
+                if (static_cast<int>(filas.size()) >= k) break;      // ya alcanzan
+                if (static_cast<int>(cand.size()) < pedir) break;    // el indice se agoto
+                if (pedir > 1 << 24) break;                          // tope de seguridad
+                pedir *= 2;
+            }
+            if (k >= 0 && static_cast<int>(filas.size()) > k)
+                filas.resize(static_cast<std::size_t>(k));
+        }
+    } else if (cond.kind == PredKind::NONE) {
+        filas = t->scan();
+    } else if (cond.kind == PredKind::WITHIN) {
+        filas = t->searchWithin(cond.column, cond.wx0, cond.wy0, cond.wx1, cond.wy1);
+    } else if (cond.kind == PredKind::CONTIENE) {
+        filas = t->searchContains(cond.column, cond.qlon, cond.qlat);
+    } else if (cond.kind == PredKind::RADIO) {
+        filas = t->searchRadio(cond.column, cond.qlon, cond.qlat, cond.metros);
+        if (cond.radio_estricto) {     // el indice resuelve <=; el < se afina aqui
+            const int cr = sch.indexOf(cond.column);
+            std::vector<Tuple> quedan;
+            quedan.reserve(filas.size());
+            for (const Tuple& f : filas)
+                if (cumple(f.at(static_cast<std::size_t>(cr)), cond)) quedan.push_back(f);
+            filas.swap(quedan);
+        }
+    } else {
+        int ci = sch.indexOf(cond.column);
+        if (ci < 0) throw DBException("No existe la columna '" + cond.column + "'");
+        Type tipo = sch[ci].type;
+        if (cond.kind == PredKind::EQ) {
+            filas = t->searchEq(cond.column, coerce(cond.eq, tipo, cond.column));
+        } else {
+            Value lo = cond.lo_abierto ? cotaMin(tipo) : coerce(cond.lo, tipo, cond.column);
+            Value hi = cond.hi_abierto ? cotaMax(tipo) : coerce(cond.hi, tipo, cond.column);
+            filas = t->searchRange(cond.column, lo, hi);
+            if (cond.lo_estricto || cond.hi_estricto) {
                 std::vector<Tuple> filtradas;
                 filtradas.reserve(filas.size());
                 for (const Tuple& f : filas)
-                    if (dentroDelPredicado(f.at(static_cast<std::size_t>(ci)), st.where, lo, hi))
+                    if (dentroDelPredicado(f.at(static_cast<std::size_t>(ci)), cond, lo, hi))
                         filtradas.push_back(f);
                 filas.swap(filtradas);
             }
         }
+    }
+
+    // ---- Filtro residual: las condiciones que no condujeron el acceso ----
+    long long antes_del_filtro = static_cast<long long>(filas.size());
+    if (!filtros.empty() && !knn_ya_filtrado) {
+        std::vector<Tuple> quedan;
+        quedan.reserve(filas.size());
+        for (const Tuple& f : filas) {
+            bool ok = true;
+            for (const Predicate& w : filtros) {
+                int cf = sch.indexOf(w.column);
+                if (cf < 0) throw DBException("No existe la columna '" + w.column + "'");
+                if (!cumple(f.at(static_cast<std::size_t>(cf)), w)) { ok = false; break; }
+            }
+            if (ok) quedan.push_back(f);
+        }
+        filas.swap(quedan);
     }
     r.exec_ms = msDesde(t_exec);
     r.metodo  = t->lastPlan().metodo;
@@ -414,6 +617,21 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     r.plan.push_back(PlanStep{"Ejecucion: " + r.metodo, r.exec_ms,
                               std::to_string(dEjec.page_accesses) + " accesos a pagina, " +
                               std::to_string(dEjec.reads) + " lecturas de disco"});
+    if (t->lastPlan().descartados > 0) {
+        // Visible a proposito: es la diferencia entre lo que el indice puede
+        // prometer (cajas envolventes) y lo que la consulta realmente pide.
+        r.plan.push_back(PlanStep{
+            "Refinamiento geometrico", 0.0,
+            std::to_string(t->lastPlan().descartados) +
+            " candidato(s) del indice descartado(s) al comprobar la geometria real"});
+    }
+    if (!filtros.empty() && !knn_ya_filtrado) {
+        r.plan.push_back(PlanStep{
+            "Filtro residual", 0.0,
+            std::to_string(antes_del_filtro) + " filas del indice -> " +
+            std::to_string(filas.size()) + " tras aplicar " +
+            std::to_string(filtros.size()) + " condicion(es) en memoria"});
+    }
 
     // ---- Materializacion (proyeccion + limite + formato) ----
     auto t_mat = Clock::now();
@@ -446,34 +664,61 @@ QueryResult Database::ejecutarDelete(const Statement& st) {
     QueryResult r;
     Table* t = abrir(st.table);
     const Schema& sch = t->schema();
+    const TableInfo& ti = catalog_.get(st.table);
 
-    int ci = sch.indexOf(st.where.column);
-    if (ci < 0) throw DBException("No existe la columna '" + st.where.column + "'");
+    std::vector<Predicate> filtros;
+    const Predicate cond = repartirCondiciones(ti, claveSecuencialDe(ti), st, &filtros);
+
+    int ci = sch.indexOf(cond.column);
+    if (ci < 0) throw DBException("No existe la columna '" + cond.column + "'");
     Type tipo = sch[ci].type;
 
     auto t_exec = Clock::now();
     std::vector<RID> objetivo;
-    if (st.where.kind == PredKind::WITHIN) {
-        objetivo = t->searchRIDsWithin(st.where.column, st.where.wx0, st.where.wy0,
-                                       st.where.wx1, st.where.wy1);
-    } else if (st.where.kind == PredKind::EQ) {
-        objetivo = t->searchRIDsEq(st.where.column, coerce(st.where.eq, tipo, st.where.column));
+    if (cond.kind == PredKind::WITHIN) {
+        objetivo = t->searchRIDsWithin(cond.column, cond.wx0, cond.wy0, cond.wx1, cond.wy1);
+    } else if (cond.kind == PredKind::CONTIENE) {
+        objetivo = t->searchRIDsContains(cond.column, cond.qlon, cond.qlat);
+    } else if (cond.kind == PredKind::RADIO) {
+        objetivo = t->searchRIDsRadio(cond.column, cond.qlon, cond.qlat, cond.metros);
+    } else if (cond.kind == PredKind::EQ) {
+        objetivo = t->searchRIDsEq(cond.column, coerce(cond.eq, tipo, cond.column));
     } else {
-        Value lo = st.where.lo_abierto ? cotaMin(tipo) : coerce(st.where.lo, tipo, st.where.column);
-        Value hi = st.where.hi_abierto ? cotaMax(tipo) : coerce(st.where.hi, tipo, st.where.column);
-        objetivo = t->searchRIDsRange(st.where.column, lo, hi);
-        if (st.where.lo_estricto || st.where.hi_estricto) {
+        Value lo = cond.lo_abierto ? cotaMin(tipo) : coerce(cond.lo, tipo, cond.column);
+        Value hi = cond.hi_abierto ? cotaMax(tipo) : coerce(cond.hi, tipo, cond.column);
+        objetivo = t->searchRIDsRange(cond.column, lo, hi);
+        if (cond.lo_estricto || cond.hi_estricto) {
             std::vector<RID> filtrados;
             filtrados.reserve(objetivo.size());
             Tuple f;
             for (const RID& rid : objetivo)
                 if (t->getByRID(rid, f) &&
-                    dentroDelPredicado(f.at(static_cast<std::size_t>(ci)), st.where, lo, hi))
+                    dentroDelPredicado(f.at(static_cast<std::size_t>(ci)), cond, lo, hi))
                     filtrados.push_back(rid);
             objetivo.swap(filtrados);
         }
     }
     r.metodo = t->lastPlan().metodo;
+
+    // Las condiciones que no condujeron el acceso TIENEN que aplicarse antes
+    // de borrar: olvidarlas aqui no devuelve filas de mas, borra filas de mas.
+    const long long candidatas = static_cast<long long>(objetivo.size());
+    if (!filtros.empty()) {
+        std::vector<RID> quedan;
+        quedan.reserve(objetivo.size());
+        Tuple f;
+        for (const RID& rid : objetivo) {
+            if (!t->getByRID(rid, f)) continue;
+            bool ok = true;
+            for (const Predicate& w : filtros) {
+                int cf = sch.indexOf(w.column);
+                if (cf < 0) throw DBException("No existe la columna '" + w.column + "'");
+                if (!cumple(f.at(static_cast<std::size_t>(cf)), w)) { ok = false; break; }
+            }
+            if (ok) quedan.push_back(rid);
+        }
+        objetivo.swap(quedan);
+    }
 
     long long borradas = 0;
     for (const RID& rid : objetivo)
@@ -483,7 +728,10 @@ QueryResult Database::ejecutarDelete(const Statement& st) {
     r.row_count = borradas;
     r.message   = std::to_string(borradas) + " fila(s) eliminada(s) de '" + st.table + "'.";
     r.plan.push_back(PlanStep{"Localizacion: " + r.metodo, r.exec_ms,
-                              std::to_string(objetivo.size()) + " candidatas"});
+                              std::to_string(candidatas) + " candidatas" +
+                              (filtros.empty() ? std::string()
+                                               : ", " + std::to_string(objetivo.size()) +
+                                                 " tras el filtro residual")});
     r.plan.push_back(PlanStep{"DELETE (heap + indice)", 0.0, std::to_string(borradas) + " borradas"});
     return r;
 }

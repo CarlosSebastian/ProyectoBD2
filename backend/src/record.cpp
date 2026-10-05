@@ -10,6 +10,7 @@ std::string typeName(Type t) {
         case Type::DOUBLE:  return "DOUBLE";
         case Type::VARCHAR: return "VARCHAR";
         case Type::POINT:   return "POINT";
+        case Type::POLYGON: return "POLYGON";
     }
     return "INT";
 }
@@ -19,6 +20,7 @@ Type typeFromName(const std::string& s) {
     if (s == "DOUBLE")  return Type::DOUBLE;
     if (s == "VARCHAR") return Type::VARCHAR;
     if (s == "POINT")   return Type::POINT;
+    if (s == "POLYGON") return Type::POLYGON;
     throw DBException("Tipo desconocido: " + s);
 }
 
@@ -44,6 +46,17 @@ std::string Value::str() const {
             os << std::fixed << "(" << d << ", " << y << ")";
             return os.str();
         }
+        case Type::POLYGON: {
+            std::ostringstream os;
+            os.precision(6);
+            os << std::fixed << "POLYGON(";
+            for (std::size_t k = 0; k + 1 < poly.size(); k += 2) {
+                if (k) os << ",";
+                os << "(" << poly[k] << "," << poly[k + 1] << ")";
+            }
+            os << ")";
+            return os.str();
+        }
     }
     return "";
 }
@@ -55,6 +68,7 @@ bool Value::operator==(const Value& o) const {
         case Type::DOUBLE:  return d == o.d;
         case Type::VARCHAR: return s == o.s;
         case Type::POINT:   return d == o.d && y == o.y;
+        case Type::POLYGON: return poly == o.poly;
     }
     return false;
 }
@@ -68,6 +82,7 @@ bool Value::operator<(const Value& o) const {
         // (x, luego y) solo para que Value siga siendo comparable; el R-Tree
         // nunca lo usa, ordena por solapamiento de cajas.
         case Type::POINT:   return d != o.d ? d < o.d : y < o.y;
+        case Type::POLYGON: return poly < o.poly;
     }
     return false;
 }
@@ -104,6 +119,15 @@ std::string serializeTuple(const Schema& sch, const Tuple& t) {
                 double px = v.d, py = v.y;
                 out.append(reinterpret_cast<const char*>(&px), sizeof(px));
                 out.append(reinterpret_cast<const char*>(&py), sizeof(py));
+                break;
+            }
+            case Type::POLYGON: {
+                if (v.poly.size() % 2 != 0)
+                    throw DBException("serializeTuple: el poligono tiene una coordenada suelta");
+                std::int32_t nv = static_cast<std::int32_t>(v.poly.size() / 2);
+                out.append(reinterpret_cast<const char*>(&nv), sizeof(nv));
+                for (double coord : v.poly)
+                    out.append(reinterpret_cast<const char*>(&coord), sizeof(coord));
                 break;
             }
             case Type::VARCHAR: {
@@ -147,6 +171,20 @@ Value extractColumn(const Schema& sch, int col, const char* data, int len) {
                 p += 16;
                 break;
             }
+            case Type::POLYGON: {
+                if (p + 4 > len) throw DBException("extractColumn: registro corrupto");
+                std::int32_t nv = readAt<std::int32_t>(data, p);
+                p += 4;
+                if (nv < 0 || p + nv * 16 > len) throw DBException("extractColumn: registro corrupto");
+                if (k == col) {
+                    std::vector<double> vs(static_cast<std::size_t>(nv) * 2);
+                    for (std::size_t q = 0; q < vs.size(); ++q)
+                        vs[q] = readAt<double>(data, p + static_cast<int>(q) * 8);
+                    return Value::makePolygon(std::move(vs));
+                }
+                p += nv * 16;
+                break;
+            }
             case Type::VARCHAR: {
                 if (p + 4 > len) throw DBException("extractColumn: registro corrupto");
                 std::int32_t n = readAt<std::int32_t>(data, p);
@@ -184,6 +222,18 @@ Tuple deserializeTuple(const Schema& sch, const char* data, int len) {
                 t.values.push_back(Value::makePoint(readAt<double>(data, p),
                                                     readAt<double>(data, p + 8)));
                 p += 16;
+                break;
+            }
+            case Type::POLYGON: {
+                if (p + 4 > len) throw DBException("deserializeTuple: registro corrupto");
+                std::int32_t nv = readAt<std::int32_t>(data, p);
+                p += 4;
+                if (nv < 0 || p + nv * 16 > len) throw DBException("deserializeTuple: registro corrupto");
+                std::vector<double> vs(static_cast<std::size_t>(nv) * 2);
+                for (std::size_t q = 0; q < vs.size(); ++q)
+                    vs[q] = readAt<double>(data, p + static_cast<int>(q) * 8);
+                t.values.push_back(Value::makePolygon(std::move(vs)));
+                p += nv * 16;
                 break;
             }
             case Type::VARCHAR: {

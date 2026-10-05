@@ -82,6 +82,37 @@ int main() {
         Statement d = parseSQL("SELECT * FROM t WHERE x > 7");
         CHECK(d.where.hi_abierto, "rango abierto por arriba");
         CHECK(!d.where.lo_abierto, "con cota inferior");
+        CHECK(b.extra.empty(), "dos cotas de la MISMA columna no generan condicion extra");
+    }
+
+    SECTION("WHERE con condiciones sobre columnas distintas");
+    {
+        // La clave del parser hibrido: las condiciones de la misma columna se
+        // fusionan en un rango, las de columnas distintas quedan separadas.
+        Statement a = parseSQL("SELECT * FROM t WHERE id > 1 AND ubic WITHIN (0,0,50,50);");
+        CHECK_EQ(a.extra.size(), static_cast<std::size_t>(1), "una condicion extra");
+        CHECK_EQ(a.where.column, std::string("id"), "la primera queda en where");
+        CHECK_EQ(static_cast<int>(a.where.kind), static_cast<int>(PredKind::RANGE), "id es rango");
+        CHECK_EQ(a.extra[0].column, std::string("ubic"), "la segunda queda en extra");
+        CHECK_EQ(static_cast<int>(a.extra[0].kind), static_cast<int>(PredKind::WITHIN), "ubic es ventana");
+        CHECK_EQ(a.extra[0].wx1, 50.0, "esquina de la ventana");
+
+        Statement b2 = parseSQL("SELECT * FROM t WHERE id >= 10 AND id <= 20 AND cat = 'x';");
+        CHECK_EQ(b2.extra.size(), static_cast<std::size_t>(1), "el rango de id NO se parte en dos");
+        CHECK_EQ(static_cast<int>(b2.where.kind), static_cast<int>(PredKind::RANGE), "rango fusionado");
+        CHECK_EQ(b2.where.lo.i, static_cast<std::int64_t>(10), "cota inferior tras fusionar");
+        CHECK_EQ(b2.where.hi.i, static_cast<std::int64_t>(20), "cota superior tras fusionar");
+        CHECK_EQ(b2.extra[0].column, std::string("cat"), "la condicion de otra columna sobrevive");
+
+        Statement c2 = parseSQL("SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3;");
+        CHECK_EQ(c2.extra.size(), static_cast<std::size_t>(2), "tres columnas = where + 2 extras");
+
+        // El AND del BETWEEN no debe confundirse con el AND que une condiciones
+        Statement d2 = parseSQL("SELECT * FROM t WHERE id BETWEEN 1 AND 9 AND cat = 'z';");
+        CHECK_EQ(static_cast<int>(d2.where.kind), static_cast<int>(PredKind::RANGE), "BETWEEN sigue siendo rango");
+        CHECK_EQ(d2.where.hi.i, static_cast<std::int64_t>(9), "el 9 es la cota, no otra condicion");
+        CHECK_EQ(d2.extra.size(), static_cast<std::size_t>(1), "y la condicion de cat se separa");
+        CHECK_EQ(d2.extra[0].column, std::string("cat"), "columna de la extra");
     }
 
     SECTION("DELETE y errores de sintaxis");
@@ -305,6 +336,299 @@ int main() {
             CHECK_EQ(db.execute("SELECT * FROM t WHERE id > 297").rows.size(),
                      static_cast<std::size_t>(3), "y los rangos tambien funcionan");
         }
+    }
+
+    // ------------------------------------------------------------------
+    //  Plan hibrido: una condicion conduce el acceso, las demas filtran.
+    //  Se contrasta cada consulta contra el calculo a mano sobre los mismos
+    //  datos, porque lo que puede salir mal aqui no es que falle sino que
+    //  devuelva (o borre) filas de mas sin avisar.
+    // ------------------------------------------------------------------
+    SECTION("planificador hibrido: relacional + espacial en el mismo WHERE");
+    {
+        const std::string DIR = "data/_thib";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+
+        CHECK(db.execute("CREATE TABLE lug (id INT PRIMARY KEY, cat CHAR(8), ubic POINT);").ok,
+              "tabla con columna POINT");
+
+        // Rejilla determinista de 20x20 = 400 filas en [0,19]x[0,19].
+        int esperado_ventana = 0, esperado_ambas = 0, esperado_tres = 0;
+        for (int i = 0; i < 400; ++i) {
+            int x = i % 20, y = i / 20;
+            std::string cat = "c" + std::to_string(i % 4);
+            db.execute("INSERT INTO lug VALUES (" + std::to_string(i) + ",'" + cat + "',POINT(" +
+                       std::to_string(x) + "," + std::to_string(y) + "));");
+            const bool en_ventana = (x >= 0 && x <= 9 && y >= 0 && y <= 9);
+            if (en_ventana)                            ++esperado_ventana;
+            if (en_ventana && i > 100)                 ++esperado_ambas;
+            if (en_ventana && i > 100 && cat == "c2")  ++esperado_tres;
+        }
+        CHECK(db.execute("CREATE INDEX ix_id ON lug (id) USING BTREE;").ok,  "B+ sobre la clave");
+        CHECK(db.execute("CREATE INDEX ix_ub ON lug (ubic) USING RTREE;").ok, "R-Tree sobre el punto");
+
+        SECTION("la consulta que antes fallaba ahora responde, y responde bien");
+        {
+            QueryResult r = db.execute("SELECT * FROM lug WHERE id > 100 AND ubic WITHIN (0,0,9,9);");
+            CHECK(r.ok, std::string("ya no es error de sintaxis") + (r.ok ? "" : " -> " + r.error));
+            CHECK_EQ(r.rows.size(), static_cast<std::size_t>(esperado_ambas),
+                     "mismas filas que el calculo a mano");
+            CHECK_EQ(r.metodo, std::string("INDEX RTREE (ventana)"),
+                     "conduce el R-Tree: la ventana es mas selectiva que el rango");
+        }
+
+        SECTION("una igualdad indexada le gana a la ventana aunque la ventana sea barata");
+        {
+            // La ventana cubre la tabla entera; la igualdad devuelve una fila.
+            QueryResult r = db.execute("SELECT * FROM lug WHERE ubic WITHIN (0,0,19,19) AND id = 77;");
+            CHECK(r.ok, "consulta valida");
+            CHECK_EQ(r.rows.size(), static_cast<std::size_t>(1), "una sola fila");
+            CHECK_EQ(r.metodo, std::string("INDEX BPLUS"),
+                     "conduce la igualdad, no la ventana que leeria las 400 filas");
+        }
+
+        SECTION("tres condiciones, una de ellas sobre una columna sin indice");
+        {
+            QueryResult r = db.execute(
+                "SELECT * FROM lug WHERE cat = 'c2' AND id > 100 AND ubic WITHIN (0,0,9,9);");
+            CHECK(r.ok, "consulta valida");
+            CHECK_EQ(r.rows.size(), static_cast<std::size_t>(esperado_tres),
+                     "mismas filas que el calculo a mano");
+        }
+
+        SECTION("el orden en que se escriben las condiciones no cambia el resultado");
+        {
+            QueryResult a2 = db.execute("SELECT * FROM lug WHERE id > 100 AND ubic WITHIN (0,0,9,9);");
+            QueryResult b3 = db.execute("SELECT * FROM lug WHERE ubic WITHIN (0,0,9,9) AND id > 100;");
+            CHECK_EQ(a2.rows.size(), b3.rows.size(), "mismo numero de filas en ambos ordenes");
+            CHECK_EQ(a2.metodo, b3.metodo, "y la misma ruta de acceso elegida");
+        }
+
+        SECTION("DELETE hibrido: el filtro residual evita borrar de mas");
+        {
+            QueryResult solo_ventana = db.execute("SELECT * FROM lug WHERE ubic WITHIN (0,0,9,9);");
+            CHECK_EQ(solo_ventana.rows.size(), static_cast<std::size_t>(esperado_ventana),
+                     "la ventana sola trae muchas mas filas");
+            CHECK(esperado_ventana > esperado_ambas,
+                  "el caso solo prueba algo si la ventana es mas amplia que la interseccion");
+
+            QueryResult d3 = db.execute("DELETE FROM lug WHERE id > 100 AND ubic WITHIN (0,0,9,9);");
+            CHECK(d3.ok, "el DELETE se ejecuta");
+            CHECK_EQ(d3.row_count, static_cast<long long>(esperado_ambas),
+                     "borra SOLO las que cumplen las dos condiciones");
+
+            CHECK_EQ(db.execute("SELECT * FROM lug;").rows.size(),
+                     static_cast<std::size_t>(400 - esperado_ambas), "el resto de la tabla sigue ahi");
+            CHECK_EQ(db.execute("SELECT * FROM lug WHERE ubic WITHIN (0,0,9,9);").rows.size(),
+                     static_cast<std::size_t>(esperado_ventana - esperado_ambas),
+                     "y el R-Tree quedo coherente tras el borrado");
+        }
+    }
+
+    SECTION("POLYGON de extremo a extremo por SQL");
+    {
+        const std::string DIR = "data/_tpoly";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+
+        CHECK(db.execute("CREATE TABLE zonas (id INT PRIMARY KEY, nombre CHAR(20), area POLYGON);").ok,
+              "tabla con columna POLYGON");
+        QueryResult ins = db.execute(
+            "INSERT INTO zonas VALUES "
+            "(1,'Cuadrado',POLYGON((0,0),(10,0),(10,10),(0,10))),"
+            "(2,'Triangulo',POLYGON((20,0),(30,0),(25,10))),"
+            "(3,'Diagonal',POLYGON((0,0),(100,100),(99,100),(0,1)));");
+        CHECK(ins.ok, std::string("INSERT de poligonos") + (ins.ok ? "" : " -> " + ins.error));
+        CHECK(db.execute("CREATE INDEX ix ON zonas (area) USING RTREE;").ok,
+              "R-Tree sobre una columna POLYGON");
+
+        SECTION("el poligono sobrevive ida y vuelta por disco");
+        {
+            QueryResult r = db.execute("SELECT * FROM zonas WHERE id = 2;");
+            CHECK_EQ(r.rows.size(), static_cast<std::size_t>(1), "una fila");
+            CHECK(r.rows[0][2].find("POLYGON(") == 0, "se reimprime como POLYGON(...)");
+            CHECK(r.rows[0][2].find("20.000000,0.000000") != std::string::npos,
+                  "con sus vertices intactos");
+        }
+
+        SECTION("ST_CONTAINS distingue la caja de la figura");
+        {
+            CHECK_EQ(db.execute("SELECT * FROM zonas WHERE ST_CONTAINS(area, POINT(5,5));").rows.size(),
+                     static_cast<std::size_t>(1), "(5,5) cae en el cuadrado");
+            CHECK_EQ(db.execute("SELECT * FROM zonas WHERE ST_CONTAINS(area, POINT(25,2));").rows.size(),
+                     static_cast<std::size_t>(1), "(25,2) cae en el triangulo");
+            // (21,9) esta dentro de la CAJA del triangulo pero fuera del triangulo.
+            QueryResult r = db.execute("SELECT * FROM zonas WHERE ST_CONTAINS(area, POINT(21,9));");
+            CHECK_EQ(r.rows.size(), static_cast<std::size_t>(0),
+                     "(21,9) esta en la caja pero no en ninguna figura");
+            CHECK_EQ(r.metodo, std::string("INDEX RTREE (contiene + refinamiento)"),
+                     "y el plan declara que hubo refinamiento");
+        }
+
+        SECTION("WITHIN sobre poligonos descarta los falsos positivos del MBR");
+        {
+            // La caja de 'Diagonal' cubre todo el cuadrante, la figura casi nada.
+            QueryResult falso = db.execute("SELECT * FROM zonas WHERE area WITHIN (90,0,95,5);");
+            CHECK_EQ(falso.rows.size(), static_cast<std::size_t>(0),
+                     "la ventana toca la caja de la diagonal, no la diagonal");
+            QueryResult cierto = db.execute("SELECT * FROM zonas WHERE area WITHIN (90,88,95,95);");
+            CHECK_EQ(cierto.rows.size(), static_cast<std::size_t>(1),
+                     "donde si pasa la diagonal, aparece");
+            CHECK_EQ(cierto.rows[0][1], std::string("Diagonal"), "y es la que toca");
+        }
+
+        SECTION("un indice que no es RTREE sobre POLYGON se rechaza con la tabla intacta");
+        {
+            QueryResult r = db.execute("CREATE INDEX mal ON zonas (nombre) USING BTREE;");
+            CHECK(r.ok, "un B+ sobre la columna de texto si vale");
+            QueryResult r2 = db.execute("CREATE INDEX peor ON zonas (id) USING RTREE;");
+            CHECK(!r2.ok, "un RTREE sobre un INT no");
+            CHECK(db.execute("SELECT * FROM zonas WHERE ST_CONTAINS(area, POINT(5,5));").ok,
+                  "y la tabla sigue respondiendo");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    //  Regresiones encontradas revisando la Parte 2.
+    // ------------------------------------------------------------------
+    SECTION("un WHERE junto a ORDER BY por distancia NO se puede ignorar");
+    {
+        const std::string DIR = "data/_tknnf";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE g (id INT PRIMARY KEY, cat CHAR(10), ubic POINT);");
+
+        // 400 puntos en fila sobre el eje X. Los 300 primeros --o sea los 300
+        // MAS CERCANOS al origen-- no cumplen el filtro. Si el motor pidiera k
+        // vecinos y filtrara despues sin sobre-pedir, devolveria vacio.
+        std::string ins = "INSERT INTO g VALUES ";
+        for (int i = 1; i <= 400; ++i) {
+            if (i > 1) ins += ",";
+            ins += "(" + std::to_string(i) + ",'" + (i > 300 ? "bueno" : "malo") +
+                   "',POINT(" + std::to_string(i) + ",0))";
+        }
+        CHECK(db.execute(ins + ";").ok, "carga de 400 puntos");
+        CHECK(db.execute("CREATE INDEX ix ON g (ubic) USING RTREE;").ok, "R-Tree");
+        CHECK_EQ(db.execute("SELECT * FROM g WHERE cat = 'bueno';").rows.size(),
+                 static_cast<std::size_t>(100), "hay 100 filas que cumplen el filtro");
+
+        QueryResult sin = db.execute("SELECT * FROM g ORDER BY ubic <-> POINT(0,0) LIMIT 5;");
+        CHECK_EQ(sin.rows[0][0], std::string("1"), "sin filtro el mas cercano es el 1");
+
+        QueryResult con = db.execute(
+            "SELECT * FROM g WHERE cat = 'bueno' ORDER BY ubic <-> POINT(0,0) LIMIT 5;");
+        CHECK_EQ(con.rows.size(), static_cast<std::size_t>(5), "devuelve los 5 pedidos");
+        CHECK_EQ(con.rows[0][0], std::string("301"),
+                 "y el primero es el 301: el WHERE se aplico de verdad");
+        CHECK_EQ(con.rows[4][0], std::string("305"), "y siguen en orden de distancia");
+
+        SECTION("la sobre-peticion se detiene cuando el indice se agota");
+        {
+            QueryResult r = db.execute(
+                "SELECT * FROM g WHERE cat = 'bueno' ORDER BY ubic <-> POINT(0,0) LIMIT 150;");
+            CHECK_EQ(r.rows.size(), static_cast<std::size_t>(100),
+                     "pedir 150 cuando solo hay 100 devuelve 100, no cuelga");
+            QueryResult vacio = db.execute(
+                "SELECT * FROM g WHERE id > 99999 ORDER BY ubic <-> POINT(0,0) LIMIT 3;");
+            CHECK_EQ(vacio.rows.size(), static_cast<std::size_t>(0),
+                     "un filtro imposible devuelve vacio sin colgarse");
+        }
+
+        SECTION("dos condiciones mas el KNN");
+        {
+            QueryResult r = db.execute("SELECT * FROM g WHERE cat = 'bueno' AND id > 350 "
+                                       "ORDER BY ubic <-> POINT(0,0) LIMIT 4;");
+            CHECK_EQ(r.rows.size(), static_cast<std::size_t>(4), "cuatro filas");
+            CHECK_EQ(r.rows[0][0], std::string("351"), "la primera cumple ambas condiciones");
+        }
+
+        SECTION("tambien con ST_DISTANCE, sobre coordenadas geograficas de verdad");
+        {
+            // OJO: la tabla 'g' pone los puntos en longitudes 1..400 grados, que
+            // sobre la esfera NO son una fila recta: la longitud 360 es la 0, o
+            // sea que ese punto cae encima del origen. Para probar el filtro con
+            // distancia geografica hace falta un dominio que no de la vuelta.
+            db.execute("CREATE TABLE gg (id INT PRIMARY KEY, cat CHAR(10), ubic POINT);");
+            std::string ins2 = "INSERT INTO gg VALUES ";
+            for (int i = 1; i <= 400; ++i) {
+                if (i > 1) ins2 += ",";
+                // longitudes de 0.1 a 40 grados: dentro de rango y monotonas
+                ins2 += "(" + std::to_string(i) + ",'" + (i > 300 ? "bueno" : "malo") +
+                        "',POINT(" + std::to_string(i / 10.0) + ",0))";
+            }
+            CHECK(db.execute(ins2 + ";").ok, "carga con longitudes en rango");
+            CHECK(db.execute("CREATE INDEX ix2 ON gg (ubic) USING RTREE;").ok, "R-Tree");
+
+            QueryResult r = db.execute("SELECT * FROM gg WHERE cat = 'bueno' "
+                                       "ORDER BY ST_DISTANCE(ubic, POINT(0,0)) LIMIT 2;");
+            CHECK_EQ(r.rows.size(), static_cast<std::size_t>(2), "dos filas");
+            CHECK_EQ(r.rows[0][0], std::string("301"), "el filtro tambien se aplica en el geo");
+            CHECK_EQ(r.rows[1][0], std::string("302"), "y el orden por metros se respeta");
+        }
+
+        SECTION("la longitud da la vuelta: es correcto, pero conviene verlo");
+        {
+            // Sobre la tabla 'g' (longitudes hasta 400 grados) el vecino
+            // geografico mas cercano al origen NO es el 301 sino el 360, porque
+            // 360 grados de longitud es el mismo meridiano que 0. El motor no
+            // valida el rango de las coordenadas: ST_DISTANCE interpreta la
+            // columna como (lon, lat) y hace la cuenta que toca.
+            QueryResult r = db.execute("SELECT * FROM g WHERE cat = 'bueno' "
+                                       "ORDER BY ST_DISTANCE(ubic, POINT(0,0)) LIMIT 1;");
+            CHECK_EQ(r.rows[0][0], std::string("360"),
+                     "la longitud 360 cae sobre el origen: distancia cero");
+        }
+    }
+
+    SECTION("la igualdad sobre un POLYGON usa su caja, no el origen");
+    {
+        const std::string DIR = "data/_tpeq";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE z (id INT PRIMARY KEY, area POLYGON);");
+        // El 1 y el 3 COMPARTEN caja envolvente pero son figuras distintas:
+        // el indice los devuelve a los dos y el refinamiento tiene que separarlos.
+        db.execute("INSERT INTO z VALUES "
+                   "(1,POLYGON((0,0),(10,0),(10,10),(0,10))),"
+                   "(2,POLYGON((20,20),(30,20),(30,30),(20,30))),"
+                   "(3,POLYGON((0,0),(10,0),(10,10),(5,5)));");
+        db.execute("CREATE INDEX c ON z (area) USING RTREE;");
+
+        QueryResult r = db.execute("SELECT * FROM z WHERE area = POLYGON((20,20),(30,20),(30,30),(20,30));");
+        CHECK_EQ(r.rows.size(), static_cast<std::size_t>(1), "encuentra el poligono lejos del origen");
+        CHECK_EQ(r.rows[0][0], std::string("2"), "y es el correcto");
+
+        QueryResult r2 = db.execute("SELECT * FROM z WHERE area = POLYGON((0,0),(10,0),(10,10),(0,10));");
+        CHECK_EQ(r2.rows.size(), static_cast<std::size_t>(1),
+                 "de dos figuras con la misma caja devuelve solo la que coincide");
+        CHECK_EQ(r2.rows[0][0], std::string("1"), "y es la correcta");
+        CHECK_EQ(r2.metodo, std::string("INDEX RTREE (igualdad + refinamiento)"),
+                 "el plan declara el refinamiento");
+    }
+
+    SECTION("borrar un poligono lo saca tambien del indice espacial");
+    {
+        const std::string DIR = "data/_tpdel";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE z (id INT PRIMARY KEY, area POLYGON);");
+        db.execute("INSERT INTO z VALUES (1,POLYGON((0,0),(10,0),(10,10),(0,10))),"
+                   "(2,POLYGON((20,20),(30,20),(30,30),(20,30)));");
+        db.execute("CREATE INDEX c ON z (area) USING RTREE;");
+        CHECK_EQ(db.execute("SELECT * FROM z WHERE ST_CONTAINS(area, POINT(5,5));").rows.size(),
+                 static_cast<std::size_t>(1), "antes de borrar lo encuentra");
+        CHECK_EQ(db.execute("DELETE FROM z WHERE id = 1;").row_count,
+                 static_cast<long long>(1), "se borro una fila");
+        CHECK_EQ(db.execute("SELECT * FROM z WHERE ST_CONTAINS(area, POINT(5,5));").rows.size(),
+                 static_cast<std::size_t>(0), "el R-Tree ya no lo devuelve");
+        CHECK_EQ(db.execute("SELECT * FROM z;").rows.size(),
+                 static_cast<std::size_t>(1), "y la otra fila sigue ahi");
     }
 
     DONE("test_sql");
