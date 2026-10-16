@@ -631,6 +631,300 @@ int main() {
                  static_cast<std::size_t>(1), "y la otra fila sigue ahi");
     }
 
+
+    // =======================================================================
+    //  Entregable 2, parte 3: modulo de texto por SQL
+    // =======================================================================
+    SECTION("TEXT sin longitud no trunca: un abstract entero cabe en la columna");
+    {
+        const std::string DIR = "data/_ttext";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE p (id INT PRIMARY KEY, cuerpo TEXT);");
+        std::string largo;
+        while (largo.size() < 900) largo += "palabra ";
+        db.execute("INSERT INTO p VALUES (1, '" + largo + "');");
+        QueryResult r = db.execute("SELECT cuerpo FROM p WHERE id = 1;");
+        CHECK_EQ(r.rows.size(), static_cast<std::size_t>(1), "la fila esta");
+        CHECK_EQ(r.rows[0][0].size(), largo.size(), "el texto vuelve completo, sin recortar");
+
+        // CHAR sin tamano si sigue valiendo 64, como antes del modulo de texto.
+        db.execute("CREATE TABLE q (id INT PRIMARY KEY, corto CHAR);");
+        db.execute("INSERT INTO q VALUES (1, '" + largo + "');");
+        CHECK_EQ(db.execute("SELECT corto FROM q WHERE id = 1;").rows[0][0].size(),
+                 static_cast<std::size_t>(64), "CHAR sin tamano se queda en 64");
+    }
+
+    SECTION("MATCH de extremo a extremo: ranking BM25 con columna de puntaje");
+    {
+        const std::string DIR = "data/_tmatch";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE papers (id INT PRIMARY KEY, titulo CHAR(60), cuerpo TEXT);");
+        db.execute(
+            "INSERT INTO papers VALUES "
+            "(1,'Inverted files','inverted index construction with spimi for large text collections'),"
+            "(2,'Ranking','bm25 and tf idf ranking of documents by term frequency'),"
+            "(3,'B trees','b plus tree indexes for relational databases and range queries'),"
+            "(4,'Text search','full text search engines build an inverted index over documents'),"
+            "(5,'Spatial','r tree indexes for spatial range and nearest neighbour queries');");
+
+        // Sin indice, MATCH tiene que explicar que falta, no fallar de forma rara.
+        QueryResult sin = db.execute("SELECT id FROM papers WHERE cuerpo MATCH 'inverted';");
+        CHECK(!sin.ok, "MATCH sin indice invertido falla");
+        CHECK(sin.error.find("INVERTED") != std::string::npos,
+              "y el mensaje dice que hay que crear el indice");
+
+        QueryResult ci = db.execute("CREATE INDEX ix ON papers (cuerpo) USING INVERTED;");
+        CHECK(ci.ok, "se crea el indice invertido");
+
+        QueryResult r = db.execute("SELECT id, titulo FROM papers WHERE cuerpo MATCH 'inverted index';");
+        CHECK(r.ok, "la consulta MATCH responde");
+        CHECK_EQ(r.columns.back(), std::string("score"), "el resultado trae la columna de puntaje");
+        CHECK_EQ(r.columns.size(), static_cast<std::size_t>(3), "id, titulo y score");
+        // Coinciden cuatro: los dos que dicen "inverted index" y los dos que
+        // solo dicen "indexes", que el stemmer reduce a la misma raiz que
+        // "index". Que aparezcan es correcto; lo que tiene que hacer el
+        // ranking es ponerlos DETRAS.
+        CHECK_EQ(r.rows.size(), static_cast<std::size_t>(4),
+                 "coinciden los cuatro documentos que mencionan indices");
+        for (std::size_t i = 1; i < r.rows.size(); ++i)
+            CHECK(std::stod(r.rows[i - 1].back()) >= std::stod(r.rows[i].back()),
+                  "el ranking viene ordenado de mas a menos relevante");
+        // Los dos primeros son los que contienen AMBOS terminos.
+        const std::string p1 = r.rows[0][0], p2 = r.rows[1][0];
+        CHECK((p1 == "1" && p2 == "4") || (p1 == "4" && p2 == "1"),
+              "arriba quedan los que tienen los dos terminos de la consulta");
+        CHECK(r.metodo.find("INVERTED") != std::string::npos, "el plan nombra el indice invertido");
+
+        // El plan tiene que decir el df de cada termino: es lo que justifica
+        // que el indice sea mas barato que leerlo todo.
+        bool explica_df = false;
+        for (const PlanStep& ps : r.plan)
+            if (ps.detalle.find("df=") != std::string::npos) explica_df = true;
+        CHECK(explica_df, "el plan publica el df de los terminos de la consulta");
+
+        // LIMIT recorta el ranking por arriba.
+        CHECK_EQ(db.execute("SELECT id FROM papers WHERE cuerpo MATCH 'inverted index' LIMIT 2;").rows.size(),
+                 static_cast<std::size_t>(2), "LIMIT 2 deja dos");
+
+        // Una consulta sin ninguna coincidencia no devuelve nada, y no falla.
+        QueryResult vacio = db.execute("SELECT id FROM papers WHERE cuerpo MATCH 'quimica organica';");
+        CHECK(vacio.ok, "una consulta sin coincidencias no es un error");
+        CHECK_EQ(vacio.rows.size(), static_cast<std::size_t>(0), "y devuelve cero filas");
+    }
+
+    SECTION("el stemming hace que singular y plural encuentren lo mismo");
+    {
+        const std::string DIR = "data/_tstem";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE d (id INT PRIMARY KEY, cuerpo TEXT);");
+        db.execute("INSERT INTO d VALUES (1,'the database indexes documents efficiently'),"
+                   "(2,'indexing a document requires a tokenizer');");
+        db.execute("CREATE INDEX ix ON d (cuerpo) USING INVERTED;");
+        const std::size_t a = db.execute("SELECT id FROM d WHERE cuerpo MATCH 'document';").rows.size();
+        const std::size_t b = db.execute("SELECT id FROM d WHERE cuerpo MATCH 'documents';").rows.size();
+        const std::size_t c = db.execute("SELECT id FROM d WHERE cuerpo MATCH 'DOCUMENTS';").rows.size();
+        CHECK_EQ(a, static_cast<std::size_t>(2), "'document' encuentra los dos");
+        CHECK_EQ(b, a, "'documents' encuentra lo mismo");
+        CHECK_EQ(c, a, "y las mayusculas dan igual");
+        // 'indexes' e 'indexing' comparten raiz
+        CHECK_EQ(db.execute("SELECT id FROM d WHERE cuerpo MATCH 'indexing';").rows.size(),
+                 static_cast<std::size_t>(2), "'indexing' alcanza a 'indexes'");
+    }
+
+    SECTION("indice en espanol: LANGUAGE cambia el analisis y queda en el catalogo");
+    {
+        const std::string DIR = "data/_tes";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        {
+            Database db(DIR);
+            db.execute("CREATE TABLE notas (id INT PRIMARY KEY, cuerpo TEXT);");
+            db.execute("INSERT INTO notas VALUES "
+                       "(1,'los indices invertidos aceleran las busquedas de texto'),"
+                       "(2,'el arbol b mas resuelve consultas por rango'),"
+                       "(3,'la busqueda por similitud usa vectores densos');");
+            QueryResult ci = db.execute("CREATE INDEX ix ON notas (cuerpo) USING INVERTED LANGUAGE 'ES';");
+            CHECK(ci.ok, "se crea el indice en espanol");
+            CHECK(ci.message.find("ES") != std::string::npos, "el mensaje dice el idioma");
+            CHECK_EQ(db.execute("SELECT id FROM notas WHERE cuerpo MATCH 'busqueda';").rows.size(),
+                     static_cast<std::size_t>(2), "'busqueda' encuentra tambien 'busquedas'");
+            CHECK_EQ(db.execute("SELECT id FROM notas WHERE cuerpo MATCH 'indice';").rows.size(),
+                     static_cast<std::size_t>(1), "'indice' encuentra 'indices'");
+        }
+        {   // reabrir: el catalogo tiene que recordar que es INVERTED y en ES
+            Database db(DIR);
+            QueryResult r = db.execute("SELECT id FROM notas WHERE cuerpo MATCH 'busquedas';");
+            CHECK(r.ok, "tras reabrir la consulta sigue funcionando");
+            CHECK_EQ(r.rows.size(), static_cast<std::size_t>(2), "y da el mismo resultado");
+        }
+    }
+
+    SECTION("TF-IDF como alternativa a BM25 en la misma consulta");
+    {
+        const std::string DIR = "data/_ttfidf";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE d (id INT PRIMARY KEY, cuerpo TEXT);");
+        db.execute("INSERT INTO d VALUES (1,'alpha beta gamma'),(2,'alpha alpha alpha delta'),"
+                   "(3,'beta gamma delta epsilon zeta eta theta iota kappa lambda');");
+        db.execute("CREATE INDEX ix ON d (cuerpo) USING INVERTED;");
+        QueryResult b = db.execute("SELECT id FROM d WHERE cuerpo MATCH 'alpha' USING BM25;");
+        QueryResult t = db.execute("SELECT id FROM d WHERE cuerpo MATCH 'alpha' USING TFIDF;");
+        CHECK(b.ok && t.ok, "los dos modelos responden");
+        CHECK_EQ(b.rows.size(), t.rows.size(), "coinciden los mismos documentos");
+        for (const PlanStep& ps : t.plan)
+            if (ps.nombre.find("Planificacion") != std::string::npos)
+                CHECK(ps.detalle.find("TF-IDF") != std::string::npos,
+                      "el plan dice que el ranking es TF-IDF");
+        // Todo coseno vive en [0,1]; BM25 no tiene cota superior.
+        for (const auto& fila : t.rows)
+            CHECK(std::stod(fila.back()) <= 1.0, "el coseno no pasa de 1");
+    }
+
+    SECTION("planificador hibrido: MATCH conduce y el resto filtra con sobre-peticion");
+    {
+        const std::string DIR = "data/_thib";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE p (id INT PRIMARY KEY, anio INT, cuerpo TEXT);");
+        std::string ins = "INSERT INTO p VALUES ";
+        for (int i = 1; i <= 40; ++i) {
+            if (i > 1) ins += ",";
+            ins += "(" + std::to_string(i) + "," + std::to_string(2000 + i) +
+                   ",'inverted index number " + std::to_string(i) + "')";
+        }
+        db.execute(ins + ";");
+        db.execute("CREATE INDEX ix ON p (cuerpo) USING INVERTED;");
+
+        // Los 40 documentos coinciden, pero solo 5 cumplen el filtro. Sin
+        // sobre-peticion, pedir LIMIT 5 devolveria los 5 mejores del ranking y
+        // despues el filtro los dejaria casi todos fuera.
+        QueryResult r = db.execute(
+            "SELECT id FROM p WHERE cuerpo MATCH 'inverted index' AND anio >= 2036 LIMIT 5;");
+        CHECK(r.ok, "la consulta hibrida responde");
+        CHECK_EQ(r.rows.size(), static_cast<std::size_t>(5),
+                 "la sobre-peticion reune los 5 que cumplen las dos condiciones");
+        for (const auto& fila : r.rows)
+            CHECK(std::stoi(fila[0]) >= 36, "todas las filas cumplen el filtro de anio");
+        bool dice_sobre = false;
+        for (const PlanStep& ps : r.plan)
+            if (ps.detalle.find("sobre-peticion") != std::string::npos) dice_sobre = true;
+        CHECK(dice_sobre, "el plan declara la sobre-peticion");
+    }
+
+    SECTION("INSERT y DELETE invalidan el indice invertido y se reconstruye solo");
+    {
+        const std::string DIR = "data/_tsucio";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE d (id INT PRIMARY KEY, cuerpo TEXT);");
+        db.execute("INSERT INTO d VALUES (1,'primero sobre grafos'),(2,'segundo sobre arboles');");
+        db.execute("CREATE INDEX ix ON d (cuerpo) USING INVERTED;");
+        CHECK_EQ(db.execute("SELECT id FROM d WHERE cuerpo MATCH 'grafos';").rows.size(),
+                 static_cast<std::size_t>(1), "estado inicial");
+
+        db.execute("INSERT INTO d VALUES (3,'tercero tambien sobre grafos');");
+        CHECK_EQ(db.execute("SELECT id FROM d WHERE cuerpo MATCH 'grafos';").rows.size(),
+                 static_cast<std::size_t>(2), "el documento nuevo aparece sin reindexar a mano");
+
+        db.execute("DELETE FROM d WHERE id = 1;");
+        QueryResult tras = db.execute("SELECT id FROM d WHERE cuerpo MATCH 'grafos';");
+        CHECK_EQ(tras.rows.size(), static_cast<std::size_t>(1), "el borrado tambien se refleja");
+        CHECK_EQ(tras.rows[0][0], std::string("3"), "y queda el que corresponde");
+    }
+
+    SECTION("lo que el motor se niega a hacer con MATCH, y por que");
+    {
+        const std::string DIR = "data/_tneg";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE d (id INT PRIMARY KEY, a TEXT, b TEXT, n INT);");
+        db.execute("INSERT INTO d VALUES (1,'uno dos','tres cuatro',1);");
+        db.execute("CREATE INDEX i1 ON d (a) USING INVERTED;");
+        db.execute("CREATE INDEX i2 ON d (b) USING INVERTED;");
+
+        QueryResult dos = db.execute("SELECT id FROM d WHERE a MATCH 'uno' AND b MATCH 'tres';");
+        CHECK(!dos.ok, "dos MATCH en el mismo WHERE se rechazan");
+        CHECK(dos.error.find("un MATCH") != std::string::npos, "con un mensaje que lo explica");
+
+        QueryResult del = db.execute("DELETE FROM d WHERE a MATCH 'uno';");
+        CHECK(!del.ok, "DELETE con MATCH se rechaza");
+        CHECK(del.error.find("relevancia") != std::string::npos, "explicando que ordena, no selecciona");
+
+        QueryResult malcol = db.execute("CREATE INDEX i3 ON d (n) USING INVERTED;");
+        CHECK(!malcol.ok, "un indice INVERTED sobre INT se rechaza");
+        CHECK(db.execute("SELECT id FROM d;").ok, "y la tabla sigue intacta");
+
+        QueryResult malidi = db.execute("CREATE INDEX i4 ON d (b) USING INVERTED LANGUAGE 'klingon';");
+        CHECK(!malidi.ok, "un idioma desconocido se rechaza");
+    }
+
+
+    SECTION("COPY: carga masiva desde un CSV con comas, comillas y saltos de linea");
+    {
+        const std::string DIR = "data/_tcopy";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        const std::string csv = DIR + "/corpus.csv";
+        {
+            std::ofstream f(csv, std::ios::binary);
+            f << "id,titulo,cuerpo\n";
+            f << "1,Simple,texto sin nada raro\n";
+            f << "2,\"Con, coma\",\"un cuerpo con, comas dentro\"\n";
+            f << "3,\"Con \"\"comillas\"\"\",\"dijo \"\"hola\"\" y se fue\"\n";
+            f << "4,Multilinea,\"primera linea\nsegunda linea del mismo campo\"\n";
+            f << "5,Vacio,\n";
+        }
+        Database db(DIR);
+        db.execute("CREATE TABLE d (id INT PRIMARY KEY, titulo CHAR(40), cuerpo TEXT);");
+        QueryResult c = db.execute("COPY d FROM '" + csv + "' HEADER;");
+        CHECK(c.ok, "el COPY funciona");
+        CHECK_EQ(db.execute("SELECT id FROM d;").rows.size(), static_cast<std::size_t>(5),
+                 "entran las cinco filas y la cabecera no cuenta");
+
+        CHECK_EQ(db.execute("SELECT titulo FROM d WHERE id = 2;").rows[0][0],
+                 std::string("Con, coma"), "la coma dentro de comillas no parte el campo");
+        CHECK_EQ(db.execute("SELECT titulo FROM d WHERE id = 3;").rows[0][0],
+                 std::string("Con \"comillas\""), "dos comillas seguidas son una comilla");
+        CHECK_EQ(db.execute("SELECT cuerpo FROM d WHERE id = 4;").rows[0][0],
+                 std::string("primera linea\nsegunda linea del mismo campo"),
+                 "un campo puede abarcar varias lineas fisicas");
+        CHECK_EQ(db.execute("SELECT cuerpo FROM d WHERE id = 5;").rows[0][0],
+                 std::string(""), "un campo vacio se carga vacio");
+
+        // Y el corpus cargado se puede indexar y consultar.
+        db.execute("CREATE INDEX ix ON d (cuerpo) USING INVERTED;");
+        CHECK_EQ(db.execute("SELECT id FROM d WHERE cuerpo MATCH 'comas';").rows.size(),
+                 static_cast<std::size_t>(1), "el texto cargado por COPY es indexable");
+
+        // Una linea con un numero de campos distinto se descarta sin tumbar la carga.
+        const std::string malo = DIR + "/malo.csv";
+        {
+            std::ofstream f(malo, std::ios::binary);
+            f << "9,solo dos campos\n";
+            f << "10,Bien,texto correcto\n";
+            f << "once,Mal,el id no es un numero\n";
+        }
+        QueryResult c2 = db.execute("COPY d FROM '" + malo + "';");
+        CHECK(c2.ok, "la carga no se cae por una linea mala");
+        CHECK(c2.message.find("descartada") != std::string::npos, "y avisa de lo que descarto");
+        CHECK_EQ(db.execute("SELECT id FROM d WHERE id = 10;").rows.size(),
+                 static_cast<std::size_t>(1), "las lineas buenas si entran");
+
+        QueryResult c3 = db.execute("COPY d FROM 'no_existe_este_archivo.csv';");
+        CHECK(!c3.ok, "un archivo inexistente da error claro");
+    }
+
     DONE("test_sql");
     return 0;
 }

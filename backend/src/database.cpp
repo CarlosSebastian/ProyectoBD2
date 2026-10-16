@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <fstream>
+#include <sstream>
 #include <limits>
 
 #include "db/disk_counter.hpp"
@@ -90,6 +93,12 @@ static bool cumple(const Value& v, const Predicate& w) {
     switch (w.kind) {
         case PredKind::NONE:
             return true;
+        case PredKind::MATCH:
+            // MATCH no es una condicion de si/no sino un ORDEN por relevancia:
+            // no se puede comprobar sobre una fila suelta. El planificador se
+            // encarga de que siempre sea el que conduce el acceso, asi que
+            // aqui nunca llega como filtro residual.
+            return true;
         case PredKind::EQ:
             return v == coerce(w.eq, v.type, w.column);
         case PredKind::WITHIN:
@@ -137,6 +146,11 @@ static int puntajeRuta(const TableInfo& ti, const std::string& clave_seq, const 
     const IndexInfo* ix = ti.findIndex(p.column);
     const bool es_clave_seq = (!clave_seq.empty() && clave_seq == p.column);
     switch (p.kind) {
+        case PredKind::MATCH:
+            // No compite: un MATCH no se puede evaluar fila a fila, asi que
+            // tiene que ser el que conduzca. Si hubiera dos, el planificador
+            // lo rechaza antes de llegar aqui.
+            return -1;
         case PredKind::EQ:                                  // ~1 fila
             if (ix && ix->kind == IndexKind::HASH)  return 0;
             if (ix && ix->kind == IndexKind::BPLUS) return 1;
@@ -197,9 +211,11 @@ QueryResult Database::ejecutarStatement(const Statement& st) {
         case StmtKind::INSERT:       r = ejecutarInsert(st);      break;
         case StmtKind::SELECT:       r = ejecutarSelect(st);      break;
         case StmtKind::DELETE_:      r = ejecutarDelete(st);      break;
+        case StmtKind::COPY:         r = ejecutarCopy(st);        break;
     }
     if (st.kind == StmtKind::CREATE_TABLE || st.kind == StmtKind::CREATE_INDEX ||
-        st.kind == StmtKind::INSERT       || st.kind == StmtKind::DELETE_) {
+        st.kind == StmtKind::INSERT       || st.kind == StmtKind::DELETE_    ||
+        st.kind == StmtKind::COPY) {
         flush();
     }
     return r;
@@ -331,7 +347,12 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
     // indice imposible y la tabla se vuelve inaccesible PARA SIEMPRE: como no
     // hay DROP INDEX, solo se recupera editando catalog.txt a mano.
     const Type tipo_ix = ti.schema[static_cast<std::size_t>(ci_ix)].type;
-    if (st.index_kind == IndexKind::RTREE) {
+    if (st.index_kind == IndexKind::INVERTED) {
+        if (tipo_ix != Type::VARCHAR)
+            throw DBException("Un indice INVERTED solo se crea sobre texto (CHAR/VARCHAR/TEXT): '" +
+                              st.index_column + "' es " + typeName(tipo_ix) + ". La tabla queda intacta.");
+        texto::idiomaDesdeNombre(st.index_idioma);   // valida antes de tocar nada
+    } else if (st.index_kind == IndexKind::RTREE) {
         if (tipo_ix != Type::POINT && tipo_ix != Type::POLYGON)
             throw DBException("Un indice RTREE solo se crea sobre POINT o POLYGON: '" +
                               st.index_column + "' es " + typeName(tipo_ix) + ". La tabla queda intacta.");
@@ -348,6 +369,8 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
     ix.column = st.index_column;
     ix.kind   = st.index_kind;
     ix.file   = st.table + "_" + st.index_column + ".idx";
+    if (st.index_kind == IndexKind::INVERTED)
+        ix.idioma = texto::nombreIdioma(texto::idiomaDesdeNombre(st.index_idioma));
     catalog_.addIndex(st.table, ix);
 
     // Reabrir la tabla con el indice y poblarlo recorriendo el heap.
@@ -357,11 +380,145 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
 
     r.metodo  = "DDL";
     r.message = "Indice '" + st.index_name + "' creado sobre " + st.table + "(" + st.index_column +
-                ") usando " + indexKindName(st.index_kind) + ". " +
+                ") usando " + indexKindName(st.index_kind) +
+                (st.index_kind == IndexKind::INVERTED ? " (idioma " + ix.idioma + ")" : "") + ". " +
                 std::to_string(t->count()) + " filas indexadas. La tabla tiene ahora " +
                 std::to_string(t->numIndices()) + " indice(s).";
     r.exec_ms = msDesde(t0);
     r.plan.push_back(PlanStep{"CREATE INDEX", r.exec_ms, indexKindName(st.index_kind)});
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+//  COPY: carga masiva desde un CSV
+//
+//  Lector de CSV al estilo RFC 4180, que es lo minimo para datos de verdad: un
+//  abstract lleva comas, comillas y a veces saltos de linea, asi que partir por
+//  comas a secas destroza el archivo. Dentro de un campo entrecomillado, dos
+//  comillas seguidas son una comilla literal.
+// ---------------------------------------------------------------------------
+namespace {
+// Lee una fila completa (puede abarcar varias lineas fisicas). Devuelve false
+// al llegar al final del archivo.
+bool leerFilaCSV(std::istream& in, char delim, std::vector<std::string>* campos) {
+    campos->clear();
+    std::string campo;
+    bool dentro_de_comillas = false;
+    bool algo = false;
+    int c;
+    while ((c = in.get()) != EOF) {
+        algo = true;
+        const char ch = static_cast<char>(c);
+        if (dentro_de_comillas) {
+            if (ch == '"') {
+                if (in.peek() == '"') { in.get(); campo += '"'; }   // comilla escapada
+                else                    dentro_de_comillas = false;
+            } else {
+                campo += ch;
+            }
+            continue;
+        }
+        if (ch == '"' && campo.empty()) { dentro_de_comillas = true; continue; }
+        if (ch == delim) { campos->push_back(campo); campo.clear(); continue; }
+        if (ch == '\n') { campos->push_back(campo); return true; }
+        if (ch == '\r') continue;                                   // CRLF de Windows
+        campo += ch;
+    }
+    if (!algo) return false;
+    campos->push_back(campo);
+    return true;
+}
+
+// Convierte el texto plano del CSV al tipo que pide la columna.
+Value valorDesdeTexto(const std::string& s, Type t, const std::string& col, long long linea) {
+    try {
+        switch (t) {
+            case Type::INT:     return Value::makeInt(s.empty() ? 0 : std::stoll(s));
+            case Type::DOUBLE:  return Value::makeDouble(s.empty() ? 0.0 : std::stod(s));
+            case Type::VARCHAR: return Value::makeStr(s);
+            case Type::POINT: {
+                // "x y" o "x,y" (la coma solo si el campo venia entrecomillado)
+                std::size_t corte = s.find_first_of(" ,;");
+                if (corte == std::string::npos)
+                    throw DBException("se esperaban dos coordenadas");
+                return Value::makePoint(std::stod(s.substr(0, corte)),
+                                        std::stod(s.substr(corte + 1)));
+            }
+            case Type::POLYGON: {
+                std::vector<double> v;
+                std::istringstream ss(s);
+                double x;
+                while (ss >> x) { v.push_back(x); if (ss.peek() == ',' || ss.peek() == ';') ss.get(); }
+                if (v.size() < 6 || v.size() % 2 != 0)
+                    throw DBException("un poligono necesita al menos tres pares de coordenadas");
+                return Value::makePolygon(v);
+            }
+        }
+    } catch (const DBException&) {
+        throw;
+    } catch (const std::exception&) {
+        throw DBException("Linea " + std::to_string(linea) + ": no se pudo leer '" + s +
+                          "' como " + typeName(t) + " para la columna '" + col + "'");
+    }
+    return Value::makeInt(0);
+}
+}  // namespace
+
+QueryResult Database::ejecutarCopy(const Statement& st) {
+    QueryResult r;
+    auto t0 = Clock::now();
+
+    Table* t = abrir(st.table);
+    const Schema& sch = t->schema();
+
+    std::ifstream in(st.copy_file, std::ios::binary);
+    if (!in)
+        throw DBException("No se pudo abrir el archivo '" + st.copy_file +
+                          "'. La ruta se resuelve desde el directorio donde corre el servidor.");
+
+    std::vector<std::string> campos;
+    long long linea = 0, insertadas = 0, saltadas = 0;
+    std::string primer_error;
+
+    if (st.copy_header) { leerFilaCSV(in, st.copy_delim, &campos); ++linea; }
+
+    while (leerFilaCSV(in, st.copy_delim, &campos)) {
+        ++linea;
+        // Una linea en blanco al final del archivo es normal; no es un error.
+        if (campos.size() == 1 && campos[0].empty()) continue;
+        if (campos.size() != sch.size()) {
+            ++saltadas;
+            if (primer_error.empty())
+                primer_error = "linea " + std::to_string(linea) + ": " +
+                               std::to_string(campos.size()) + " campos y la tabla tiene " +
+                               std::to_string(sch.size());
+            continue;
+        }
+        Tuple tup;
+        tup.values.reserve(sch.size());
+        try {
+            for (std::size_t i = 0; i < sch.size(); ++i)
+                tup.values.push_back(valorDesdeTexto(campos[i], sch[i].type, sch[i].name, linea));
+        } catch (const DBException& e) {
+            ++saltadas;
+            if (primer_error.empty()) primer_error = e.what();
+            continue;
+        }
+        t->insert(tup);
+        ++insertadas;
+    }
+
+    r.metodo  = "COPY";
+    r.message = std::to_string(insertadas) + " fila(s) cargada(s) en '" + st.table +
+                "' desde " + st.copy_file;
+    if (saltadas > 0)
+        r.message += ". " + std::to_string(saltadas) + " linea(s) descartada(s) (" +
+                     primer_error + ")";
+    r.exec_ms = msDesde(t0);
+    r.plan.push_back(PlanStep{"COPY", r.exec_ms,
+                              std::to_string(insertadas) + " filas insertadas una a una; "
+                              "los indices se mantienen al dia salvo el invertido, que se "
+                              "reconstruye en la primera consulta MATCH"});
     return r;
 }
 
@@ -413,6 +570,18 @@ static Predicate repartirCondiciones(const TableInfo& ti, const std::string& cla
     todas.push_back(st.where);
     for (const Predicate& p : st.extra) todas.push_back(p);
 
+    // Dos MATCH en el mismo WHERE no se pueden resolver: uno conduciria y el
+    // otro quedaria como filtro, pero un filtro de relevancia no existe. Mejor
+    // decirlo que devolver filas de mas en silencio.
+    int n_match = 0;
+    for (const Predicate& p : todas) if (p.kind == PredKind::MATCH) ++n_match;
+    if (n_match > 1)
+        throw DBException("Solo se admite un MATCH por consulta: el ranking textual "
+                          "conduce el acceso y no puede aplicarse como filtro");
+    if (n_match == 1 && st.knn)
+        throw DBException("MATCH y ORDER BY por distancia piden dos ordenes distintos "
+                          "en la misma consulta");
+
     std::size_t mejor = 0;
     int mejor_pts = puntajeRuta(ti, clave_seq, todas[0]);
     for (std::size_t i = 1; i < todas.size(); ++i) {
@@ -451,6 +620,30 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
             ruta = "SeqScan + orden parcial";
             detalle_ruta = "no hay indice RTREE sobre " + st.knn_column;
         }
+    } else if (cond.kind == PredKind::MATCH) {
+        const IndexInfo* ix = ti.findIndex(cond.column);
+        if (!ix || ix->kind != IndexKind::INVERTED)
+            throw DBException("MATCH necesita un indice INVERTED sobre '" + cond.column +
+                              "'. Crealo con: CREATE INDEX ix ON " + st.table +
+                              " (" + cond.column + ") USING INVERTED;");
+        ruta = "IndexMatch";
+        const InvertedIndex* inv = t->indiceTexto(cond.column);
+        detalle_ruta = std::string("indice invertido sobre ") + cond.column +
+                       ", ranking " + (cond.usar_tfidf ? "TF-IDF (coseno)" : "BM25") +
+                       ", idioma " + ix->idioma;
+        if (inv) {
+            detalle_ruta += ", " + std::to_string(inv->numTerminos()) + " terminos sobre " +
+                            std::to_string(inv->numDocs()) + " documentos";
+            // Cuantos documentos toca realmente cada termino de la consulta:
+            // es la medida de cuanto trabajo se ahorra frente a leerlos todos.
+            std::string dfs;
+            for (const std::string& term : inv->analizar(cond.consulta)) {
+                if (!dfs.empty()) dfs += ", ";
+                dfs += term + " (df=" + std::to_string(inv->df(term)) + ")";
+            }
+            if (!dfs.empty()) detalle_ruta += "; terminos: " + dfs;
+            else              detalle_ruta += "; la consulta no deja ningun termino tras el analisis";
+        }
     } else if (cond.kind == PredKind::NONE) {
         ruta = "SeqScan"; detalle_ruta = "sin predicado";
     } else if (cond.kind == PredKind::WITHIN || cond.kind == PredKind::RADIO ||
@@ -487,7 +680,12 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
             detalle_ruta = "el indice HASH no ordena: un rango exige recorrido completo";
         }
     }
-    if (st.knn && cond.kind != PredKind::NONE) {
+    if (cond.kind == PredKind::MATCH && !filtros.empty()) {
+        std::string cols;
+        for (const Predicate& f : filtros) { if (!cols.empty()) cols += ", "; cols += f.column; }
+        detalle_ruta += "  [conduce la relevancia; filtra " + cols +
+                        " con sobre-peticion hasta reunir k]";
+    } else if (st.knn && cond.kind != PredKind::NONE) {
         // El KNN conduce y TODO el WHERE queda como filtro, con sobre-peticion.
         std::string cols = cond.column;
         for (const Predicate& f : filtros) cols += ", " + f.column;
@@ -508,8 +706,54 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     auto t_exec = Clock::now();
     DiskCounter::Snapshot io_exec = DiskCounter::global().snapshot();
     std::vector<Tuple> filas;
+    // Paralelo a 'filas' cuando la consulta es por relevancia: el puntaje no
+    // es una columna de la tabla, pero sin el no se puede juzgar el ranking.
+    std::vector<double> puntajes;
     bool knn_ya_filtrado = false;
-    if (st.knn) {
+    if (cond.kind == PredKind::MATCH) {
+        const int k = st.limit >= 0 ? static_cast<int>(st.limit) : -1;
+
+        auto pasaFiltros = [&](const Tuple& f) {
+            for (const Predicate& w : filtros) {
+                const int cf = sch.indexOf(w.column);
+                if (cf < 0) throw DBException("No existe la columna '" + w.column + "'");
+                if (!cumple(f.at(static_cast<std::size_t>(cf)), w)) return false;
+            }
+            return true;
+        };
+
+        if (filtros.empty()) {
+            filas = t->searchMatch(cond.column, cond.consulta, k, cond.usar_tfidf, &puntajes);
+        } else {
+            // Mismo problema que el KNN: el indice ordena por relevancia y no
+            // sabe nada del resto del WHERE. Si se piden k y despues se
+            // filtran, pueden quedar menos de k. Se duplica la peticion hasta
+            // reunir k supervivientes o hasta agotar el indice.
+            knn_ya_filtrado = true;
+            int pedir = (k < 0) ? -1 : std::max(k, 1);
+            while (true) {
+                std::vector<double> ps;
+                std::vector<Tuple> cand =
+                    t->searchMatch(cond.column, cond.consulta, pedir, cond.usar_tfidf, &ps);
+                filas.clear();
+                puntajes.clear();
+                for (std::size_t i = 0; i < cand.size(); ++i) {
+                    if (!pasaFiltros(cand[i])) continue;
+                    filas.push_back(cand[i]);
+                    puntajes.push_back(i < ps.size() ? ps[i] : 0.0);
+                }
+                if (k < 0) break;
+                if (static_cast<int>(filas.size()) >= k) break;
+                if (static_cast<int>(cand.size()) < pedir) break;
+                if (pedir > 1 << 20) break;
+                pedir *= 2;
+            }
+            if (k >= 0 && static_cast<int>(filas.size()) > k) {
+                filas.resize(static_cast<std::size_t>(k));
+                puntajes.resize(static_cast<std::size_t>(k));
+            }
+        }
+    } else if (st.knn) {
         int ck = sch.indexOf(st.knn_column);
         if (ck < 0) throw DBException("No existe la columna '" + st.knn_column + "'");
         if (sch[ck].type != Type::POINT)
@@ -646,11 +890,23 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
             r.columns.push_back(c);
         }
     }
+    // El puntaje de relevancia no vive en ninguna columna de la tabla, asi que
+    // se anade al final del resultado. Sin el, un ranking es una lista de filas
+    // en un orden que el usuario no puede verificar.
+    const bool con_puntaje = !puntajes.empty() && puntajes.size() == filas.size();
+    if (con_puntaje) r.columns.push_back("score");
+
     long long tope = (st.limit >= 0) ? st.limit : static_cast<long long>(filas.size());
-    for (const Tuple& f : filas) {
+    for (std::size_t fi = 0; fi < filas.size(); ++fi) {
         if (static_cast<long long>(r.rows.size()) >= tope) break;
+        const Tuple& f = filas[fi];
         std::vector<std::string> fila;
         for (int ci : proyeccion) fila.push_back(f.at(static_cast<std::size_t>(ci)).str());
+        if (con_puntaje) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.4f", puntajes[fi]);
+            fila.push_back(buf);
+        }
         r.rows.push_back(std::move(fila));
     }
     r.row_count = static_cast<long long>(r.rows.size());
@@ -668,6 +924,13 @@ QueryResult Database::ejecutarDelete(const Statement& st) {
 
     std::vector<Predicate> filtros;
     const Predicate cond = repartirCondiciones(ti, claveSecuencialDe(ti), st, &filtros);
+
+    // Un MATCH ordena por relevancia; no recorta un conjunto de filas. "Borra
+    // lo que se parezca a estas palabras" no tiene un limite definido, asi que
+    // el motor prefiere negarse antes que adivinar donde cortar.
+    if (cond.kind == PredKind::MATCH)
+        throw DBException("DELETE con MATCH no esta soportado: la relevancia ordena, no "
+                          "selecciona. Borra por una condicion concreta sobre otra columna.");
 
     int ci = sch.indexOf(cond.column);
     if (ci < 0) throw DBException("No existe la columna '" + cond.column + "'");

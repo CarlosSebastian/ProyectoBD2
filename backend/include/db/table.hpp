@@ -15,6 +15,15 @@
 //     - ventana  'col WITHIN (x0,y0,x1,y1)'      -> R-Tree, o scan con filtro
 //     - KNN      'ORDER BY col <-> POINT(x,y)'   -> R-Tree best-first, o scan
 //                                                   con ordenacion parcial
+//
+//  Para columnas de texto se suma la ruta textual (Entregable 2, parte 3):
+//     - relevancia  'col MATCH ''palabras'''  -> indice invertido, ranking
+//                                               BM25 o TF-IDF
+//  El indice invertido es de construccion masiva: no admite insercion fila a
+//  fila. Un INSERT o un DELETE sobre una tabla que lo tenga lo marcan como
+//  desactualizado, y la siguiente consulta MATCH lo reconstruye antes de
+//  responder. Asi el resultado nunca es incorrecto, aunque la escritura salga
+//  barata y la primera lectura posterior cara.
 // ============================================================================
 #pragma once
 
@@ -27,6 +36,7 @@
 #include "db/catalog.hpp"
 #include "db/extendible_hash.hpp"
 #include "db/heap_file.hpp"
+#include "db/inverted.hpp"
 #include "db/record.hpp"
 #include "db/rtree.hpp"
 #include "db/sequential_file.hpp"
@@ -92,6 +102,25 @@ public:
     std::vector<Tuple> searchContains(const std::string& col, double px, double py);
     std::vector<RID>   searchRIDsContains(const std::string& col, double px, double py);
 
+    // ---- consulta textual (columna VARCHAR/TEXT con indice INVERTED) ----
+    // Devuelve hasta k filas ordenadas por relevancia descendente; k < 0 son
+    // todas las que coincidan. Si 'puntajes' no es nulo, recibe el puntaje de
+    // cada fila en el mismo orden.
+    std::vector<Tuple> searchMatch(const std::string& col, const std::string& consulta,
+                                   int k, bool tfidf = false,
+                                   std::vector<double>* puntajes = nullptr);
+    std::vector<RID>   searchRIDsMatch(const std::string& col, const std::string& consulta,
+                                       int k, bool tfidf = false);
+    // Reconstruye los indices invertidos de la tabla desde el heap (SPIMI).
+    // 'presupuesto_bytes' es la memoria que SPIMI puede acumular antes de
+    // volcar un bloque a disco; 0 deja el valor por defecto. Se expone porque
+    // es la variable que el experimento necesita mover para enseñar el
+    // intercambio entre memoria y numero de bloques.
+    void reconstruirTexto(std::size_t presupuesto_bytes = 0);
+    bool textoDesactualizado() const { return texto_sucio_; }
+    // Acceso de solo lectura para las metricas del plan y los tests.
+    const InvertedIndex* indiceTexto(const std::string& col) const;
+
     const PlanInfo& lastPlan() const { return last_plan_; }
 
     void buildIndex();                     // vacia el indice y lo repuebla desde los datos
@@ -148,9 +177,12 @@ private:
         std::unique_ptr<ExtendibleHash<std::int64_t>> hs_int;
         std::unique_ptr<ExtendibleHash<Key32>>        hs_str;
         std::unique_ptr<RTree>                        rt;
+        std::unique_ptr<InvertedIndex>                inv;
+        texto::Idioma                                 idioma = texto::Idioma::EN;
 
         void soltarEstructuras() {
-            bt_int.reset(); bt_str.reset(); hs_int.reset(); hs_str.reset(); rt.reset();
+            bt_int.reset(); bt_str.reset(); hs_int.reset(); hs_str.reset();
+            rt.reset(); inv.reset();
         }
     };
 
@@ -181,6 +213,8 @@ private:
     bool                           auto_reorg_ = true;
 
     std::vector<Indice> indices_;
+    // Hay un indice invertido y la tabla cambio desde que se construyo.
+    bool                texto_sucio_ = false;
     std::string         data_dir_;
     int                 pool_size_ = 64;
 

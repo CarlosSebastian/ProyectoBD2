@@ -233,6 +233,11 @@ const EJEMPLOS = [
   ["KNN",          "SELECT * FROM lugares ORDER BY ubic <-> POINT(-77.0300,-12.0460) LIMIT 3;"],
   ["KNN geográfico", "SELECT * FROM lugares ORDER BY ST_DISTANCE(ubic, POINT(-77.0300,-12.0460)) LIMIT 3;"],
   ["Radio (metros)", "SELECT * FROM lugares WHERE ST_DISTANCE(ubic, POINT(-77.0300,-12.0460)) <= 12000;"],
+  ["Texto: crear", "CREATE TABLE papers (id INT PRIMARY KEY, titulo CHAR(80), resumen TEXT);\nINSERT INTO papers VALUES\n (1,'Inverted files','inverted index construction with spimi over large text collections'),\n (2,'Okapi BM25','bm25 ranks documents by term frequency and inverse document frequency'),\n (3,'B+ trees','b plus tree indexes for relational databases and range queries'),\n (4,'Full text search','search engines build an inverted index over millions of documents'),\n (5,'R-trees','r tree indexes for spatial range and nearest neighbour queries');\nCREATE INDEX ix_texto ON papers (resumen) USING INVERTED;"],
+  ["MATCH (BM25)",  "SELECT id, titulo FROM papers WHERE resumen MATCH 'inverted index' LIMIT 5;"],
+  ["MATCH (TF-IDF)","SELECT id, titulo FROM papers WHERE resumen MATCH 'inverted index' USING TFIDF LIMIT 5;"],
+  ["MATCH híbrido", "SELECT id, titulo FROM papers WHERE resumen MATCH 'index' AND id >= 3 LIMIT 3;"],
+  ["Texto español", "CREATE TABLE notas (id INT PRIMARY KEY, cuerpo TEXT);\nINSERT INTO notas VALUES\n (1,'los indices invertidos aceleran las busquedas de texto libre'),\n (2,'el arbol B+ resuelve consultas por rango sobre la clave primaria'),\n (3,'la busqueda por similitud compara vectores densos de alta dimension');\nCREATE INDEX ix_es ON notas (cuerpo) USING INVERTED LANGUAGE 'ES';\nSELECT * FROM notas WHERE cuerpo MATCH 'busqueda';"],
   ["Polígonos",    "CREATE TABLE zonas (id INT PRIMARY KEY, nombre CHAR(24), area POLYGON);\nINSERT INTO zonas VALUES (1,'Centro',POLYGON((-77.05,-12.06),(-77.01,-12.06),(-77.01,-12.03),(-77.05,-12.03))),(2,'Sur',POLYGON((-77.05,-12.16),(-77.00,-12.16),(-77.00,-12.10),(-77.05,-12.10)));\nCREATE INDEX ix_area ON zonas (area) USING RTREE;\nSELECT * FROM zonas WHERE ST_CONTAINS(area, POINT(-77.0300,-12.0460));"],
 ];
 
@@ -345,9 +350,26 @@ function pintarResultados(resp){
   pagina = Math.min(pagina, total - 1);
   const desde = pagina * FILAS_POR_PAGINA;
   const visibles = d.rows.slice(desde, desde + FILAS_POR_PAGINA);
+  // La columna 'score' la agrega el motor cuando la consulta es un MATCH.
+  // Un numero suelto no dice nada; al lado de una barra se ve de un vistazo
+  // cuanto mas relevante es el primero que el ultimo.
+  const ciScore = d.columns.indexOf('score');
+  let maxScore = 0;
+  if (ciScore >= 0) for (const f of d.rows) maxScore = Math.max(maxScore, parseFloat(f[ciScore]) || 0);
+  const celda = (c, i) => {
+    if (i !== ciScore) return `<td>${escapar(c)}</td>`;
+    const v = parseFloat(c) || 0;
+    const pct = maxScore > 0 ? Math.round((v / maxScore) * 100) : 0;
+    return `<td style="white-space:nowrap">` +
+           `<span style="display:inline-block;width:46px">${escapar(c)}</span>` +
+           `<span style="display:inline-block;width:70px;height:7px;background:var(--border);` +
+           `border-radius:4px;vertical-align:middle;overflow:hidden">` +
+           `<span style="display:block;width:${pct}%;height:100%;background:#d97706"></span>` +
+           `</span></td>`;
+  };
   cont.innerHTML = `<table>
     <thead><tr>${d.columns.map(c=>`<th>${escapar(c)}</th>`).join('')}</tr></thead>
-    <tbody>${visibles.map(f=>`<tr>${f.map(c=>`<td>${escapar(c)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+    <tbody>${visibles.map(f=>`<tr>${f.map(celda).join('')}</tr>`).join('')}</tbody></table>`;
   pag.hidden = d.rows.length <= FILAS_POR_PAGINA;
   $('#pag-info').textContent = `${desde+1}–${Math.min(desde+FILAS_POR_PAGINA, d.rows.length)} de ${d.rows.length}`;
   $('#pag-prev').disabled = pagina === 0;

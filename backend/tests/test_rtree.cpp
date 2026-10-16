@@ -81,7 +81,7 @@ int main() {
 
         std::cout << "   capacidad hoja=" << RTree::leafCapacity()
                   << " interno=" << RTree::internalCapacity()
-                  << " (minimos " << RTree::LEAF_MIN << "/" << RTree::INT_MIN << ")\n";
+                  << " (minimos " << RTree::LEAF_MIN << "/" << RTree::INT_MIN_E << ")\n";
 
         SECTION("insertar 20000 puntos -> fuerza splits y crecimiento de altura");
         for (const Punto& p : ps) rt.insert(MBR::point(p.x, p.y), p.rid);

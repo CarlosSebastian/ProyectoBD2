@@ -4,17 +4,20 @@
 //  Gramatica soportada (la que exige el enunciado):
 //
 //    CREATE TABLE t ( col TIPO [PRIMARY KEY], ... ) [USING HEAP|SEQUENTIAL];
-//    CREATE INDEX nombre ON t ( col ) [USING BTREE|HASH|RTREE];
+//    CREATE INDEX nombre ON t ( col ) [USING BTREE|HASH|RTREE|INVERTED]
+//                                     [LANGUAGE 'EN'|'ES'];
 //    INSERT INTO t VALUES ( v1, v2, ... ) [, ( ... ) ...];
 //    SELECT * | c1,c2 FROM t [WHERE <cond>]
 //           [ORDER BY col <-> POINT(x,y)] [LIMIT n];
 //    DELETE FROM t WHERE <cond>;
+//    COPY t FROM 'ruta.csv' [HEADER];   -- carga masiva desde un CSV
 //
 //    <cond> ::= col = v
 //             | col BETWEEN a AND b
 //             | col >= a AND col <= b     (cualquier combinacion de < <= > >=)
 //             | col > a                   (rango abierto por un extremo)
 //             | col WITHIN (minx, miny, maxx, maxy)   -- ventana espacial
+//             | col MATCH 'palabras' [USING BM25|TFIDF]  -- relevancia textual
 //             | <cond> AND <cond>         sobre columnas DISTINTAS
 //
 //  Varias condiciones unidas por AND: las que caen sobre la misma columna se
@@ -51,7 +54,7 @@
 
 namespace db {
 
-enum class StmtKind { CREATE_TABLE, CREATE_INDEX, INSERT, SELECT, DELETE_ };
+enum class StmtKind { CREATE_TABLE, CREATE_INDEX, INSERT, SELECT, DELETE_, COPY };
 
 enum class EngineKind { HEAP, SEQUENTIAL };
 std::string engineName(EngineKind e);
@@ -64,7 +67,7 @@ struct ColumnDef {
     bool        primary_key = false;
 };
 
-enum class PredKind { NONE, EQ, RANGE, WITHIN, RADIO, CONTIENE };
+enum class PredKind { NONE, EQ, RANGE, WITHIN, RADIO, CONTIENE, MATCH };
 
 struct Predicate {
     PredKind    kind = PredKind::NONE;
@@ -85,6 +88,12 @@ struct Predicate {
     // RADIO: ST_DISTANCE(col, POINT(lon,lat)) <= metros
     double      qlon = 0.0, qlat = 0.0, metros = 0.0;
     bool        radio_estricto = false;      // true => '<' en vez de '<='
+
+    // MATCH: texto de la consulta en bruto. Lo analiza el indice invertido con
+    // SU idioma, porque consulta y documentos tienen que pasar por el mismo
+    // tokenizador o los terminos no coinciden.
+    std::string consulta;
+    bool        usar_tfidf = false;          // false => BM25 (el de por defecto)
 };
 
 struct Statement {
@@ -99,9 +108,16 @@ struct Statement {
     std::string index_name;
     std::string index_column;
     IndexKind   index_kind = IndexKind::BPLUS;
+    std::string index_idioma = "EN";          // solo INVERTED
 
     // INSERT
     std::vector<std::vector<Value>> rows; 
+
+    // COPY: cargar un CSV entero. Sin esto, meter doce mil abstracts exigiria
+    // doce mil sentencias INSERT, que es inviable a mano y absurdo por HTTP.
+    std::string copy_file;
+    bool        copy_header = false;     // la primera linea son los nombres
+    char        copy_delim  = ',';
 
     // SELECT / DELETE
     std::vector<std::string> select_columns;   // vacio => SELECT *

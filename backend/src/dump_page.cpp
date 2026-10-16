@@ -223,6 +223,7 @@ constexpr int RT_MBR      = 32;                        // cuatro doubles
 constexpr int RT_LEAF_MAX = (PAGE_SIZE - RT_HDR) / (RT_MBR + 8);
 constexpr int RT_INT_MAX  = (PAGE_SIZE - RT_HDR) / (RT_MBR + 4);
 constexpr std::int32_t RT_MAGIC = 0x52545245;          // "RTRE"
+constexpr std::int32_t IV_MAGIC = 0x494E5658;          // "INVX"
 constexpr int EH_HDR      = 12;                        // extendible_hash.hpp
 
 void dumpBPlus(const char* b, int numero, bool hex_completo) {
@@ -357,6 +358,103 @@ void dumpHash(const char* b, int numero, bool hex_completo) {
 }
 
 // ---------------------------------------------------------------------------
+//  Indice invertido. Es el unico de los cuatro que no es un arbol: el archivo
+//  son cuatro zonas seguidas y la pagina 0 dice donde empieza cada una.
+// ---------------------------------------------------------------------------
+void dumpInvertido(const char* b, int numero, bool hex_completo,
+                   const std::vector<char>& meta) {
+    linea('=');
+    std::cout << "  PAGINA " << numero << " del indice invertido   (offset "
+              << static_cast<long long>(numero) * PAGE_SIZE << ")\n";
+    linea('=');
+
+    const int p_post = readAt<std::int32_t>(meta.data(), 24);
+    const int p_dicc = readAt<std::int32_t>(meta.data(), 28);
+    const int p_docs = readAt<std::int32_t>(meta.data(), 32);
+    const int p_fin  = readAt<std::int32_t>(meta.data(), 36);
+
+    if (numero == 0) {
+        std::cout << "\nPAGINA META\n";
+        std::cout << "  off  tam  campo                valor               bytes en disco\n";
+        linea();
+        campo("num_docs",     0, 4, std::to_string(readAt<std::int32_t>(b, 0)), b);
+        campo("num_terminos", 4, 4, std::to_string(readAt<std::int32_t>(b, 4)), b);
+        campo("total_tokens", 8, 8, std::to_string(readAt<std::int64_t>(b, 8)), b);
+        campo("MAGIC",       16, 4, "\"INVX\"", b);
+        campo("idioma",      20, 4, readAt<std::int32_t>(b, 20) == 1 ? "1 (ES)" : "0 (EN)", b);
+        campo("pag_postings",24, 4, std::to_string(p_post), b);
+        campo("pag_dicc",    28, 4, std::to_string(p_dicc), b);
+        campo("pag_docs",    32, 4, std::to_string(p_docs), b);
+        campo("pag_fin",     36, 4, std::to_string(p_fin), b);
+        campo("avgdl",       40, 8, std::to_string(readAt<double>(b, 40)), b);
+        campo("bloques_spimi",48,4, std::to_string(readAt<std::int32_t>(b, 48)), b);
+        std::cout << "\n  Zonas: postings [" << p_post << ", " << p_dicc
+                  << ")   diccionario [" << p_dicc << ", " << p_docs
+                  << ")   documentos [" << p_docs << ", " << p_fin << ")\n\n";
+        linea();
+        volcadoHex(b, 0, 56);
+        std::cout << "\n";
+        return;
+    }
+
+    if (numero >= p_post && numero < p_dicc) {
+        std::cout << "\nZONA DE POSTINGS\n"
+                     "  Bytes crudos: las listas van codificadas como huecos entre doc_id\n"
+                     "  consecutivos y frecuencias, ambos en varint de 7 bits, y una lista\n"
+                     "  puede cruzar el borde de la pagina. No hay cabecera que separar.\n\n";
+        volcadoHex(b, 0, hex_completo ? PAGE_SIZE : 256);
+        std::cout << "\n";
+        return;
+    }
+
+    if (numero >= p_dicc && numero < p_docs) {
+        const int n     = readAt<std::int32_t>(b, 0);
+        const int usado = readAt<std::int32_t>(b, 4);
+        std::cout << "\nPAGINA DEL DICCIONARIO\n";
+        std::cout << "  off  tam  campo                valor               bytes en disco\n";
+        linea();
+        campo("n_terminos", 0, 4, std::to_string(n), b);
+        campo("bytes_usados", 4, 4, std::to_string(usado), b);
+        std::cout << "\nTERMINOS (ordenados: por eso la busqueda es por biseccion)\n";
+        std::cout << "      i  termino                            df        offset     bytes\n";
+        linea();
+        int off = 8;
+        for (int i = 0; i < n && off < PAGE_SIZE; ++i) {
+            const int largo = static_cast<unsigned char>(b[off]);
+            std::string t(b + off + 1, static_cast<std::size_t>(largo));
+            const int o = off + 1 + largo;
+            std::cout << "  " << std::setw(5) << i << "  " << std::setw(32) << std::left << t
+                      << std::right << std::setw(6) << readAt<std::uint32_t>(b, o)
+                      << std::setw(14) << readAt<std::uint64_t>(b, o + 4)
+                      << std::setw(10) << readAt<std::uint32_t>(b, o + 12) << "\n";
+            off += 1 + largo + 16;
+        }
+        std::cout << "\n";
+        if (hex_completo) { linea(); volcadoHex(b, 0, PAGE_SIZE); }
+        return;
+    }
+
+    std::cout << "\nTABLA DE DOCUMENTOS  (16 bytes por documento)\n";
+    std::cout << "    doc_id       RID     |d| tokens      norma TF-IDF\n";
+    linea();
+    const int por_pagina = PAGE_SIZE / 16;
+    const int base = (numero - p_docs) * por_pagina;
+    for (int i = 0; i < por_pagina; ++i) {
+        const int o = i * 16;
+        const std::int32_t pg = readAt<std::int32_t>(b, o);
+        const std::int32_t sl = readAt<std::int32_t>(b, o + 4);
+        const std::uint32_t lg = readAt<std::uint32_t>(b, o + 8);
+        if (pg == 0 && sl == 0 && lg == 0) continue;
+        std::cout << "  " << std::setw(8) << (base + i)
+                  << "  " << std::setw(8) << ("(" + std::to_string(pg) + "," + std::to_string(sl) + ")")
+                  << std::setw(14) << lg
+                  << std::setw(18) << readAt<float>(b, o + 12) << "\n";
+    }
+    std::cout << "\n";
+    if (hex_completo) { linea(); volcadoHex(b, 0, PAGE_SIZE); }
+}
+
+// ---------------------------------------------------------------------------
 //  Indice espacial R-Tree. A diferencia del B+, un nodo no guarda claves sino
 //  CAJAS ENVOLVENTES de 32 bytes, y las hojas apuntan al dato por RID.
 // ---------------------------------------------------------------------------
@@ -446,7 +544,7 @@ int main(int argc, char** argv) {
 
     const std::string ruta = argv[1];
     bool quiere_resumen = false, hex_completo = false;
-    enum class Formato { SLOTTED, BPLUS, HASH, RTREE } formato = Formato::SLOTTED;
+    enum class Formato { SLOTTED, BPLUS, HASH, RTREE, INVERTIDO } formato = Formato::SLOTTED;
     long long numero = 0;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -455,6 +553,7 @@ int main(int argc, char** argv) {
         else if (a == "--bplus")   formato        = Formato::BPLUS;
         else if (a == "--hash")    formato        = Formato::HASH;
         else if (a == "--rtree")   formato        = Formato::RTREE;
+        else if (a == "--invertido" || a == "--inverted") formato = Formato::INVERTIDO;
         else if (a == "--help" || a == "-h") { uso(); return 0; }
         else                       numero = std::atoll(a.c_str());
     }
@@ -491,6 +590,8 @@ int main(int argc, char** argv) {
         f.clear(); f.seekg(0, std::ios::beg); f.read(p0.data(), PAGE_SIZE);
         if (readAt<std::int32_t>(p0.data(), 16) == RT_MAGIC) {
             formato = Formato::RTREE;
+        } else if (readAt<std::int32_t>(p0.data(), 16) == IV_MAGIC) {
+            formato = Formato::INVERTIDO;
         } else {
             formato = Formato::BPLUS;
             if (paginas > 1) {
@@ -501,8 +602,9 @@ int main(int argc, char** argv) {
         }
         std::cout << "  formato detectado: indice "
                   << (formato == Formato::RTREE ? "R-TREE ESPACIAL"
+                      : formato == Formato::INVERTIDO ? "INVERTIDO (texto)"
                       : formato == Formato::HASH ? "HASH EXTENSIBLE" : "ARBOL B+")
-                  << "   (--bplus / --hash / --rtree para forzarlo)\n";
+                  << "   (--bplus / --hash / --rtree / --invertido para forzarlo)\n";
     }
 
     if (quiere_resumen) {
@@ -528,6 +630,13 @@ int main(int argc, char** argv) {
         case Formato::BPLUS: dumpBPlus(buf.data(), static_cast<int>(numero), hex_completo); break;
         case Formato::HASH:  dumpHash (buf.data(), static_cast<int>(numero), hex_completo); break;
         case Formato::RTREE: dumpRTree(buf.data(), static_cast<int>(numero), hex_completo); break;
+        case Formato::INVERTIDO: {
+            // El volcador necesita la META para saber en que zona cae la pagina.
+            std::vector<char> meta(PAGE_SIZE, 0);
+            f.clear(); f.seekg(0, std::ios::beg); f.read(meta.data(), PAGE_SIZE);
+            dumpInvertido(buf.data(), static_cast<int>(numero), hex_completo, meta);
+            break;
+        }
         default:             mostrarPagina(buf.data(), static_cast<int>(numero), hex_completo);
     }
     return 0;

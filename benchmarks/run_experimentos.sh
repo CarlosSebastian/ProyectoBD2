@@ -6,6 +6,8 @@
 #  Experimentos 1 a 4: motor relacional (Entregable 1).
 #  Experimento 5: escalabilidad del modulo espacial (Entregable 2). No usa el
 #  dataset de empleados: genera sus propios puntos con semilla fija.
+#  Experimento 6: modulo de texto (Entregable 2). Tambien genera su propio
+#  corpus, con vocabulario zipfiano y semilla fija.
 #
 #     ./benchmarks/run_experimentos.sh [N_dataset]
 #
@@ -89,6 +91,11 @@ echo "==> exp5 (modulo espacial)"
 g++ -std=c++17 -O2 -Ibackend/include -Ibenchmarks -DDB_PAGE_SIZE=$PAGE \
     benchmarks/exp5_espacial.cpp $LIB -o "build/exp5_espacial$EXE"
 "./build/exp5_espacial$EXE" data 100000 20 >> "$SALIDA"
+
+echo "==> exp6 (modulo de texto)"
+g++ -std=c++17 -O2 -Ibackend/include -Ibenchmarks -DDB_PAGE_SIZE=$PAGE \
+    benchmarks/exp6_texto.cpp $LIB -o "build/exp6_texto$EXE"
+"./build/exp6_texto$EXE" data 50000 20 >> "$SALIDA"
 
 echo ""
 echo "==> listo: $SALIDA"

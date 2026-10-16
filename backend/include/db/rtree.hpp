@@ -313,7 +313,7 @@ public:
     // Relleno minimo del 40 %, el valor que recomienda Guttman: por debajo de
     // eso los nodos quedan tan vacios que el arbol degenera.
     static constexpr int LEAF_MIN = LEAF_MAX * 2 / 5;
-    static constexpr int INT_MIN  = INT_MAX_E * 2 / 5;
+    static constexpr int INT_MIN_E  = INT_MAX_E * 2 / 5;
 
     static_assert(LEAF_MAX >= 4 && INT_MAX_E >= 4, "pagina demasiado chica para un R-Tree");
 
@@ -516,7 +516,7 @@ private:
     static int ridOff(int i, bool)        { return NODE_HDR + LEAF_MAX  * MBR_SZ + i * RID_SZ; }
     static int hijoOff(int i, bool)       { return NODE_HDR + INT_MAX_E * MBR_SZ + i * PID_SZ; }
     static int capacidad(bool hoja)       { return hoja ? LEAF_MAX : INT_MAX_E; }
-    static int minimo(bool hoja)          { return hoja ? LEAF_MIN : INT_MIN; }
+    static int minimo(bool hoja)          { return hoja ? LEAF_MIN : INT_MIN_E; }
 
     static bool esHoja(const char* b)     { return readAt<std::uint8_t>(b, 0) != 0; }
     static int  getN(const char* b)       { return readAt<std::uint16_t>(b, 1); }

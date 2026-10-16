@@ -64,7 +64,12 @@ Table::Table(const std::string& data_dir, const TableInfo& info, int pool_size)
         if (ix.col < 0) throw DBException("La columna indexada no existe: " + meta.column);
 
         const Type kt = info_.schema[static_cast<std::size_t>(ix.col)].type;
-        if (meta.kind == IndexKind::RTREE) {
+        if (meta.kind == IndexKind::INVERTED) {
+            if (kt != Type::VARCHAR)
+                throw DBException("Un indice INVERTED solo se crea sobre texto: '" +
+                                  meta.column + "' es " + typeName(kt));
+            ix.idioma = texto::idiomaDesdeNombre(meta.idioma.empty() ? "EN" : meta.idioma);
+        } else if (meta.kind == IndexKind::RTREE) {
             if (kt != Type::POINT && kt != Type::POLYGON)
                 throw DBException("Un indice RTREE solo se crea sobre POINT o POLYGON: '" +
                                   meta.column + "' es " + typeName(kt));
@@ -101,6 +106,9 @@ void Table::abrirIndice(Indice& ix) {
     switch (ix.kind) {
         case IndexKind::RTREE:
             ix.rt = std::make_unique<RTree>(ix.bp.get());
+            break;
+        case IndexKind::INVERTED:
+            ix.inv = std::make_unique<InvertedIndex>(ix.bp.get());
             break;
         case IndexKind::BPLUS:
             if (kt == Type::INT) ix.bt_int = std::make_unique<BPlusTree<std::int64_t>>(ix.bp.get());
@@ -158,7 +166,11 @@ MBR Table::cajaDe(const Value& v) {
 void Table::insertIntoIndex(const Tuple& t, const RID& rid) {
     for (Indice& ix : indices_) {
         const Value& key = t.values[static_cast<std::size_t>(ix.col)];
-        if (ix.rt)          ix.rt->insert(cajaDe(key), rid);
+        // El indice invertido no se actualiza fila a fila: insertar un
+        // documento obligaria a desplazar casi todas las listas de postings.
+        // Se marca como desactualizado y se reconstruye en la proxima consulta.
+        if (ix.inv)         texto_sucio_ = true;
+        else if (ix.rt)     ix.rt->insert(cajaDe(key), rid);
         else if (ix.bt_int) ix.bt_int->insert(key.i, rid);
         else if (ix.hs_int) ix.hs_int->insert(key.i, rid);
         else if (ix.bt_str) ix.bt_str->insert(Key32(key.s), rid);
@@ -168,7 +180,8 @@ void Table::insertIntoIndex(const Tuple& t, const RID& rid) {
 void Table::removeFromIndex(const Tuple& t, const RID& rid) {
     for (Indice& ix : indices_) {
         const Value& key = t.values[static_cast<std::size_t>(ix.col)];
-        if (ix.rt)          ix.rt->remove(cajaDe(key), rid);
+        if (ix.inv)         texto_sucio_ = true;
+        else if (ix.rt)     ix.rt->remove(cajaDe(key), rid);
         else if (ix.bt_int) ix.bt_int->remove(key.i, rid);
         else if (ix.hs_int) ix.hs_int->remove(key.i, rid);
         else if (ix.bt_str) ix.bt_str->remove(Key32(key.s), rid);
@@ -630,11 +643,99 @@ void Table::recrearIndiceVacio() {
 void Table::buildIndex() {
     if (indices_.empty()) return;
     recrearIndiceVacio();
-    // Una sola pasada por el heap repuebla TODOS los indices a la vez.
+    // Una sola pasada por el heap repuebla TODOS los indices de clave a la vez.
     for (const RID& rid : engine_->scanAll()) {
         Tuple t;
         if (getByRID(rid, t)) insertIntoIndex(t, rid);
     }
+    // Los invertidos van aparte: su construccion es masiva y externa, no una
+    // sucesion de inserciones.
+    reconstruirTexto();
+}
+
+// ---------------------------------------------------------------------------
+//  Reconstruccion de los indices invertidos de la tabla.
+//
+//  Se le pasa a SPIMI un generador que va sacando documentos del heap de uno
+//  en uno. Asi el corpus entero no pasa nunca por memoria: lo unico que crece
+//  con N es la tabla de documentos, que son doce bytes por fila.
+// ---------------------------------------------------------------------------
+void Table::reconstruirTexto(std::size_t presupuesto_bytes) {
+    bool habia = false;
+    for (Indice& ix : indices_) {
+        if (!ix.inv) continue;
+        habia = true;
+        const std::size_t col = static_cast<std::size_t>(ix.col);
+        const std::vector<RID> rids = engine_->scanAll();
+        std::size_t i = 0;
+        const std::string prefijo = joinPath(data_dir_, "spimi_" + info_.name + "_" + ix.columna);
+        ix.inv->construir(
+            [&](RID& rid, std::string& documento) {
+                Tuple t;
+                while (i < rids.size()) {
+                    const RID r = rids[i++];
+                    if (!getByRID(r, t)) continue;
+                    rid = r;
+                    documento = t.values[col].s;
+                    return true;
+                }
+                return false;
+            },
+            ix.idioma, prefijo,
+            presupuesto_bytes > 0 ? presupuesto_bytes : std::size_t(8u * 1024u * 1024u));
+    }
+    if (habia) texto_sucio_ = false;
+}
+
+const InvertedIndex* Table::indiceTexto(const std::string& col) const {
+    const Indice* ix = indicePara(col);
+    return (ix && ix->inv) ? ix->inv.get() : nullptr;
+}
+
+std::vector<Tuple> Table::searchMatch(const std::string& col, const std::string& consulta,
+                                      int k, bool tfidf, std::vector<double>* puntajes) {
+    auto t0 = Clock::now();
+    const long long r0 = lecturasTotales();
+
+    Indice* ix = indicePara(col);
+    if (!ix || !ix->inv)
+        throw DBException("No hay un indice INVERTED sobre la columna '" + col + "'");
+    if (texto_sucio_) reconstruirTexto();
+
+    const auto res = ix->inv->buscar(consulta, k,
+                                     tfidf ? InvertedIndex::Ranking::TFIDF
+                                           : InvertedIndex::Ranking::BM25);
+    std::vector<Tuple> out;
+    out.reserve(res.size());
+    if (puntajes) { puntajes->clear(); puntajes->reserve(res.size()); }
+    for (const InvertedIndex::Resultado& x : res) {
+        Tuple t;
+        if (!getByRID(x.rid, t)) continue;
+        out.push_back(std::move(t));
+        if (puntajes) puntajes->push_back(x.score);
+    }
+
+    last_plan_.metodo         = std::string("INDEX INVERTED (") + (tfidf ? "TF-IDF" : "BM25") + ")";
+    last_plan_.columna        = col;
+    last_plan_.paginas_leidas = lecturasTotales() - r0;
+    last_plan_.registros      = static_cast<long long>(out.size());
+    last_plan_.descartados    = 0;
+    last_plan_.ms             = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    return out;
+}
+
+std::vector<RID> Table::searchRIDsMatch(const std::string& col, const std::string& consulta,
+                                        int k, bool tfidf) {
+    Indice* ix = indicePara(col);
+    if (!ix || !ix->inv)
+        throw DBException("No hay un indice INVERTED sobre la columna '" + col + "'");
+    if (texto_sucio_) reconstruirTexto();
+    std::vector<RID> out;
+    for (const InvertedIndex::Resultado& x :
+         ix->inv->buscar(consulta, k, tfidf ? InvertedIndex::Ranking::TFIDF
+                                            : InvertedIndex::Ranking::BM25))
+        out.push_back(x.rid);
+    return out;
 }
 
 bool Table::reorganize(double fill_factor) {

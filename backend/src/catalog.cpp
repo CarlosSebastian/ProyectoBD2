@@ -10,6 +10,7 @@ std::string indexKindName(IndexKind k) {
         case IndexKind::BPLUS: return "BPLUS";
         case IndexKind::HASH:  return "HASH";
         case IndexKind::RTREE: return "RTREE";
+        case IndexKind::INVERTED: return "INVERTED";
     }
     return "BPLUS";
 }
@@ -18,6 +19,7 @@ IndexKind indexKindFromName(const std::string& s) {
     if (s == "BPLUS") return IndexKind::BPLUS;
     if (s == "HASH")  return IndexKind::HASH;
     if (s == "RTREE") return IndexKind::RTREE;
+    if (s == "INVERTED" || s == "INVERT" || s == "FULLTEXT") return IndexKind::INVERTED;
     throw DBException("Tipo de indice desconocido: " + s);
 }
 
@@ -64,6 +66,8 @@ void Catalog::load() {
             std::string kind;
             ss >> ix.column >> kind >> ix.file;
             ix.kind = indexKindFromName(kind);
+            std::string idi;
+            if (ss >> idi) ix.idioma = idi;      // ausente en catalogos viejos
             cur.indexes.push_back(ix);
         } else if (tag == "END" && open) {
             cur.schema = Schema(cols);
@@ -83,8 +87,11 @@ void Catalog::save() const {
             << (t.key_column.empty() ? "-" : t.key_column) << "\n";
         for (const auto& c : t.schema.columns())
             out << "COL " << c.name << " " << typeName(c.type) << " " << c.max_len << "\n";
-        for (const auto& ix : t.indexes)
-            out << "INDEX " << ix.column << " " << indexKindName(ix.kind) << " " << ix.file << "\n";
+        for (const auto& ix : t.indexes) {
+            out << "INDEX " << ix.column << " " << indexKindName(ix.kind) << " " << ix.file;
+            if (ix.kind == IndexKind::INVERTED) out << " " << ix.idioma;
+            out << "\n";
+        }
         out << "END\n";
     }
 }

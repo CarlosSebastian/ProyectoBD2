@@ -4,7 +4,9 @@
 //  Se persiste en un archivo de texto plano (data/catalog.txt) con formato:
 //     TABLE <nombre> <archivo_datos> <motor> <clave_primaria>
 //     COL   <nombre> <TIPO> <max_len>
-//     INDEX <columna> <BPLUS|HASH|RTREE> <archivo>
+//     INDEX <columna> <BPLUS|HASH|RTREE|INVERTED> <archivo> [<idioma>]
+//  El idioma solo lo lleva el indice invertido y es opcional, de modo que un
+//  catalogo escrito antes del modulo de texto se sigue leyendo igual.
 //     END
 //  Texto plano a proposito: el catalogo se lee una vez al arrancar y hay que
 //  poder inspeccionarlo y depurarlo a mano durante el desarrollo.
@@ -19,7 +21,7 @@
 
 namespace db {
 
-enum class IndexKind { BPLUS, HASH, RTREE };
+enum class IndexKind { BPLUS, HASH, RTREE, INVERTED };
 
 std::string indexKindName(IndexKind k);
 IndexKind   indexKindFromName(const std::string& s);
@@ -28,6 +30,9 @@ struct IndexInfo {
     std::string column;
     IndexKind   kind = IndexKind::BPLUS;
     std::string file;
+    // Solo INVERTED: "EN" o "ES". Decide stopwords y stemmer, y tiene que ser
+    // el mismo al indexar y al consultar.
+    std::string idioma = "EN";
 };
 
 struct TableInfo {

@@ -125,6 +125,7 @@ private:
         if (k == "INSERT") return parseInsert();
         if (k == "SELECT") return parseSelect();
         if (k == "DELETE") return parseDelete();
+        if (k == "COPY")   return parseCopy();
         throw DBException("Sentencia no soportada: '" + k +
                           "'. Se admiten CREATE TABLE, CREATE INDEX, INSERT, SELECT y DELETE.");
     }
@@ -229,7 +230,11 @@ private:
         if (t == "FLOAT" || t == "DOUBLE" || t == "REAL")  return Type::DOUBLE;
         if (t == "CHAR" || t == "VARCHAR" || t == "TEXT") {
             if (esSimbolo("(")) { avanza(); *len = esperaEntero(); esperaSimbolo(")"); }
-            if (*len <= 0) *len = 64;
+            // TEXT sin longitud es texto libre: no se trunca. Es el tipo de las
+            // columnas que indexa el indice invertido, donde un abstract de mil
+            // caracteres no puede quedar cortado a 64. CHAR/VARCHAR sin tamano
+            // siguen valiendo 64, como hasta ahora.
+            if (*len <= 0) *len = (t == "TEXT") ? 0 : 64;
             return Type::VARCHAR;
         }
         if (t == "POINT" || t == "GEOPOINT") return Type::POINT;
@@ -264,6 +269,32 @@ private:
         return st;
     }
 
+    // COPY t FROM 'archivo.csv' [HEADER] [DELIMITER '<c>'];
+    Statement parseCopy() {
+        Statement st;
+        st.kind  = StmtKind::COPY;
+        st.table = esperaNombre();
+        esperaPalabra("FROM");
+        if (cur().tipo != Tok::STRING)
+            throw DBException("COPY espera la ruta entre comillas: COPY t FROM 'datos.csv';");
+        st.copy_file = cur().texto;
+        avanza();
+        while (true) {
+            if (esPalabra("HEADER")) { avanza(); st.copy_header = true; continue; }
+            if (esPalabra("DELIMITER")) {
+                avanza();
+                if (cur().tipo != Tok::STRING || cur().texto.size() != 1)
+                    throw DBException("DELIMITER espera un solo caracter entre comillas");
+                st.copy_delim = cur().texto[0];
+                avanza();
+                continue;
+            }
+            break;
+        }
+        finSentencia();
+        return st;
+    }
+
     Statement parseCreateIndex() {
         Statement st;
         st.kind       = StmtKind::CREATE_INDEX;
@@ -279,8 +310,22 @@ private:
             if (k == "BTREE" || k == "BPLUS" || k == "BTREE+") st.index_kind = IndexKind::BPLUS;
             else if (k == "HASH")                              st.index_kind = IndexKind::HASH;
             else if (k == "RTREE" || k == "RTREE2D" || k == "GIST") st.index_kind = IndexKind::RTREE;
+            else if (k == "INVERTED" || k == "FULLTEXT" || k == "SPIMI")
+                st.index_kind = IndexKind::INVERTED;
             else throw DBException("Tipo de indice no soportado: '" + k +
-                                   "'. Use BTREE, HASH o RTREE.");
+                                   "'. Use BTREE, HASH, RTREE o INVERTED.");
+        }
+        // El idioma del analisis lexico. Solo tiene sentido en INVERTED.
+        if (esPalabra("LANGUAGE") || esPalabra("IDIOMA")) {
+            avanza();
+            if (cur().tipo == Tok::STRING || cur().tipo == Tok::IDENT) {
+                st.index_idioma = cur().texto;
+                avanza();
+            } else {
+                throw DBException("Se esperaba el idioma tras LANGUAGE: 'EN' o 'ES'");
+            }
+            if (st.index_kind != IndexKind::INVERTED)
+                throw DBException("LANGUAGE solo aplica a un indice INVERTED");
         }
         finSentencia();
         return st;
@@ -422,6 +467,27 @@ Statement parseInsert() {
             pr.lo   = esperaLiteral();
             esperaPalabra("AND");          // este AND pertenece al BETWEEN
             pr.hi = esperaLiteral();
+            return pr;
+        }
+
+        // Relevancia textual: col MATCH 'palabras' [USING BM25|TFIDF]
+        if (esPalabra("MATCH")) {
+            avanza();
+            if (cur().tipo != Tok::STRING)
+                throw DBException("MATCH espera la consulta entre comillas: " +
+                                  pr.column + " MATCH 'palabras'");
+            pr.consulta = cur().texto;
+            avanza();
+            if (esPalabra("USING")) {
+                avanza();
+                const std::string modelo = esperaIdent();
+                if (modelo == "TFIDF" || modelo == "TF_IDF" || modelo == "COSENO" ||
+                    modelo == "COSINE")                      pr.usar_tfidf = true;
+                else if (modelo == "BM25" || modelo == "OKAPI") pr.usar_tfidf = false;
+                else throw DBException("Modelo de ranking no soportado: '" + modelo +
+                                       "'. Use BM25 o TFIDF.");
+            }
+            pr.kind = PredKind::MATCH;
             return pr;
         }
 

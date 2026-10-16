@@ -86,6 +86,7 @@ private:
     QueryResult ejecutarInsert(const Statement& st);
     QueryResult ejecutarSelect(const Statement& st);
     QueryResult ejecutarDelete(const Statement& st);
+    QueryResult ejecutarCopy(const Statement& st);
 
     std::string data_dir_;
     int         pool_size_;
