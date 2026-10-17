@@ -11,6 +11,7 @@ std::string typeName(Type t) {
         case Type::VARCHAR: return "VARCHAR";
         case Type::POINT:   return "POINT";
         case Type::POLYGON: return "POLYGON";
+        case Type::VECTOR:  return "VECTOR";
     }
     return "INT";
 }
@@ -21,6 +22,7 @@ Type typeFromName(const std::string& s) {
     if (s == "VARCHAR") return Type::VARCHAR;
     if (s == "POINT")   return Type::POINT;
     if (s == "POLYGON") return Type::POLYGON;
+    if (s == "VECTOR")  return Type::VECTOR;
     throw DBException("Tipo desconocido: " + s);
 }
 
@@ -57,6 +59,22 @@ std::string Value::str() const {
             os << ")";
             return os.str();
         }
+        case Type::VECTOR: {
+            // Un embedding de 384 componentes impreso entero no le dice nada a
+            // nadie y rompe cualquier tabla. Se muestran las tres primeras y la
+            // dimension, que es lo unico que se mira a ojo.
+            std::ostringstream os;
+            os.precision(4);
+            os << std::fixed << "[";
+            std::size_t cuantas = vec.size() < 3 ? vec.size() : 3;
+            for (std::size_t k = 0; k < cuantas; ++k) {
+                if (k) os << ", ";
+                os << vec[k];
+            }
+            if (vec.size() > cuantas) os << ", ...";
+            os << "] (" << vec.size() << " dim)";
+            return os.str();
+        }
     }
     return "";
 }
@@ -69,6 +87,7 @@ bool Value::operator==(const Value& o) const {
         case Type::VARCHAR: return s == o.s;
         case Type::POINT:   return d == o.d && y == o.y;
         case Type::POLYGON: return poly == o.poly;
+        case Type::VECTOR:  return vec == o.vec;
     }
     return false;
 }
@@ -83,6 +102,10 @@ bool Value::operator<(const Value& o) const {
         // nunca lo usa, ordena por solapamiento de cajas.
         case Type::POINT:   return d != o.d ? d < o.d : y < o.y;
         case Type::POLYGON: return poly < o.poly;
+        // Tampoco hay orden natural entre embeddings: se compara componente a
+        // componente solo para que Value sea ordenable. Las consultas de
+        // similitud no pasan por aqui, pasan por la distancia del IVF.
+        case Type::VECTOR:  return vec < o.vec;
     }
     return false;
 }
@@ -128,6 +151,17 @@ std::string serializeTuple(const Schema& sch, const Tuple& t) {
                 out.append(reinterpret_cast<const char*>(&nv), sizeof(nv));
                 for (double coord : v.poly)
                     out.append(reinterpret_cast<const char*>(&coord), sizeof(coord));
+                break;
+            }
+            case Type::VECTOR: {
+                if (c.max_len > 0 && static_cast<int>(v.vec.size()) != c.max_len)
+                    throw DBException("el vector tiene " + std::to_string(v.vec.size()) +
+                                      " dimensiones y la columna '" + c.name +
+                                      "' esta declarada VECTOR(" + std::to_string(c.max_len) + ")");
+                std::int32_t nd = static_cast<std::int32_t>(v.vec.size());
+                out.append(reinterpret_cast<const char*>(&nd), sizeof(nd));
+                for (float comp : v.vec)
+                    out.append(reinterpret_cast<const char*>(&comp), sizeof(comp));
                 break;
             }
             case Type::VARCHAR: {
@@ -185,6 +219,20 @@ Value extractColumn(const Schema& sch, int col, const char* data, int len) {
                 p += nv * 16;
                 break;
             }
+            case Type::VECTOR: {
+                if (p + 4 > len) throw DBException("extractColumn: registro corrupto");
+                std::int32_t nd = readAt<std::int32_t>(data, p);
+                p += 4;
+                if (nd < 0 || p + nd * 4 > len) throw DBException("extractColumn: registro corrupto");
+                if (k == col) {
+                    std::vector<float> vs(static_cast<std::size_t>(nd));
+                    for (std::size_t q = 0; q < vs.size(); ++q)
+                        vs[q] = readAt<float>(data, p + static_cast<int>(q) * 4);
+                    return Value::makeVector(std::move(vs));
+                }
+                p += nd * 4;
+                break;
+            }
             case Type::VARCHAR: {
                 if (p + 4 > len) throw DBException("extractColumn: registro corrupto");
                 std::int32_t n = readAt<std::int32_t>(data, p);
@@ -234,6 +282,18 @@ Tuple deserializeTuple(const Schema& sch, const char* data, int len) {
                     vs[q] = readAt<double>(data, p + static_cast<int>(q) * 8);
                 t.values.push_back(Value::makePolygon(std::move(vs)));
                 p += nv * 16;
+                break;
+            }
+            case Type::VECTOR: {
+                if (p + 4 > len) throw DBException("deserializeTuple: registro corrupto");
+                std::int32_t nd = readAt<std::int32_t>(data, p);
+                p += 4;
+                if (nd < 0 || p + nd * 4 > len) throw DBException("deserializeTuple: registro corrupto");
+                std::vector<float> vs(static_cast<std::size_t>(nd));
+                for (std::size_t q = 0; q < vs.size(); ++q)
+                    vs[q] = readAt<float>(data, p + static_cast<int>(q) * 4);
+                t.values.push_back(Value::makeVector(std::move(vs)));
+                p += nd * 4;
                 break;
             }
             case Type::VARCHAR: {

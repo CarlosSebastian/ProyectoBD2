@@ -4,11 +4,13 @@
 //  Gramatica soportada (la que exige el enunciado):
 //
 //    CREATE TABLE t ( col TIPO [PRIMARY KEY], ... ) [USING HEAP|SEQUENTIAL];
-//    CREATE INDEX nombre ON t ( col ) [USING BTREE|HASH|RTREE|INVERTED]
-//                                     [LANGUAGE 'EN'|'ES'];
+//    CREATE INDEX nombre ON t ( col ) [USING BTREE|HASH|RTREE|INVERTED|IVF]
+//                                     [LANGUAGE 'EN'|'ES']
+//                                     [LISTS n] [METRIC COSINE|L2];
 //    INSERT INTO t VALUES ( v1, v2, ... ) [, ( ... ) ...];
 //    SELECT * | c1,c2 FROM t [WHERE <cond>]
-//           [ORDER BY col <-> POINT(x,y)] [LIMIT n];
+//           [ORDER BY col <-> POINT(x,y) | col <=> [v1,...,vd]]
+//           [LIMIT n] [PROBES n];
 //    DELETE FROM t WHERE <cond>;
 //    COPY t FROM 'ruta.csv' [HEADER];   -- carga masiva desde un CSV
 //
@@ -18,6 +20,7 @@
 //             | col > a                   (rango abierto por un extremo)
 //             | col WITHIN (minx, miny, maxx, maxy)   -- ventana espacial
 //             | col MATCH 'palabras' [USING BM25|TFIDF]  -- relevancia textual
+//             | col <=> [v1,...,vd] <= d  -- similitud vectorial por umbral
 //             | <cond> AND <cond>         sobre columnas DISTINTAS
 //
 //  Varias condiciones unidas por AND: las que caen sobre la misma columna se
@@ -26,7 +29,10 @@
 //  filtro sobre las filas recuperadas.
 //
 //  Tipos: INT | FLOAT | DOUBLE | CHAR(n) | VARCHAR(n) | POINT | POLYGON
-//         FLOAT se mapea a DOUBLE y CHAR(n) a VARCHAR(n).
+//         | VECTOR(d) | EMBEDDING(d)
+//         FLOAT se mapea a DOUBLE y CHAR(n) a VARCHAR(n). EMBEDDING(d) es un
+//         sinonimo de VECTOR(d); la dimension es OBLIGATORIA, porque un
+//         embedding sin dimension declarada no se puede indexar.
 //
 //  Espacial (Entregable 2):
 //    Un literal POINT se escribe POINT(x, y).
@@ -43,6 +49,23 @@
 //    solo. ST_CONTAINS(col, POINT(x,y)) devuelve los poligonos que contienen
 //    al punto; el R-Tree filtra por caja envolvente y despues se refina con la
 //    geometria real.
+//
+//  Vectorial (Entregable 2):
+//    Un literal vector se escribe entre corchetes: [0.1, -0.5, 2e-3]. Se
+//    aceptan exponentes porque un embedding normalizado suele venir impreso en
+//    notacion cientifica.
+//    Los operadores son DISTANCIAS (no similitudes), para que "mas parecido"
+//    sea siempre "menor valor" y el mismo ORDER BY ... LIMIT k sirva igual que
+//    en el modulo espacial:
+//       <=>  distancia coseno
+//       <->  distancia euclidiana (L2); con un POINT a la derecha es la
+//            consulta espacial de la parte 2, con un vector es la vectorial
+//    La metrica que pide el operador tiene que coincidir con la del indice: no
+//    se puede consultar en coseno un IVF entrenado en L2.
+//       ORDER BY emb <=> [..] LIMIT 5 PROBES 16      -- k vecinos aproximados
+//       WHERE emb <=> [..] <= 0.35                   -- busqueda por umbral
+//    PROBES n es el numero de celdas del IVF que se visitan: es el dial entre
+//    recall y latencia. Sin PROBES se usa round(sqrt(nlist)).
 // ============================================================================
 #pragma once
 
@@ -67,7 +90,7 @@ struct ColumnDef {
     bool        primary_key = false;
 };
 
-enum class PredKind { NONE, EQ, RANGE, WITHIN, RADIO, CONTIENE, MATCH };
+enum class PredKind { NONE, EQ, RANGE, WITHIN, RADIO, CONTIENE, MATCH, VECDIST };
 
 struct Predicate {
     PredKind    kind = PredKind::NONE;
@@ -94,6 +117,14 @@ struct Predicate {
     // tokenizador o los terminos no coinciden.
     std::string consulta;
     bool        usar_tfidf = false;          // false => BM25 (el de por defecto)
+
+    // VECDIST: col <=> [..] <= umbral. El vector se guarda tal como se escribio
+    // y la validacion de la dimension se hace al ejecutar, donde ya se conoce el
+    // esquema de la tabla.
+    std::vector<float> vector_consulta;
+    double      umbral = 0.0;
+    bool        vec_coseno = true;           // lo fija la metrica del indice
+    bool        vec_estricto = false;        // true => '<' en vez de '<='
 };
 
 struct Statement {
@@ -109,6 +140,10 @@ struct Statement {
     std::string index_column;
     IndexKind   index_kind = IndexKind::BPLUS;
     std::string index_idioma = "EN";          // solo INVERTED
+    // Solo IVF. listas = 0 significa "elige tu": el motor usa sqrt(n), que es
+    // la regla de dedo habitual para IVF-Flat.
+    int         index_listas = 0;
+    std::string index_metrica = "COSINE";
 
     // INSERT
     std::vector<std::vector<Value>> rows; 
@@ -136,6 +171,15 @@ struct Statement {
     // true si se ordeno por ST_DISTANCE (metros sobre la esfera) en vez de por
     // <-> (euclidiana en grados).
     bool        knn_geo = false;
+
+    // ORDER BY col <=> [..]:  k vecinos mas cercanos en el espacio vectorial.
+    // Es un camino aparte del knn espacial porque el indice, la distancia y el
+    // tipo de la columna son otros.
+    bool        knn_vectorial = false;
+    std::vector<float> knn_vector;
+    bool        knn_coseno = true;            // lo fija la metrica del indice
+    // PROBES n. -1 => usar el valor por defecto del indice.
+    int         probes = -1;
 };
 
 // Lanza DBException con un mensaje legible si la sentencia no es valida.

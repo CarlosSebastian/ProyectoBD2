@@ -59,6 +59,20 @@ std::vector<Token> tokenize(const std::string& sql) {
                 if (sql[j] == '.') dec = true;
                 ++j;
             }
+            // Notacion cientifica: 2e-3, 1.5E+10. Sin esto el lexer partiria
+            // '2e-3' en NUMBER(2), IDENT(e) y NUMBER(-3), y los embeddings se
+            // imprimen asi muy a menudo. Solo se acepta si tras la e viene un
+            // digito, con o sin signo; en cualquier otro caso la 'e' sigue
+            // siendo el comienzo de un identificador.
+            if (j < sql.size() && (sql[j] == 'e' || sql[j] == 'E')) {
+                std::size_t k = j + 1;
+                if (k < sql.size() && (sql[k] == '+' || sql[k] == '-')) ++k;
+                if (k < sql.size() && std::isdigit(static_cast<unsigned char>(sql[k]))) {
+                    while (k < sql.size() && std::isdigit(static_cast<unsigned char>(sql[k]))) ++k;
+                    j = k;
+                    dec = true;
+                }
+            }
             Token t; t.tipo = Tok::NUMBER; t.texto = sql.substr(i, j - i); t.decimal = dec;
             ts.push_back(t);
             i = j;
@@ -77,8 +91,12 @@ std::vector<Token> tokenize(const std::string& sql) {
         }
         // simbolos, incluyendo los de dos y tres caracteres
         std::string sym(1, c);
-        // '<->' (distancia) se prueba ANTES que '<=', porque comparten prefijo.
-        if (c == '<' && i + 2 < sql.size() && sql[i + 1] == '-' && sql[i + 2] == '>') {
+        // Los tres comparten el prefijo '<', asi que el orden de las pruebas
+        // importa: primero '<=>' (el mas largo), luego '<->', y solo al final
+        // '<='. Al reves, '<=>' se leeria como '<=' seguido de '>'.
+        if (c == '<' && i + 2 < sql.size() && sql[i + 1] == '=' && sql[i + 2] == '>') {
+            sym = "<=>"; i += 2;
+        } else if (c == '<' && i + 2 < sql.size() && sql[i + 1] == '-' && sql[i + 2] == '>') {
             sym = "<->"; i += 2;
         } else if ((c == '>' || c == '<' || c == '!') && i + 1 < sql.size() && sql[i + 1] == '=') {
             sym += '='; ++i;
@@ -195,6 +213,25 @@ private:
         return Value::makePolygon(std::move(vs));
     }
 
+    // Literal vector: [v1, v2, ..., vd]. Se admiten enteros, decimales y
+    // notacion cientifica; todo se guarda en float32, que es como lo almacena
+    // el registro.
+    std::vector<float> esperaVector() {
+        esperaSimbolo("[");
+        std::vector<float> vs;
+        if (esSimbolo("]")) {
+            avanza();
+            throw DBException("Un literal vector no puede estar vacio: [] no tiene dimension");
+        }
+        while (true) {
+            vs.push_back(static_cast<float>(esperaDouble()));
+            if (esSimbolo(",")) { avanza(); continue; }
+            break;
+        }
+        esperaSimbolo("]");
+        return vs;
+    }
+
     // POINT(x, y). Es el unico literal compuesto del lenguaje.
     Value esperaPunto() {
         esperaPalabra("POINT");
@@ -209,6 +246,7 @@ private:
     Value esperaLiteral() {
         if (esPalabra("POINT"))   return esperaPunto();
         if (esPalabra("POLYGON")) return esperaPoligono();
+        if (esSimbolo("["))       return Value::makeVector(esperaVector());
         if (cur().tipo == Tok::NUMBER) {
             Value v = cur().decimal ? Value::makeDouble(std::atof(cur().texto.c_str()))
                                     : Value::makeInt(std::atoll(cur().texto.c_str()));
@@ -239,8 +277,24 @@ private:
         }
         if (t == "POINT" || t == "GEOPOINT") return Type::POINT;
         if (t == "POLYGON" || t == "GEOMETRY") return Type::POLYGON;
+        if (t == "VECTOR" || t == "EMBEDDING") {
+            // Aqui la dimension NO es opcional, al contrario que en VARCHAR(n).
+            // El IVF necesita saber cuantas componentes tiene cada vector para
+            // dimensionar centroides y entradas antes de ver un solo dato, y una
+            // tabla con vectores de dimensiones mezcladas no se puede indexar.
+            if (!esSimbolo("("))
+                throw DBException("VECTOR necesita la dimension: " + t +
+                                  "(384). Sin dimension declarada no se puede crear el indice.");
+            avanza();
+            *len = esperaEntero();
+            esperaSimbolo(")");
+            if (*len <= 0)
+                throw DBException("La dimension de un VECTOR tiene que ser positiva; se leyo " +
+                                  std::to_string(*len));
+            return Type::VECTOR;
+        }
         throw DBException("Tipo no soportado: '" + t +
-                          "'. Use INT, FLOAT/DOUBLE, CHAR(n)/VARCHAR(n), POINT o POLYGON.");
+                          "'. Use INT, FLOAT/DOUBLE, CHAR(n)/VARCHAR(n), POINT, POLYGON o VECTOR(d).");
     }
 
     Statement parseCreateTable() {
@@ -312,8 +366,10 @@ private:
             else if (k == "RTREE" || k == "RTREE2D" || k == "GIST") st.index_kind = IndexKind::RTREE;
             else if (k == "INVERTED" || k == "FULLTEXT" || k == "SPIMI")
                 st.index_kind = IndexKind::INVERTED;
+            else if (k == "IVF" || k == "IVFFLAT" || k == "VECTOR")
+                st.index_kind = IndexKind::IVF;
             else throw DBException("Tipo de indice no soportado: '" + k +
-                                   "'. Use BTREE, HASH, RTREE o INVERTED.");
+                                   "'. Use BTREE, HASH, RTREE, INVERTED o IVF.");
         }
         // El idioma del analisis lexico. Solo tiene sentido en INVERTED.
         if (esPalabra("LANGUAGE") || esPalabra("IDIOMA")) {
@@ -326,6 +382,32 @@ private:
             }
             if (st.index_kind != IndexKind::INVERTED)
                 throw DBException("LANGUAGE solo aplica a un indice INVERTED");
+        }
+        // Parametros del IVF. LISTS es el numero de celdas de k-means y METRIC
+        // la distancia con la que se entrena y se consulta: tienen que ser la
+        // misma, por eso se fijan al crear el indice y no en cada consulta.
+        while (esPalabra("LISTS") || esPalabra("LISTAS") || esPalabra("METRIC") ||
+               esPalabra("METRICA")) {
+            const bool es_listas = esPalabra("LISTS") || esPalabra("LISTAS");
+            avanza();
+            if (es_listas) {
+                st.index_listas = esperaEntero();
+                if (st.index_listas <= 0)
+                    throw DBException("LISTS tiene que ser positivo; se leyo " +
+                                      std::to_string(st.index_listas));
+            } else {
+                std::string m;
+                if (cur().tipo == Tok::STRING) { m = upper(cur().texto); avanza(); }
+                else                           { m = esperaIdent(); }
+                if (m == "COSINE" || m == "COSENO")      st.index_metrica = "COSINE";
+                else if (m == "L2" || m == "EUCLIDEAN" || m == "EUCLIDIANA")
+                    st.index_metrica = "L2";
+                else throw DBException("Metrica no soportada: '" + m +
+                                       "'. Use COSINE o L2.");
+            }
+            if (st.index_kind != IndexKind::IVF)
+                throw DBException(std::string(es_listas ? "LISTS" : "METRIC") +
+                                  " solo aplica a un indice IVF");
         }
         finSentencia();
         return st;
@@ -383,19 +465,49 @@ Statement parseInsert() {
                 st.knn_geo = true;
             } else {
                 st.knn_column = esperaNombre();
-                if (!esSimbolo("<->"))
+                // El OPERADOR elige la distancia: <=> es coseno y <-> es L2.
+                // No es decoracion: tiene que coincidir con la metrica con la
+                // que se entreno el indice, porque las dos no ordenan igual.
+                if (esSimbolo("<=>") || esSimbolo("<->")) {
+                    const bool cos = esSimbolo("<=>");
+                    avanza();
+                    if (esSimbolo("[")) {
+                        // Similitud vectorial. Camino aparte del espacial: otra
+                        // distancia, otro indice y otro tipo de columna.
+                        st.knn_vector    = esperaVector();
+                        st.knn_vectorial = true;
+                        st.knn_coseno    = cos;
+                    } else if (!cos) {
+                        Value p = esperaPunto();
+                        st.knn   = true;
+                        st.knn_x = p.d;
+                        st.knn_y = p.y;
+                    } else {
+                        throw DBException(
+                            "El operador <=> compara embeddings, no puntos: ORDER BY " +
+                            st.knn_column + " <=> [v1, ..., vd]. Para un POINT use <->. "
+                            "Se encontro '" + cur().texto + "'.");
+                    }
+                } else {
                     throw DBException(
                         "Solo se admite ordenar por distancia: ORDER BY " + st.knn_column +
-                        " <-> POINT(x, y), o bien ORDER BY ST_DISTANCE(" + st.knn_column +
+                        " <-> POINT(x, y), ORDER BY " + st.knn_column +
+                        " <=> [v1, ..., vd], o bien ORDER BY ST_DISTANCE(" + st.knn_column +
                         ", POINT(lon, lat)). Se encontro '" + cur().texto + "'.");
-                avanza();
-                Value p = esperaPunto();
-                st.knn   = true;
-                st.knn_x = p.d;
-                st.knn_y = p.y;
+                }
             }
         }
         if (esPalabra("LIMIT")) { avanza(); st.limit = esperaEntero(); }
+        // PROBES va DESPUES de LIMIT porque no es parte del orden ni del
+        // recorte: es cuantas celdas del IVF se visitan, o sea cuanto esfuerzo
+        // se gasta en acertar el top-k. Es el dial entre recall y latencia.
+        if (esPalabra("PROBES") || esPalabra("NPROBE")) {
+            avanza();
+            st.probes = esperaEntero();
+            if (st.probes <= 0)
+                throw DBException("PROBES tiene que ser positivo; se leyo " +
+                                  std::to_string(st.probes));
+        }
         finSentencia();
         return st;
     }
@@ -460,6 +572,25 @@ Statement parseInsert() {
         }
 
         pr.column = esperaNombre();
+
+        // Umbral de similitud: col <=> [..] <= d  (coseno), col <-> [..] <= d (L2)
+        if (esSimbolo("<=>") || esSimbolo("<->")) {
+            pr.vec_coseno = esSimbolo("<=>");
+            avanza();
+            pr.vector_consulta = esperaVector();
+            if (cur().tipo != Tok::SYMBOL || (cur().texto != "<" && cur().texto != "<="))
+                throw DBException(
+                    std::string("El operador ") + (pr.vec_coseno ? "<=>" : "<->") +
+                    " solo se compara con < o <= en el WHERE: " + pr.column + " " +
+                    (pr.vec_coseno ? "<=>" : "<->") + " [v1, ..., vd] <= 0.35. Se encontro '" +
+                    cur().texto + "'. Es una DISTANCIA, no una similitud: cuanto menor, "
+                    "mas parecido.");
+            pr.vec_estricto = (cur().texto == "<");
+            avanza();
+            pr.umbral = esperaDouble();
+            pr.kind   = PredKind::VECDIST;
+            return pr;
+        }
 
         if (esPalabra("BETWEEN")) {
             avanza();

@@ -97,5 +97,10 @@ g++ -std=c++17 -O2 -Ibackend/include -Ibenchmarks -DDB_PAGE_SIZE=$PAGE \
     benchmarks/exp6_texto.cpp $LIB -o "build/exp6_texto$EXE"
 "./build/exp6_texto$EXE" data 50000 20 >> "$SALIDA"
 
+echo "==> exp7 (modulo vectorial)"
+g++ -std=c++17 -O2 -Ibackend/include -Ibenchmarks -DDB_PAGE_SIZE=$PAGE \
+    benchmarks/exp7_vectorial.cpp $LIB -o "build/exp7_vectorial$EXE"
+"./build/exp7_vectorial$EXE" data 20000 50 >> "$SALIDA"
+
 echo ""
 echo "==> listo: $SALIDA"

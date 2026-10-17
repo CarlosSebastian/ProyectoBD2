@@ -3,6 +3,7 @@
 // ============================================================================
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <string>
 
 #include "db/database.hpp"
@@ -923,6 +924,221 @@ int main() {
 
         QueryResult c3 = db.execute("COPY d FROM 'no_existe_este_archivo.csv';");
         CHECK(!c3.ok, "un archivo inexistente da error claro");
+    }
+
+
+    // =======================================================================
+    //  Entregable 2, parte 4: modulo vectorial por SQL
+    // =======================================================================
+    SECTION("VECTOR: tipo, literal con corchetes y notacion cientifica");
+    {
+        const std::string DIR = "data/_tvec";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        QueryResult sin_dim = db.execute("CREATE TABLE malo (id INT PRIMARY KEY, e VECTOR);");
+        CHECK(!sin_dim.ok, "un VECTOR sin dimension se rechaza");
+        CHECK(sin_dim.error.find("dimension") != std::string::npos, "y dice por que");
+
+        db.execute("CREATE TABLE v (id INT PRIMARY KEY, e VECTOR(3));");
+        db.execute("INSERT INTO v VALUES (1,[1.0,0.0,0.0]),(2,[-0.5,2.5e-1,1e-3]);");
+        QueryResult r = db.execute("SELECT e FROM v WHERE id = 2;");
+        CHECK(r.ok, "el literal con exponente se parsea");
+        CHECK(r.rows[0][0].find("-0.5000") != std::string::npos, "la primera componente");
+        CHECK(r.rows[0][0].find("0.2500") != std::string::npos, "2.5e-1 es 0.25");
+
+        QueryResult malo = db.execute("INSERT INTO v VALUES (3,[1.0,2.0]);");
+        CHECK(!malo.ok, "un vector de dimension equivocada se rechaza");
+        CHECK(malo.error.find("dimensiones") != std::string::npos, "y lo explica");
+
+        // Un embedding largo se abrevia al mostrarlo: una tabla con 384
+        // numeros por celda no la lee nadie.
+        db.execute("CREATE TABLE g (id INT PRIMARY KEY, e VECTOR(12));");
+        db.execute("INSERT INTO g VALUES (1,[1,2,3,4,5,6,7,8,9,10,11,12]);");
+        const std::string pintado = db.execute("SELECT e FROM g;").rows[0][0];
+        CHECK(pintado.find("...") != std::string::npos, "se abrevia");
+        CHECK(pintado.find("12 dim") != std::string::npos, "pero dice cuantas dimensiones son");
+    }
+
+    SECTION("busqueda por similitud de extremo a extremo");
+    {
+        const std::string DIR = "data/_tivf";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE items (id INT PRIMARY KEY, nombre CHAR(20), emb VECTOR(4));");
+        db.execute("INSERT INTO items VALUES "
+                   "(1,'perro', [0.95,0.05,0.00,0.10]),"
+                   "(2,'gato',  [0.90,0.12,0.02,0.08]),"
+                   "(3,'lobo',  [0.88,0.03,0.05,0.14]),"
+                   "(4,'auto',  [0.04,0.93,0.10,0.02]),"
+                   "(5,'camion',[0.02,0.89,0.15,0.05]),"
+                   "(6,'arbol', [0.05,0.08,0.95,0.03]);");
+
+        QueryResult sin = db.execute("SELECT id FROM items ORDER BY emb <=> [1,0,0,0] LIMIT 2;");
+        CHECK(!sin.ok, "sin indice IVF la busqueda por similitud falla");
+        CHECK(sin.error.find("IVF") != std::string::npos, "y dice como crearlo");
+
+        QueryResult ci = db.execute("CREATE INDEX ix ON items (emb) USING IVF LISTS 3 METRIC COSINE;");
+        CHECK(ci.ok, "se crea el indice IVF");
+        CHECK(ci.message.find("COSENO") != std::string::npos, "el mensaje dice la metrica");
+        CHECK(ci.message.find("3 celdas") != std::string::npos, "y cuantas celdas");
+
+        QueryResult r = db.execute(
+            "SELECT id, nombre FROM items ORDER BY emb <=> [0.93,0.07,0.01,0.09] LIMIT 3 PROBES 3;");
+        CHECK(r.ok, "la consulta responde");
+        CHECK_EQ(r.columns.back(), std::string("distancia"), "el resultado trae la distancia");
+        CHECK_EQ(r.rows.size(), static_cast<std::size_t>(3), "tres vecinos");
+        for (std::size_t i = 1; i < r.rows.size(); ++i)
+            CHECK(std::stod(r.rows[i - 1].back()) <= std::stod(r.rows[i].back()),
+                  "ordenado de menor a mayor distancia");
+        // Los tres animales tienen que ganar a los vehiculos y al arbol.
+        std::set<std::string> salieron;
+        for (const auto& fila : r.rows) salieron.insert(fila[1]);
+        CHECK(salieron.count("perro") && salieron.count("gato") && salieron.count("lobo"),
+              "los tres mas parecidos son los animales");
+        CHECK(r.metodo.find("IVF") != std::string::npos, "el plan nombra el IVF");
+
+        // PROBES aparece en el plan: es la perilla entre recall y latencia.
+        bool dice_nprobe = false;
+        for (const PlanStep& ps : r.plan)
+            if (ps.detalle.find("nprobe=3") != std::string::npos) dice_nprobe = true;
+        CHECK(dice_nprobe, "el plan publica cuantas celdas se visitaron");
+
+        // Visitar TODAS las celdas tiene que coincidir con la respuesta exacta.
+        QueryResult todas = db.execute(
+            "SELECT id FROM items ORDER BY emb <=> [0.93,0.07,0.01,0.09] LIMIT 6 PROBES 3;");
+        CHECK_EQ(todas.rows.size(), static_cast<std::size_t>(6), "con todas las celdas salen los 6");
+    }
+
+    SECTION("la metrica del indice y la del operador tienen que coincidir");
+    {
+        const std::string DIR = "data/_tmet";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE v (id INT PRIMARY KEY, e VECTOR(3));");
+        db.execute("INSERT INTO v VALUES (1,[1,0,0]),(2,[10,0,0]),(3,[0,1,0]);");
+        db.execute("CREATE INDEX ix ON v (e) USING IVF LISTS 2 METRIC L2;");
+
+        QueryResult mal = db.execute("SELECT id FROM v ORDER BY e <=> [2,0,0] LIMIT 2;");
+        CHECK(!mal.ok, "pedir coseno a un indice L2 se rechaza");
+        CHECK(mal.error.find("L2") != std::string::npos, "y el mensaje dice las dos metricas");
+
+        QueryResult bien = db.execute("SELECT id FROM v ORDER BY e <-> [2,0,0] LIMIT 3 PROBES 2;");
+        CHECK(bien.ok, "con el operador correcto funciona");
+        CHECK_EQ(bien.rows[0][0], std::string("1"), "con L2 gana el de modulo parecido");
+        CHECK_EQ(bien.rows[2][0], std::string("2"), "y el de modulo 10 queda ultimo");
+
+        QueryResult op_malo = db.execute("SELECT id FROM v ORDER BY e <=> POINT(1,2) LIMIT 1;");
+        CHECK(!op_malo.ok, "el operador de embeddings no acepta un POINT");
+    }
+
+    SECTION("umbral de distancia: en el WHERE y combinado con otra condicion");
+    {
+        const std::string DIR = "data/_tumb";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE v (id INT PRIMARY KEY, grupo INT, e VECTOR(3));");
+        db.execute("INSERT INTO v VALUES (1,10,[1.0,0.0,0.0]),(2,10,[0.99,0.01,0.0]),"
+                   "(3,20,[0.98,0.02,0.0]),(4,20,[0.0,1.0,0.0]),(5,30,[0.0,0.0,1.0]);");
+
+        // Sin indice el umbral YA funciona: se evalua fila a fila y es exacto.
+        QueryResult sin = db.execute("SELECT id FROM v WHERE e <=> [1,0,0] <= 0.01;");
+        CHECK(sin.ok, "el umbral funciona sin indice");
+        CHECK_EQ(sin.rows.size(), static_cast<std::size_t>(3), "tres vectores cerca del eje X");
+        CHECK(sin.metodo.find("SEQ") != std::string::npos, "por escaneo");
+
+        db.execute("CREATE INDEX ix ON v (e) USING IVF LISTS 2 METRIC COSINE;");
+        QueryResult con = db.execute("SELECT id FROM v WHERE e <=> [1,0,0] <= 0.01 PROBES 2;");
+        CHECK(con.ok, "y tambien con indice");
+        CHECK_EQ(con.rows.size(), sin.rows.size(),
+                 "visitando todas las celdas, el indice da lo mismo que el escaneo");
+        CHECK_EQ(con.columns.back(), std::string("distancia"), "trae la distancia");
+
+        // Hibrido: el umbral conduce y el resto filtra.
+        QueryResult hib = db.execute(
+            "SELECT id FROM v WHERE e <=> [1,0,0] <= 0.01 AND grupo = 10 PROBES 2;");
+        CHECK(hib.ok, "la consulta hibrida responde");
+        CHECK_EQ(hib.rows.size(), static_cast<std::size_t>(2), "solo los del grupo 10");
+
+        // Y al reves: la igualdad indexada deberia conducir si es mas selectiva.
+        db.execute("CREATE INDEX ixg ON v (grupo) USING BTREE;");
+        QueryResult inv = db.execute(
+            "SELECT id FROM v WHERE grupo = 20 AND e <=> [1,0,0] <= 0.05;");
+        CHECK(inv.ok, "con indice en grupo tambien responde");
+        CHECK_EQ(inv.rows.size(), static_cast<std::size_t>(1), "solo el id 3");
+        CHECK_EQ(inv.rows[0][0], std::string("3"), "y es el correcto");
+    }
+
+    SECTION("el IVF se reconstruye solo tras un INSERT o un DELETE");
+    {
+        const std::string DIR = "data/_tivfsucio";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE v (id INT PRIMARY KEY, e VECTOR(3));");
+        db.execute("INSERT INTO v VALUES (1,[1,0,0]),(2,[0,1,0]);");
+        db.execute("CREATE INDEX ix ON v (e) USING IVF LISTS 2;");
+        CHECK_EQ(db.execute("SELECT id FROM v ORDER BY e <=> [1,0,0] LIMIT 1 PROBES 2;").rows[0][0],
+                 std::string("1"), "estado inicial");
+
+        db.execute("INSERT INTO v VALUES (3,[0.99,0.01,0.0]);");
+        QueryResult tras = db.execute("SELECT id FROM v ORDER BY e <=> [0.99,0.01,0] LIMIT 1 PROBES 2;");
+        CHECK(tras.ok, "tras insertar sigue respondiendo");
+        CHECK_EQ(tras.rows[0][0], std::string("3"), "y encuentra el vector nuevo");
+
+        db.execute("DELETE FROM v WHERE id = 3;");
+        QueryResult tras2 = db.execute("SELECT id FROM v ORDER BY e <=> [0.99,0.01,0] LIMIT 1 PROBES 2;");
+        CHECK_EQ(tras2.rows[0][0], std::string("1"), "y el borrado tambien se refleja");
+    }
+
+    SECTION("DELETE por distancia: exacto a proposito, no por el indice");
+    {
+        const std::string DIR = "data/_tvdel";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE v (id INT PRIMARY KEY, e VECTOR(3));");
+        db.execute("INSERT INTO v VALUES (1,[1,0,0]),(2,[0.99,0.01,0]),(3,[0,1,0]),(4,[0,0,1]);");
+        db.execute("CREATE INDEX ix ON v (e) USING IVF LISTS 2;");
+        QueryResult del = db.execute("DELETE FROM v WHERE e <=> [1,0,0] <= 0.01;");
+        CHECK(del.ok, "el DELETE por distancia funciona");
+        CHECK_EQ(del.row_count, static_cast<long long>(2), "borra los dos cercanos");
+        bool dice_exacto = false;
+        for (const PlanStep& ps : del.plan)
+            if (ps.detalle.find("irreversible") != std::string::npos) dice_exacto = true;
+        CHECK(dice_exacto, "y el plan explica por que no usa el indice");
+        CHECK_EQ(db.execute("SELECT id FROM v;").rows.size(), static_cast<std::size_t>(2),
+                 "quedan dos filas");
+    }
+
+    SECTION("lo que el motor rechaza en el modulo vectorial");
+    {
+        const std::string DIR = "data/_tvneg";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE v (id INT PRIMARY KEY, n INT, e VECTOR(3));");
+        db.execute("INSERT INTO v VALUES (1,5,[1,0,0]);");
+
+        CHECK(!db.execute("CREATE INDEX a ON v (n) USING IVF;").ok,
+              "un IVF sobre INT se rechaza");
+        CHECK(!db.execute("CREATE INDEX b ON v (e) USING BTREE;").ok,
+              "un B+ sobre VECTOR se rechaza");
+        CHECK(!db.execute("CREATE INDEX c ON v (e) USING RTREE;").ok,
+              "un R-Tree sobre VECTOR se rechaza");
+        CHECK(!db.execute("CREATE INDEX d ON v (e) USING IVF METRIC MANHATTAN;").ok,
+              "una metrica desconocida se rechaza");
+        CHECK(!db.execute("CREATE INDEX e2 ON v (e) USING IVF LISTS 0;").ok,
+              "LISTS 0 se rechaza");
+        CHECK(db.execute("SELECT id FROM v;").ok, "y la tabla sigue intacta tras todos los rechazos");
+
+        CHECK(db.execute("CREATE INDEX ok ON v (e) USING IVF;").ok,
+              "el indice valido si se crea");
+        CHECK(!db.execute("SELECT id FROM v ORDER BY e <=> [1,0] LIMIT 1;").ok,
+              "una consulta con dimension distinta se rechaza");
     }
 
     DONE("test_sql");

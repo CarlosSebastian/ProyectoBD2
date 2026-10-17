@@ -224,6 +224,7 @@ constexpr int RT_LEAF_MAX = (PAGE_SIZE - RT_HDR) / (RT_MBR + 8);
 constexpr int RT_INT_MAX  = (PAGE_SIZE - RT_HDR) / (RT_MBR + 4);
 constexpr std::int32_t RT_MAGIC = 0x52545245;          // "RTRE"
 constexpr std::int32_t IV_MAGIC = 0x494E5658;          // "INVX"
+constexpr std::int32_t VF_MAGIC = 0x49564658;          // "IVFX"
 constexpr int EH_HDR      = 12;                        // extendible_hash.hpp
 
 void dumpBPlus(const char* b, int numero, bool hex_completo) {
@@ -522,6 +523,114 @@ void dumpRTree(const char* b, int numero, bool hex_completo) {
     std::cout << "\n";
 }
 
+// ---------------------------------------------------------------------------
+//  Indice vectorial IVF. Como el invertido, no es un arbol: tres zonas
+//  seguidas (centroides, directorio, entradas) y la pagina 0 dice donde
+//  empieza cada una.
+// ---------------------------------------------------------------------------
+void dumpIVF(const char* b, int numero, bool hex_completo, const std::vector<char>& meta) {
+    linea('=');
+    std::cout << "  PAGINA " << numero << " del indice vectorial IVF   (offset "
+              << static_cast<long long>(numero) * PAGE_SIZE << ")\n";
+    linea('=');
+
+    const int dim    = readAt<std::int32_t>(meta.data(), 4);
+    const int nlist  = readAt<std::int32_t>(meta.data(), 8);
+    const int p_cent = readAt<std::int32_t>(meta.data(), 20);
+    const int p_dir  = readAt<std::int32_t>(meta.data(), 24);
+    const int p_ent  = readAt<std::int32_t>(meta.data(), 28);
+    const int p_fin  = readAt<std::int32_t>(meta.data(), 32);
+    const int bytes_entrada = 8 + 4 + dim * 4;      // RID + norma + componentes
+
+    if (numero == 0) {
+        std::cout << "\nPAGINA META\n";
+        std::cout << "  off  tam  campo                valor               bytes en disco\n";
+        linea();
+        campo("num_vectores",  0, 4, std::to_string(readAt<std::int32_t>(b, 0)), b);
+        campo("dimension",     4, 4, std::to_string(dim), b);
+        campo("nlist",         8, 4, std::to_string(nlist), b);
+        campo("metrica",      12, 4, readAt<std::int32_t>(b, 12) == 1 ? "1 (L2)" : "0 (COSENO)", b);
+        campo("MAGIC",        16, 4, "\"IVFX\"", b);
+        campo("pag_centroides",20,4, std::to_string(p_cent), b);
+        campo("pag_directorio",24,4, std::to_string(p_dir), b);
+        campo("pag_entradas", 28, 4, std::to_string(p_ent), b);
+        campo("pag_fin",      32, 4, std::to_string(p_fin), b);
+        campo("iteraciones",  36, 4, std::to_string(readAt<std::int32_t>(b, 36)), b);
+        campo("inercia",      40, 8, std::to_string(readAt<double>(b, 40)), b);
+        std::cout << "\n  Zonas: centroides [" << p_cent << ", " << p_dir
+                  << ")   directorio [" << p_dir << ", " << p_ent
+                  << ")   entradas [" << p_ent << ", " << p_fin << ")\n";
+        std::cout << "  Cada entrada ocupa " << bytes_entrada << " bytes (RID 8 + norma 4 + "
+                  << dim << " floats): " << (PAGE_SIZE / (bytes_entrada > 0 ? bytes_entrada : 1))
+                  << " por pagina.\n\n";
+        linea();
+        volcadoHex(b, 0, 48);
+        std::cout << "\n";
+        return;
+    }
+
+    if (numero >= p_cent && numero < p_dir) {
+        std::cout << "\nZONA DE CENTROIDES\n"
+                     "  " << nlist << " centroides de " << dim << " floats, planos y seguidos.\n"
+                     "  Son los unicos vectores contra los que se compara SIEMPRE: la consulta\n"
+                     "  mide su distancia a los " << nlist << " y solo baja a las celdas mas cercanas.\n\n";
+        const int cuantos = hex_completo ? PAGE_SIZE / 4 : 8;
+        std::cout << "  primeros floats de la pagina: ";
+        for (int i = 0; i < cuantos && i * 4 + 4 <= PAGE_SIZE; ++i)
+            std::cout << readAt<float>(b, i * 4) << (i + 1 < cuantos ? ", " : "");
+        std::cout << "\n\n";
+        volcadoHex(b, 0, hex_completo ? PAGE_SIZE : 128);
+        std::cout << "\n";
+        return;
+    }
+
+    if (numero >= p_dir && numero < p_ent) {
+        std::cout << "\nPAGINA DEL DIRECTORIO\n"
+                     "  Una entrada de 16 bytes por celda: donde empieza su lista dentro de la\n"
+                     "  zona de entradas y cuantos vectores tiene. El reparto es lo que decide\n"
+                     "  el costo de una consulta: una celda gigante es una lectura larga.\n\n";
+        std::cout << "   celda      offset_bytes     n_vectores   paginas que ocupa\n";
+        linea();
+        const int por_pagina = PAGE_SIZE / 16;
+        const int base = (numero - p_dir) * por_pagina;
+        for (int i = 0; i < por_pagina; ++i) {
+            const int celda = base + i;
+            if (celda >= nlist) break;
+            const std::uint64_t off = readAt<std::uint64_t>(b, i * 16);
+            const std::uint32_t n   = readAt<std::uint32_t>(b, i * 16 + 8);
+            const long long bytes = static_cast<long long>(n) * bytes_entrada;
+            std::cout << std::setw(8) << celda << std::setw(18) << off
+                      << std::setw(15) << n
+                      << std::setw(20) << (bytes + PAGE_SIZE - 1) / PAGE_SIZE << "\n";
+        }
+        std::cout << "\n";
+        volcadoHex(b, 0, hex_completo ? PAGE_SIZE : 128);
+        std::cout << "\n";
+        return;
+    }
+
+    if (numero >= p_ent && numero < p_fin) {
+        std::cout << "\nZONA DE ENTRADAS (IVF-Flat: los vectores viven DENTRO del indice)\n"
+                     "  Cada entrada: RID (page_id, slot) + norma float32 + " << dim << " floats.\n"
+                     "  Las entradas de una misma celda son contiguas, y una entrada puede\n"
+                     "  cruzar el borde de la pagina: por eso aqui no hay cabecera que separar.\n\n";
+        if (bytes_entrada > 0) {
+            const long long off_pagina =
+                static_cast<long long>(numero - p_ent) * PAGE_SIZE;
+            std::cout << "  esta pagina cubre los bytes [" << off_pagina << ", "
+                      << off_pagina + PAGE_SIZE << ") de la zona, o sea las entradas "
+                      << off_pagina / bytes_entrada << " en adelante\n\n";
+        }
+        volcadoHex(b, 0, hex_completo ? PAGE_SIZE : 256);
+        std::cout << "\n";
+        return;
+    }
+
+    std::cout << "\n  La pagina " << numero << " no cae en ninguna zona declarada en la META.\n\n";
+    volcadoHex(b, 0, hex_completo ? PAGE_SIZE : 128);
+    std::cout << "\n";
+}
+
 void uso() {
     std::cout <<
       "uso: dump_page <archivo> [pagina] [--hex]\n"
@@ -532,8 +641,10 @@ void uso() {
       "  --resumen    una linea por pagina del archivo\n"
       "  --bplus      forzar la lectura como indice B+\n"
       "  --hash       forzar la lectura como indice hash extensible\n"
-      "  --rtree      forzar la lectura como indice espacial R-Tree\n\n"
-      "  Los .idx se detectan solos; --bplus/--hash/--rtree solo hacen falta si\n"
+      "  --rtree      forzar la lectura como indice espacial R-Tree\n"
+      "  --invertido  forzar la lectura como indice invertido de texto\n"
+      "  --ivf        forzar la lectura como indice vectorial IVF\n\n"
+      "  Los .idx se detectan solos; las opciones de formato solo hacen falta si\n"
       "  el archivo tiene otro nombre.\n";
 }
 
@@ -544,7 +655,7 @@ int main(int argc, char** argv) {
 
     const std::string ruta = argv[1];
     bool quiere_resumen = false, hex_completo = false;
-    enum class Formato { SLOTTED, BPLUS, HASH, RTREE, INVERTIDO } formato = Formato::SLOTTED;
+    enum class Formato { SLOTTED, BPLUS, HASH, RTREE, INVERTIDO, IVF } formato = Formato::SLOTTED;
     long long numero = 0;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -554,6 +665,7 @@ int main(int argc, char** argv) {
         else if (a == "--hash")    formato        = Formato::HASH;
         else if (a == "--rtree")   formato        = Formato::RTREE;
         else if (a == "--invertido" || a == "--inverted") formato = Formato::INVERTIDO;
+        else if (a == "--ivf" || a == "--vectorial") formato = Formato::IVF;
         else if (a == "--help" || a == "-h") { uso(); return 0; }
         else                       numero = std::atoll(a.c_str());
     }
@@ -592,6 +704,8 @@ int main(int argc, char** argv) {
             formato = Formato::RTREE;
         } else if (readAt<std::int32_t>(p0.data(), 16) == IV_MAGIC) {
             formato = Formato::INVERTIDO;
+        } else if (readAt<std::int32_t>(p0.data(), 16) == VF_MAGIC) {
+            formato = Formato::IVF;
         } else {
             formato = Formato::BPLUS;
             if (paginas > 1) {
@@ -603,8 +717,9 @@ int main(int argc, char** argv) {
         std::cout << "  formato detectado: indice "
                   << (formato == Formato::RTREE ? "R-TREE ESPACIAL"
                       : formato == Formato::INVERTIDO ? "INVERTIDO (texto)"
+                      : formato == Formato::IVF ? "IVF (vectorial)"
                       : formato == Formato::HASH ? "HASH EXTENSIBLE" : "ARBOL B+")
-                  << "   (--bplus / --hash / --rtree / --invertido para forzarlo)\n";
+                  << "   (--bplus / --hash / --rtree / --invertido / --ivf para forzarlo)\n";
     }
 
     if (quiere_resumen) {
@@ -635,6 +750,13 @@ int main(int argc, char** argv) {
             std::vector<char> meta(PAGE_SIZE, 0);
             f.clear(); f.seekg(0, std::ios::beg); f.read(meta.data(), PAGE_SIZE);
             dumpInvertido(buf.data(), static_cast<int>(numero), hex_completo, meta);
+            break;
+        }
+        case Formato::IVF: {
+            // Igual que el invertido: sin la META no se sabe en que zona cae.
+            std::vector<char> meta(PAGE_SIZE, 0);
+            f.clear(); f.seekg(0, std::ios::beg); f.read(meta.data(), PAGE_SIZE);
+            dumpIVF(buf.data(), static_cast<int>(numero), hex_completo, meta);
             break;
         }
         default:             mostrarPagina(buf.data(), static_cast<int>(numero), hex_completo);

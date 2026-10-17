@@ -238,6 +238,10 @@ const EJEMPLOS = [
   ["MATCH (TF-IDF)","SELECT id, titulo FROM papers WHERE resumen MATCH 'inverted index' USING TFIDF LIMIT 5;"],
   ["MATCH híbrido", "SELECT id, titulo FROM papers WHERE resumen MATCH 'index' AND id >= 3 LIMIT 3;"],
   ["Texto español", "CREATE TABLE notas (id INT PRIMARY KEY, cuerpo TEXT);\nINSERT INTO notas VALUES\n (1,'los indices invertidos aceleran las busquedas de texto libre'),\n (2,'el arbol B+ resuelve consultas por rango sobre la clave primaria'),\n (3,'la busqueda por similitud compara vectores densos de alta dimension');\nCREATE INDEX ix_es ON notas (cuerpo) USING INVERTED LANGUAGE 'ES';\nSELECT * FROM notas WHERE cuerpo MATCH 'busqueda';"],
+  ["Vectores: crear", "CREATE TABLE items (id INT PRIMARY KEY, nombre CHAR(20), emb VECTOR(4));\nINSERT INTO items VALUES\n (1,'perro', [0.95,0.05,0.00,0.10]),\n (2,'gato',  [0.90,0.12,0.02,0.08]),\n (3,'lobo',  [0.88,0.03,0.05,0.14]),\n (4,'auto',  [0.04,0.93,0.10,0.02]),\n (5,'camion',[0.02,0.89,0.15,0.05]),\n (6,'arbol', [0.05,0.08,0.95,0.03]);\nCREATE INDEX ix_emb ON items (emb) USING IVF LISTS 3 METRIC COSINE;"],
+  ["Similitud",    "SELECT id, nombre FROM items ORDER BY emb <=> [0.93,0.07,0.01,0.09] LIMIT 3;"],
+  ["Similitud (más celdas)", "SELECT id, nombre FROM items ORDER BY emb <=> [0.93,0.07,0.01,0.09] LIMIT 3 PROBES 3;"],
+  ["Umbral vectorial", "SELECT id, nombre FROM items WHERE emb <=> [0.93,0.07,0.01,0.09] <= 0.02 PROBES 3;"],
   ["Polígonos",    "CREATE TABLE zonas (id INT PRIMARY KEY, nombre CHAR(24), area POLYGON);\nINSERT INTO zonas VALUES (1,'Centro',POLYGON((-77.05,-12.06),(-77.01,-12.06),(-77.01,-12.03),(-77.05,-12.03))),(2,'Sur',POLYGON((-77.05,-12.16),(-77.00,-12.16),(-77.00,-12.10),(-77.05,-12.10)));\nCREATE INDEX ix_area ON zonas (area) USING RTREE;\nSELECT * FROM zonas WHERE ST_CONTAINS(area, POINT(-77.0300,-12.0460));"],
 ];
 
@@ -354,14 +358,21 @@ function pintarResultados(resp){
   // Un numero suelto no dice nada; al lado de una barra se ve de un vistazo
   // cuanto mas relevante es el primero que el ultimo.
   const ciScore = d.columns.indexOf('score');
+  // 'distancia' es la columna que agrega una consulta de similitud vectorial.
+  // Se dibuja con la MISMA barra pero AL REVES: en un puntaje mas alto es
+  // mejor, en una distancia mas bajo es mejor, asi que la barra se invierte
+  // para que la barra mas larga siga significando "el mejor resultado".
+  const ciDist = d.columns.indexOf('distancia');
+  const ciBarra = ciScore >= 0 ? ciScore : ciDist;
   let maxScore = 0;
-  if (ciScore >= 0) for (const f of d.rows) maxScore = Math.max(maxScore, parseFloat(f[ciScore]) || 0);
+  if (ciBarra >= 0) for (const f of d.rows) maxScore = Math.max(maxScore, parseFloat(f[ciBarra]) || 0);
   const celda = (c, i) => {
-    if (i !== ciScore) return `<td>${escapar(c)}</td>`;
+    if (i !== ciBarra) return `<td>${escapar(c)}</td>`;
     const v = parseFloat(c) || 0;
-    const pct = maxScore > 0 ? Math.round((v / maxScore) * 100) : 0;
+    let pct = maxScore > 0 ? Math.round((v / maxScore) * 100) : 0;
+    if (ciBarra === ciDist) pct = 100 - pct;
     return `<td style="white-space:nowrap">` +
-           `<span style="display:inline-block;width:46px">${escapar(c)}</span>` +
+           `<span style="display:inline-block;width:${ciBarra === ciDist ? 62 : 46}px">${escapar(c)}</span>` +
            `<span style="display:inline-block;width:70px;height:7px;background:var(--border);` +
            `border-radius:4px;vertical-align:middle;overflow:hidden">` +
            `<span style="display:block;width:${pct}%;height:100%;background:#d97706"></span>` +

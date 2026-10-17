@@ -5,8 +5,11 @@
 //     TABLE <nombre> <archivo_datos> <motor> <clave_primaria>
 //     COL   <nombre> <TIPO> <max_len>
 //     INDEX <columna> <BPLUS|HASH|RTREE|INVERTED> <archivo> [<idioma>]
-//  El idioma solo lo lleva el indice invertido y es opcional, de modo que un
-//  catalogo escrito antes del modulo de texto se sigue leyendo igual.
+//     INDEX <columna> IVF <archivo> <listas> <COSINE|L2>
+//  La cola de la linea depende del tipo: el idioma solo lo lleva el indice
+//  invertido y los parametros de celdas y metrica solo el IVF. Ambas son
+//  opcionales al leer, de modo que un catalogo escrito antes de estos modulos
+//  se sigue leyendo igual.
 //     END
 //  Texto plano a proposito: el catalogo se lee una vez al arrancar y hay que
 //  poder inspeccionarlo y depurarlo a mano durante el desarrollo.
@@ -21,7 +24,7 @@
 
 namespace db {
 
-enum class IndexKind { BPLUS, HASH, RTREE, INVERTED };
+enum class IndexKind { BPLUS, HASH, RTREE, INVERTED, IVF };
 
 std::string indexKindName(IndexKind k);
 IndexKind   indexKindFromName(const std::string& s);
@@ -33,6 +36,12 @@ struct IndexInfo {
     // Solo INVERTED: "EN" o "ES". Decide stopwords y stemmer, y tiene que ser
     // el mismo al indexar y al consultar.
     std::string idioma = "EN";
+    // Solo IVF. El numero de celdas se guarda porque hay que poder reconstruir
+    // el indice con la MISMA particion, y la metrica porque una consulta en
+    // coseno contra un indice entrenado en L2 daria vecinos equivocados sin
+    // dar ningun error.
+    int         listas  = 0;
+    std::string metrica = "COSINE";
 };
 
 struct TableInfo {

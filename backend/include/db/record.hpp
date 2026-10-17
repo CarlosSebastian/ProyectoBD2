@@ -7,6 +7,9 @@
 //      POINT   -> 16 bytes (dos doubles: x, y)
 //      POLYGON -> int32 numero de vertices + 2n doubles (x1,y1,x2,y2,...)
 //      VARCHAR -> int32 longitud + los bytes del texto
+//      VECTOR  -> int32 dimension + d float32 (la dimension se repite en cada
+//                 tupla aunque el esquema ya la fije: asi deserializeTuple
+//                 puede avanzar sin consultar el catalogo, igual que POLYGON)
 //  Se serializa en el orden de las columnas del esquema, sin cabecera: el
 //  esquema (que vive en el catalogo) es lo que permite volver a leerla.
 // ============================================================================
@@ -27,7 +30,14 @@ namespace db {
 // consulta sobre poligonos tiene dos pasos, filtrado por MBR en el indice y
 // REFINAMIENTO exacto sobre la geometria real. Es como trabajan los motores
 // espaciales de verdad.
-enum class Type { INT, DOUBLE, VARCHAR, POINT, POLYGON };
+//
+// VECTOR(d) es un embedding denso de dimension fija. Se guarda en float32 y no
+// en double a proposito: la mitad de bytes, y la precision de un float sobra
+// para distancias entre embeddings normalizados. El indice que lo atiende no es
+// el R-Tree sino el IVF: en 384 dimensiones las cajas envolventes se solapan
+// casi siempre (maldicion de la dimensionalidad) y un indice espacial exacto
+// termina leyendo mas paginas que el scan.
+enum class Type { INT, DOUBLE, VARCHAR, POINT, POLYGON, VECTOR };
 
 std::string typeName(Type t);
 Type        typeFromName(const std::string& s);
@@ -35,7 +45,7 @@ Type        typeFromName(const std::string& s);
 struct Column {
     std::string name;
     Type        type    = Type::INT;
-    int         max_len = 0;   // solo para VARCHAR
+    int         max_len = 0;   // VARCHAR: longitud maxima. VECTOR: dimension.
 
     Column() = default;
     Column(std::string n, Type t, int len = 0) : name(std::move(n)), type(t), max_len(len) {}
@@ -66,6 +76,7 @@ struct Value {
     double       y    = 0.0;   // solo POINT: coordenada Y
     std::string  s;
     std::vector<double> poly;  // solo POLYGON: x1,y1,x2,y2,... (anillo cerrado)
+    std::vector<float>  vec;   // solo VECTOR: las d componentes del embedding
 
     Value() = default;
     static Value makeInt(std::int64_t v)      { Value x; x.type = Type::INT;     x.i = v; return x; }
@@ -78,7 +89,12 @@ struct Value {
     static Value makePolygon(std::vector<double> vertices) {
         Value x; x.type = Type::POLYGON; x.poly = std::move(vertices); return x;
     }
+    // vec = [v1, ..., vd]; la dimension es implicita en el tamano.
+    static Value makeVector(std::vector<float> componentes) {
+        Value x; x.type = Type::VECTOR; x.vec = std::move(componentes); return x;
+    }
     std::size_t numVertices() const { return poly.size() / 2; }
+    std::size_t dim() const { return vec.size(); }
 
     std::string str() const;
     bool operator==(const Value& o) const;

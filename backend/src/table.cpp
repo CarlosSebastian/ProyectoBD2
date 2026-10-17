@@ -69,6 +69,16 @@ Table::Table(const std::string& data_dir, const TableInfo& info, int pool_size)
                 throw DBException("Un indice INVERTED solo se crea sobre texto: '" +
                                   meta.column + "' es " + typeName(kt));
             ix.idioma = texto::idiomaDesdeNombre(meta.idioma.empty() ? "EN" : meta.idioma);
+        } else if (meta.kind == IndexKind::IVF) {
+            if (kt != Type::VECTOR)
+                throw DBException("Un indice IVF solo se crea sobre VECTOR: '" +
+                                  meta.column + "' es " + typeName(kt));
+            if (info_.schema[static_cast<std::size_t>(ix.col)].max_len <= 0)
+                throw DBException("La columna '" + meta.column +
+                                  "' no declara dimension; declarala como VECTOR(d)");
+            ix.listas  = meta.listas;
+            ix.metrica = IVFIndex::metricaDesdeNombre(meta.metrica.empty() ? "COSINE"
+                                                                           : meta.metrica);
         } else if (meta.kind == IndexKind::RTREE) {
             if (kt != Type::POINT && kt != Type::POLYGON)
                 throw DBException("Un indice RTREE solo se crea sobre POINT o POLYGON: '" +
@@ -79,6 +89,10 @@ Table::Table(const std::string& data_dir, const TableInfo& info, int pool_size)
             if (kt == Type::POINT || kt == Type::POLYGON)
                 throw DBException("Una columna " + typeName(kt) +
                                   " solo admite un indice RTREE: '" + meta.column + "'");
+            if (kt == Type::VECTOR)
+                throw DBException("Una columna VECTOR solo admite un indice IVF: '" +
+                                  meta.column + "'. Un B+ o un hash ordenan o reparten por "
+                                  "clave, y un embedding no tiene clave: tiene vecinos.");
         }
 
         ix.disk = std::make_unique<DiskManager>(joinPath(data_dir, meta.file));
@@ -109,6 +123,9 @@ void Table::abrirIndice(Indice& ix) {
             break;
         case IndexKind::INVERTED:
             ix.inv = std::make_unique<InvertedIndex>(ix.bp.get());
+            break;
+        case IndexKind::IVF:
+            ix.ivf = std::make_unique<IVFIndex>(ix.bp.get());
             break;
         case IndexKind::BPLUS:
             if (kt == Type::INT) ix.bt_int = std::make_unique<BPlusTree<std::int64_t>>(ix.bp.get());
@@ -156,6 +173,12 @@ int Table::columnaGeom(const std::string& col) const {
 // Lo que el R-Tree guarda de una geometria: el punto mismo, o la envolvente
 // del poligono. Para el poligono es solo una aproximacion, y de ahi que las
 // consultas tengan que refinar.
+int Table::columnaVector(const std::string& col) const {
+    int ci = info_.schema.indexOf(col);
+    if (ci < 0) return -1;
+    return info_.schema[static_cast<std::size_t>(ci)].type == Type::VECTOR ? ci : -1;
+}
+
 MBR Table::cajaDe(const Value& v) {
     if (v.type == Type::POLYGON) return poly::envolvente(v.poly);
     return MBR::point(v.d, v.y);
@@ -170,6 +193,9 @@ void Table::insertIntoIndex(const Tuple& t, const RID& rid) {
         // documento obligaria a desplazar casi todas las listas de postings.
         // Se marca como desactualizado y se reconstruye en la proxima consulta.
         if (ix.inv)         texto_sucio_ = true;
+        // El IVF tampoco: k-means se entrena sobre el conjunto completo, asi
+        // que anadir un vector no es insertar en una lista, es reparticionar.
+        else if (ix.ivf)    vector_sucio_ = true;
         else if (ix.rt)     ix.rt->insert(cajaDe(key), rid);
         else if (ix.bt_int) ix.bt_int->insert(key.i, rid);
         else if (ix.hs_int) ix.hs_int->insert(key.i, rid);
@@ -181,6 +207,7 @@ void Table::removeFromIndex(const Tuple& t, const RID& rid) {
     for (Indice& ix : indices_) {
         const Value& key = t.values[static_cast<std::size_t>(ix.col)];
         if (ix.inv)         texto_sucio_ = true;
+        else if (ix.ivf)    vector_sucio_ = true;
         else if (ix.rt)     ix.rt->remove(cajaDe(key), rid);
         else if (ix.bt_int) ix.bt_int->remove(key.i, rid);
         else if (ix.hs_int) ix.hs_int->remove(key.i, rid);
@@ -245,6 +272,8 @@ bool Table::removeByRID(const RID& rid) {
 // ---------------------------------------------------------------------------
 //  Busquedas que devuelven RIDs. Aqui vive la seleccion de ruta de acceso.
 // ---------------------------------------------------------------------------
+std::vector<RID> Table::scanRIDs() { return engine_->scanAll(); }
+
 std::vector<RID> Table::searchRIDsEq(const std::string& col, const Value& v) {
     auto t0 = Clock::now();
     long long r0 = lecturasTotales();
@@ -648,9 +677,10 @@ void Table::buildIndex() {
         Tuple t;
         if (getByRID(rid, t)) insertIntoIndex(t, rid);
     }
-    // Los invertidos van aparte: su construccion es masiva y externa, no una
-    // sucesion de inserciones.
+    // Los invertidos y los IVF van aparte: su construccion es masiva y externa,
+    // no una sucesion de inserciones.
     reconstruirTexto();
+    reconstruirVector();
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +765,209 @@ std::vector<RID> Table::searchRIDsMatch(const std::string& col, const std::strin
          ix->inv->buscar(consulta, k, tfidf ? InvertedIndex::Ranking::TFIDF
                                             : InvertedIndex::Ranking::BM25))
         out.push_back(x.rid);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  Ruta vectorial (IVF)
+// ---------------------------------------------------------------------------
+
+// La metrica no es un parametro de la consulta: es parte del indice. k-means se
+// entreno minimizando UNA distancia, y preguntar por la otra devolveria vecinos
+// equivocados sin dar ningun error, que es la peor forma de equivocarse.
+void Table::exigirMetrica(const Indice& ix, bool coseno) {
+    const bool del_indice = (ix.metrica == IVFIndex::Metrica::COSENO);
+    if (del_indice == coseno) return;
+    throw DBException("El indice IVF de '" + ix.columna + "' esta entrenado con metrica " +
+                      IVFIndex::nombreMetrica(ix.metrica) + " y la consulta pide " +
+                      std::string(coseno ? "COSINE" : "L2") +
+                      ". Las dos distancias no ordenan igual.");
+}
+
+void Table::exigirDimension(const Indice& ix, const std::string& col,
+                            const std::vector<float>& q) const {
+    const int dim = info_.schema[static_cast<std::size_t>(ix.col)].max_len;
+    if (static_cast<int>(q.size()) != dim)
+        throw DBException("El vector de la consulta tiene " + std::to_string(q.size()) +
+                          " componentes y la columna '" + col + "' es VECTOR(" +
+                          std::to_string(dim) + ")");
+}
+
+// ---------------------------------------------------------------------------
+//  Reconstruccion de los indices IVF desde el heap.
+//
+//  La fuente se recorre TRES veces (muestrear, asignar, colocar), asi que
+//  tiene que dar siempre los mismos vectores en el mismo orden. La lista de
+//  RIDs se calcula una vez y se reutiliza en las tres pasadas; los vectores en
+//  si no se acumulan nunca en memoria, se releen del heap.
+// ---------------------------------------------------------------------------
+void Table::reconstruirVector() {
+    bool habia = false;
+    for (Indice& ix : indices_) {
+        if (!ix.ivf) continue;
+        habia = true;
+        const std::size_t col = static_cast<std::size_t>(ix.col);
+        const int dim = info_.schema[col].max_len;
+        const std::vector<RID> rids = engine_->scanAll();
+
+        IVFIndex::Fuente fuente =
+            [&](const std::function<void(const RID&, const std::vector<float>&)>& emitir) {
+                Tuple t;
+                for (const RID& r : rids) {
+                    if (!getByRID(r, t)) continue;
+                    emitir(r, t.values[col].vec);
+                }
+            };
+        ix.ivf->construir(fuente, dim, ix.listas, ix.metrica);
+    }
+    if (habia) vector_sucio_ = false;
+}
+
+const IVFIndex* Table::indiceVector(const std::string& col) const {
+    const Indice* ix = indicePara(col);
+    return (ix && ix->ivf) ? ix->ivf.get() : nullptr;
+}
+
+std::vector<RID> Table::searchRIDsVector(const std::string& col, const std::vector<float>& q,
+                                         int k, bool coseno, int probes) {
+    Indice* ix = indicePara(col);
+    if (!ix || !ix->ivf)
+        throw DBException("No hay un indice IVF sobre la columna '" + col + "'");
+    exigirMetrica(*ix, coseno);
+    exigirDimension(*ix, col, q);
+    if (vector_sucio_) reconstruirVector();
+
+    const int total = static_cast<int>(ix->ivf->size());
+    const int kk    = (k < 0) ? total : k;
+    std::vector<RID> out;
+    if (kk <= 0 || total == 0) return out;
+    for (const IVFIndex::Resultado& r : ix->ivf->buscar(q, kk, probes)) out.push_back(r.rid);
+    return out;
+}
+
+std::vector<Tuple> Table::searchVector(const std::string& col, const std::vector<float>& q,
+                                       int k, bool coseno, int probes,
+                                       std::vector<double>* distancias) {
+    auto t0 = Clock::now();
+    const long long r0 = lecturasTotales();
+
+    Indice* ix = indicePara(col);
+    if (!ix || !ix->ivf)
+        throw DBException("No hay un indice IVF sobre la columna '" + col + "'");
+    exigirMetrica(*ix, coseno);
+    exigirDimension(*ix, col, q);
+    if (vector_sucio_) reconstruirVector();
+
+    const int total = static_cast<int>(ix->ivf->size());
+    const int kk    = (k < 0) ? total : k;
+    std::vector<Tuple> out;
+    if (distancias) distancias->clear();
+
+    std::vector<IVFIndex::Resultado> res;
+    if (kk > 0 && total > 0) res = ix->ivf->buscar(q, kk, probes);
+    out.reserve(res.size());
+    for (const IVFIndex::Resultado& x : res) {
+        Tuple t;
+        if (!getByRID(x.rid, t)) continue;
+        out.push_back(std::move(t));
+        if (distancias) distancias->push_back(x.dist);
+    }
+
+    const int np = probes > 0 ? probes : ix->ivf->nprobePorDefecto();
+    last_plan_.metodo         = "INDEX IVF (" + IVFIndex::nombreMetrica(ix->metrica) +
+                                ", nprobe=" + std::to_string(np) + "/" +
+                                std::to_string(ix->ivf->listas()) + ")";
+    last_plan_.columna        = col;
+    last_plan_.paginas_leidas = lecturasTotales() - r0;
+    last_plan_.registros      = static_cast<long long>(out.size());
+    last_plan_.descartados    = 0;
+    last_plan_.ms             = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    return out;
+}
+
+// El IVF solo sabe responder top-k, pero un umbral no dice cuantas filas son.
+// Se pide un k y se DOBLA mientras el ultimo vecino siga dentro del umbral: al
+// salir del bucle o el k-esimo ya se paso del umbral (y entonces no falta
+// ninguno) o se agoto el indice. Asi el resultado no depende de haber acertado
+// el k de entrada.
+std::vector<IVFIndex::Resultado> Table::ivfUmbral(Indice& ix, const std::vector<float>& q,
+                                                  double umbral, bool estricto, int probes) {
+    const int total = static_cast<int>(ix.ivf->size());
+    std::vector<IVFIndex::Resultado> res;
+    if (total == 0) return res;
+
+    int k = 64;
+    while (true) {
+        if (k > total) k = total;
+        res = ix.ivf->buscar(q, k, probes);
+        if (k >= total || static_cast<int>(res.size()) < k) break;   // no hay mas que traer
+        const double ultima = res.back().dist;
+        if (estricto ? (ultima >= umbral) : (ultima > umbral)) break;  // el umbral ya quedo cubierto
+        k *= 2;
+    }
+    // buscar() devuelve por distancia creciente: en el primer vecino que se
+    // pasa del umbral se puede cortar.
+    std::size_t corte = 0;
+    while (corte < res.size()) {
+        const double d = res[corte].dist;
+        if (estricto ? (d < umbral) : (d <= umbral)) ++corte;
+        else break;
+    }
+    res.resize(corte);
+    return res;
+}
+
+std::vector<RID> Table::searchRIDsVectorUmbral(const std::string& col,
+                                               const std::vector<float>& q,
+                                               double umbral, bool estricto, bool coseno,
+                                               int probes) {
+    Indice* ix = indicePara(col);
+    if (!ix || !ix->ivf)
+        throw DBException("No hay un indice IVF sobre la columna '" + col + "'");
+    exigirMetrica(*ix, coseno);
+    exigirDimension(*ix, col, q);
+    if (vector_sucio_) reconstruirVector();
+
+    std::vector<RID> out;
+    for (const IVFIndex::Resultado& r : ivfUmbral(*ix, q, umbral, estricto, probes))
+        out.push_back(r.rid);
+    return out;
+}
+
+std::vector<Tuple> Table::searchVectorUmbral(const std::string& col,
+                                             const std::vector<float>& q,
+                                             double umbral, bool estricto, bool coseno,
+                                             int probes, std::vector<double>* distancias) {
+    auto t0 = Clock::now();
+    const long long r0 = lecturasTotales();
+
+    Indice* ix = indicePara(col);
+    if (!ix || !ix->ivf)
+        throw DBException("No hay un indice IVF sobre la columna '" + col + "'");
+    exigirMetrica(*ix, coseno);
+    exigirDimension(*ix, col, q);
+    if (vector_sucio_) reconstruirVector();
+
+    const std::vector<IVFIndex::Resultado> res = ivfUmbral(*ix, q, umbral, estricto, probes);
+    std::vector<Tuple> out;
+    out.reserve(res.size());
+    if (distancias) { distancias->clear(); distancias->reserve(res.size()); }
+    for (const IVFIndex::Resultado& x : res) {
+        Tuple t;
+        if (!getByRID(x.rid, t)) continue;
+        out.push_back(std::move(t));
+        if (distancias) distancias->push_back(x.dist);
+    }
+
+    const int np = probes > 0 ? probes : ix->ivf->nprobePorDefecto();
+    last_plan_.metodo         = "INDEX IVF UMBRAL (" + IVFIndex::nombreMetrica(ix->metrica) +
+                                ", nprobe=" + std::to_string(np) + "/" +
+                                std::to_string(ix->ivf->listas()) + ")";
+    last_plan_.columna        = col;
+    last_plan_.paginas_leidas = lecturasTotales() - r0;
+    last_plan_.registros      = static_cast<long long>(out.size());
+    last_plan_.descartados    = 0;
+    last_plan_.ms             = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     return out;
 }
 

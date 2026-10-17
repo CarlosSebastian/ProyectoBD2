@@ -34,6 +34,13 @@ static Value coerce(const Value& v, Type destino, const std::string& col) {
     }
     // Una geometria no se convierte desde ningun otro tipo: o viene de
     // POINT(x,y) / POLYGON((..)) o es un error del usuario. Lo mismo al reves.
+    // Un vector tampoco: no hay conversion sensata entre un embedding y un
+    // numero o un texto, y convertirlo "por si acaso" esconderia el error de
+    // haber escrito un literal del tipo equivocado.
+    if (destino == Type::VECTOR || v.type == Type::VECTOR)
+        throw DBException("La columna '" + col + "' es de tipo " + typeName(destino) +
+                          " y se recibio un valor " + typeName(v.type) +
+                          ". Los vectores se escriben entre corchetes: [0.1, -0.5, ...].");
     const bool geo_dest = (destino == Type::POINT || destino == Type::POLYGON);
     const bool geo_val  = (v.type  == Type::POINT || v.type  == Type::POLYGON);
     if (geo_dest || geo_val)
@@ -71,6 +78,10 @@ static Value cotaMin(Type t) {
         case Type::POINT:   return Value::makePoint(-std::numeric_limits<double>::infinity(),
                                                     -std::numeric_limits<double>::infinity());
         case Type::POLYGON: return Value::makePolygon({});
+        // Un vector no tiene cota: no se recorre por rango. El caso existe para
+        // que el switch quede exhaustivo y el compilador avise si manana se
+        // anade otro tipo.
+        case Type::VECTOR:  return Value::makeVector({});
     }
     return Value::makeInt(0);
 }
@@ -82,6 +93,7 @@ static Value cotaMax(Type t) {
         case Type::POINT:   return Value::makePoint(std::numeric_limits<double>::infinity(),
                                                     std::numeric_limits<double>::infinity());
         case Type::POLYGON: return Value::makePolygon({});
+        case Type::VECTOR:  return Value::makeVector({});
     }
     return Value::makeInt(0);
 }
@@ -112,6 +124,16 @@ static bool cumple(const Value& v, const Predicate& w) {
             if (v.type != Type::POINT) return false;
             const double d = geo::haversine(w.qlon, w.qlat, v.d, v.y);
             return w.radio_estricto ? (d < w.metros) : (d <= w.metros);
+        }
+        case PredKind::VECDIST: {
+            // Esta SI se puede comprobar fila a fila: la distancia se calcula
+            // con la fila ya en memoria, sin tocar el indice. Es lo que permite
+            // que un umbral vectorial funcione como filtro residual y que el
+            // DELETE sea exacto aunque el IVF sea aproximado.
+            if (v.type != Type::VECTOR) return false;
+            if (v.vec.size() != w.vector_consulta.size()) return false;
+            const double d = vecdist::entre(v.vec, w.vector_consulta, w.vec_coseno);
+            return w.vec_estricto ? (d < w.umbral) : (d <= w.umbral);
         }
         case PredKind::RANGE: {
             if (!w.lo_abierto) {
@@ -161,6 +183,11 @@ static int puntajeRuta(const TableInfo& ti, const std::string& clave_seq, const 
         case PredKind::WITHIN:                              // area acotada
         case PredKind::RADIO:                               // circulo acotado
             return (ix && ix->kind == IndexKind::RTREE) ? 3 : 50;
+        case PredKind::VECDIST:                             // vecinos dentro de un radio
+            // Con IVF es la ruta mas barata que existe para esta condicion;
+            // sin IVF no hay nada que hacer salvo recorrer y calcular la
+            // distancia de cada fila, igual de caro que un scan.
+            return (ix && ix->kind == IndexKind::IVF) ? 3 : 50;
         case PredKind::RANGE:                               // puede ser media tabla
             if (ix && ix->kind == IndexKind::BPLUS) return 4;
             if (es_clave_seq)                       return 5;
@@ -352,6 +379,16 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
             throw DBException("Un indice INVERTED solo se crea sobre texto (CHAR/VARCHAR/TEXT): '" +
                               st.index_column + "' es " + typeName(tipo_ix) + ". La tabla queda intacta.");
         texto::idiomaDesdeNombre(st.index_idioma);   // valida antes de tocar nada
+    } else if (st.index_kind == IndexKind::IVF) {
+        if (tipo_ix != Type::VECTOR)
+            throw DBException("Un indice IVF solo se crea sobre VECTOR: '" +
+                              st.index_column + "' es " + typeName(tipo_ix) +
+                              ". La tabla queda intacta.");
+        if (ti.schema[static_cast<std::size_t>(ci_ix)].max_len <= 0)
+            throw DBException("La columna '" + st.index_column +
+                              "' no declara dimension: declarala como VECTOR(d). "
+                              "La tabla queda intacta.");
+        IVFIndex::metricaDesdeNombre(st.index_metrica);   // valida antes de tocar nada
     } else if (st.index_kind == IndexKind::RTREE) {
         if (tipo_ix != Type::POINT && tipo_ix != Type::POLYGON)
             throw DBException("Un indice RTREE solo se crea sobre POINT o POLYGON: '" +
@@ -363,6 +400,9 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
         if (tipo_ix == Type::POINT || tipo_ix == Type::POLYGON)
             throw DBException("La columna '" + st.index_column + "' es " + typeName(tipo_ix) +
                               ": use USING RTREE. La tabla queda intacta.");
+        if (tipo_ix == Type::VECTOR)
+            throw DBException("La columna '" + st.index_column +
+                              "' es VECTOR: use USING IVF. La tabla queda intacta.");
     }
 
     IndexInfo ix;
@@ -371,6 +411,10 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
     ix.file   = st.table + "_" + st.index_column + ".idx";
     if (st.index_kind == IndexKind::INVERTED)
         ix.idioma = texto::nombreIdioma(texto::idiomaDesdeNombre(st.index_idioma));
+    if (st.index_kind == IndexKind::IVF) {
+        ix.listas  = st.index_listas;          // 0 => que el IVF use sqrt(N)
+        ix.metrica = IVFIndex::nombreMetrica(IVFIndex::metricaDesdeNombre(st.index_metrica));
+    }
     catalog_.addIndex(st.table, ix);
 
     // Reabrir la tabla con el indice y poblarlo recorriendo el heap.
@@ -384,6 +428,24 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
                 (st.index_kind == IndexKind::INVERTED ? " (idioma " + ix.idioma + ")" : "") + ". " +
                 std::to_string(t->count()) + " filas indexadas. La tabla tiene ahora " +
                 std::to_string(t->numIndices()) + " indice(s).";
+    if (st.index_kind == IndexKind::IVF) {
+        const IVFIndex* iv = t->indiceVector(st.index_column);
+        if (iv) {
+            // Cuantas celdas salieron y como quedo el reparto es LA informacion
+            // util de un IVF recien construido: una celda gigante es una lectura
+            // larga que ninguna consulta va a poder evitar.
+            const std::vector<std::uint32_t> tam = iv->tamanosDeListas();
+            std::uint32_t mayor = 0;
+            for (std::uint32_t c : tam) if (c > mayor) mayor = c;
+            const double media = tam.empty() ? 0.0
+                               : static_cast<double>(iv->size()) / static_cast<double>(tam.size());
+            r.message += " Metrica " + IVFIndex::nombreMetrica(iv->metrica()) + ", " +
+                         std::to_string(iv->listas()) + " celdas (" + num0(media) +
+                         " vectores de media, la mayor " + std::to_string(mayor) +
+                         "), nprobe por defecto " + std::to_string(iv->nprobePorDefecto()) +
+                         ", " + std::to_string(iv->numPages()) + " paginas de indice.";
+        }
+    }
     r.exec_ms = msDesde(t0);
     r.plan.push_back(PlanStep{"CREATE INDEX", r.exec_ms, indexKindName(st.index_kind)});
     return r;
@@ -443,6 +505,22 @@ Value valorDesdeTexto(const std::string& s, Type t, const std::string& col, long
                     throw DBException("se esperaban dos coordenadas");
                 return Value::makePoint(std::stod(s.substr(0, corte)),
                                         std::stod(s.substr(corte + 1)));
+            }
+            case Type::VECTOR: {
+                // El CSV trae el embedding como "[0.1,0.2,...]" o como
+                // "0.1 0.2 ...": se aceptan las dos formas porque el script que
+                // los genera puede volcarlos de cualquiera de las dos maneras.
+                // Es por aqui por donde entran los embeddings de verdad.
+                std::string limpio = s;
+                for (char& c : limpio)
+                    if (c == '[' || c == ']' || c == ',' || c == ';') c = ' ';
+                std::vector<float> v;
+                std::istringstream ss(limpio);
+                double x;
+                while (ss >> x) v.push_back(static_cast<float>(x));
+                if (v.empty())
+                    throw DBException("un vector necesita al menos una componente");
+                return Value::makeVector(std::move(v));
             }
             case Type::POLYGON: {
                 std::vector<double> v;
@@ -578,7 +656,7 @@ static Predicate repartirCondiciones(const TableInfo& ti, const std::string& cla
     if (n_match > 1)
         throw DBException("Solo se admite un MATCH por consulta: el ranking textual "
                           "conduce el acceso y no puede aplicarse como filtro");
-    if (n_match == 1 && st.knn)
+    if (n_match == 1 && (st.knn || st.knn_vectorial))
         throw DBException("MATCH y ORDER BY por distancia piden dos ordenes distintos "
                           "en la misma consulta");
 
@@ -602,10 +680,53 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     auto t_plan = Clock::now();
     const TableInfo& ti = catalog_.get(st.table);
     std::vector<Predicate> filtros;
-    const Predicate cond = repartirCondiciones(ti, claveSecuencialDe(ti), st, &filtros);
+    Predicate cond = repartirCondiciones(ti, claveSecuencialDe(ti), st, &filtros);
+
+    // La metrica NO se deduce del indice: la pide el operador (<=> coseno,
+    // <-> L2). Si no coincide con la del indice, la consulta se rechaza en vez
+    // de responder con la distancia equivocada, que es un error que nadie
+    // notaria mirando el resultado.
+    const IndexInfo* ix_vec = st.knn_vectorial ? ti.findIndex(st.knn_column) : nullptr;
+    const bool knn_cos = st.knn_coseno;
+
+    // Texto de una sola linea con el reparto de las celdas del IVF. Un reparto
+    // muy desigual es la explicacion de por que dos consultas con el mismo
+    // nprobe pueden costar muy distinto.
+    auto detalleIVF = [&](const IVFIndex* iv, int probes_pedidos) {
+        std::string d;
+        if (!iv) return d;
+        const std::vector<std::uint32_t> tam = iv->tamanosDeListas();
+        std::uint32_t mayor = 0;
+        for (std::uint32_t c : tam) if (c > mayor) mayor = c;
+        const int np = probes_pedidos > 0 ? probes_pedidos : iv->nprobePorDefecto();
+        d = "metrica " + IVFIndex::nombreMetrica(iv->metrica()) +
+            ", nprobe=" + std::to_string(np) + "/" + std::to_string(iv->listas()) +
+            " celdas, " + std::to_string(iv->size()) + " vectores (la celda mayor tiene " +
+            std::to_string(mayor) + "); resultado APROXIMADO: solo se compara contra las "
+            "celdas visitadas";
+        return d;
+    };
+
     std::string ruta, detalle_ruta;
     const IndexInfo* ix_knn = st.knn ? ti.findIndex(st.knn_column) : nullptr;
-    if (st.knn) {
+    if (st.knn_vectorial) {
+        // La similitud manda sobre el WHERE, igual que el KNN espacial. Y a
+        // diferencia del KNN espacial, aqui NO hay plan B: recorrer la tabla
+        // comparando 384 floats por fila es justo lo que el indice existe para
+        // evitar, asi que el motor prefiere pedir el indice antes que ofrecer
+        // una consulta que no escala.
+        if (!ix_vec || ix_vec->kind != IndexKind::IVF)
+            throw DBException("ORDER BY por similitud necesita un indice IVF sobre '" +
+                              st.knn_column + "'. Crealo con: CREATE INDEX ix ON " + st.table +
+                              " (" + st.knn_column + ") USING IVF LISTS n METRIC " +
+                              std::string(st.knn_coseno ? "COSINE" : "L2") + ";");
+        ruta = "IndexVectorKNN";
+        detalle_ruta = "IVF sobre " + st.knn_column + ", k=" +
+                       (st.limit >= 0 ? std::to_string(st.limit) : std::string("todos")) +
+                       ", " + detalleIVF(t->indiceVector(st.knn_column), st.probes);
+        if (t->vectorDesactualizado())
+            detalle_ruta += "; el indice se reconstruira antes de responder";
+    } else if (st.knn) {
         // El KNN manda sobre el WHERE: es lo que decide la ruta de acceso.
         if (ix_knn && ix_knn->kind == IndexKind::RTREE && st.limit >= 0) {
             ruta = st.knn_geo ? "IndexKNN (geografico)" : "IndexKNN";
@@ -643,6 +764,19 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
             }
             if (!dfs.empty()) detalle_ruta += "; terminos: " + dfs;
             else              detalle_ruta += "; la consulta no deja ningun termino tras el analisis";
+        }
+    } else if (cond.kind == PredKind::VECDIST) {
+        const IndexInfo* iv = ti.findIndex(cond.column);
+        if (iv && iv->kind == IndexKind::IVF) {
+            ruta = "IndexVectorRange";
+            detalle_ruta = "IVF sobre " + cond.column + ", umbral " +
+                           (cond.vec_estricto ? "< " : "<= ") + std::to_string(cond.umbral) +
+                           ", " + detalleIVF(t->indiceVector(cond.column), st.probes) +
+                           "; se pide top-k y se dobla k hasta cubrir el umbral";
+        } else {
+            ruta = "SeqScan";
+            detalle_ruta = "no hay indice IVF sobre " + cond.column +
+                           ": la distancia se calcula fila a fila (exacto, O(N))";
         }
     } else if (cond.kind == PredKind::NONE) {
         ruta = "SeqScan"; detalle_ruta = "sin predicado";
@@ -685,6 +819,11 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
         for (const Predicate& f : filtros) { if (!cols.empty()) cols += ", "; cols += f.column; }
         detalle_ruta += "  [conduce la relevancia; filtra " + cols +
                         " con sobre-peticion hasta reunir k]";
+    } else if (st.knn_vectorial && cond.kind != PredKind::NONE) {
+        std::string cols = cond.column;
+        for (const Predicate& f : filtros) cols += ", " + f.column;
+        detalle_ruta += "  [conduce la similitud; filtra " + cols +
+                        " con sobre-peticion hasta reunir k]";
     } else if (st.knn && cond.kind != PredKind::NONE) {
         // El KNN conduce y TODO el WHERE queda como filtro, con sobre-peticion.
         std::string cols = cond.column;
@@ -709,6 +848,12 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     // Paralelo a 'filas' cuando la consulta es por relevancia: el puntaje no
     // es una columna de la tabla, pero sin el no se puede juzgar el ranking.
     std::vector<double> puntajes;
+    // Como se llama esa columna y con cuanta precision se imprime: un puntaje
+    // BM25 no es lo mismo que una distancia, y llamar "score" a una distancia
+    // invitaria a leerla al reves (cuanto mas alto, mejor), que es justo lo
+    // contrario de lo que significa.
+    const char* columna_extra = "score";
+    bool extra_es_distancia = false;
     bool knn_ya_filtrado = false;
     if (cond.kind == PredKind::MATCH) {
         const int k = st.limit >= 0 ? static_cast<int>(st.limit) : -1;
@@ -752,6 +897,114 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
                 filas.resize(static_cast<std::size_t>(k));
                 puntajes.resize(static_cast<std::size_t>(k));
             }
+        }
+    } else if (st.knn_vectorial) {
+        const int ck = sch.indexOf(st.knn_column);
+        if (ck < 0) throw DBException("No existe la columna '" + st.knn_column + "'");
+        if (sch[ck].type != Type::VECTOR)
+            throw DBException("ORDER BY <=> exige una columna VECTOR: '" + st.knn_column +
+                              "' es " + typeName(sch[ck].type));
+        if (static_cast<int>(st.knn_vector.size()) != sch[ck].max_len)
+            throw DBException("El vector de la consulta tiene " +
+                              std::to_string(st.knn_vector.size()) + " componentes y '" +
+                              st.knn_column + "' es VECTOR(" +
+                              std::to_string(sch[ck].max_len) + ")");
+        columna_extra     = "distancia";
+        extra_es_distancia = true;
+
+        const int k = st.limit >= 0 ? static_cast<int>(st.limit) : -1;
+
+        std::vector<Predicate> todas;
+        if (cond.kind != PredKind::NONE) todas.push_back(cond);
+        for (const Predicate& f : filtros) todas.push_back(f);
+        auto pasaTodas = [&](const Tuple& f) {
+            for (const Predicate& w : todas) {
+                const int cf = sch.indexOf(w.column);
+                if (cf < 0) throw DBException("No existe la columna '" + w.column + "'");
+                if (!cumple(f.at(static_cast<std::size_t>(cf)), w)) return false;
+            }
+            return true;
+        };
+
+        {
+            // Misma sobre-peticion que en el KNN espacial: el indice ordena por
+            // similitud y no sabe nada del WHERE, asi que se dobla k hasta
+            // reunir k supervivientes o hasta agotar el indice.
+            if (todas.empty()) {
+                filas = t->searchVector(st.knn_column, st.knn_vector, k, knn_cos,
+                                        st.probes, &puntajes);
+            } else {
+                knn_ya_filtrado = true;
+                int pedir = (k < 0) ? -1 : std::max(k, 1);
+                while (true) {
+                    std::vector<double> ds;
+                    std::vector<Tuple> cand = t->searchVector(st.knn_column, st.knn_vector,
+                                                              pedir, knn_cos, st.probes, &ds);
+                    filas.clear();
+                    puntajes.clear();
+                    for (std::size_t i = 0; i < cand.size(); ++i) {
+                        if (!pasaTodas(cand[i])) continue;
+                        filas.push_back(cand[i]);
+                        puntajes.push_back(i < ds.size() ? ds[i] : 0.0);
+                    }
+                    if (k < 0) break;
+                    if (static_cast<int>(filas.size()) >= k) break;
+                    if (static_cast<int>(cand.size()) < pedir) break;
+                    if (pedir > 1 << 20) break;
+                    pedir *= 2;
+                }
+                if (k >= 0 && static_cast<int>(filas.size()) > k) {
+                    filas.resize(static_cast<std::size_t>(k));
+                    puntajes.resize(static_cast<std::size_t>(k));
+                }
+            }
+        }
+    } else if (cond.kind == PredKind::VECDIST) {
+        const int cv = sch.indexOf(cond.column);
+        if (cv < 0) throw DBException("No existe la columna '" + cond.column + "'");
+        if (sch[cv].type != Type::VECTOR)
+            throw DBException("El operador <=> exige una columna VECTOR: '" + cond.column +
+                              "' es " + typeName(sch[cv].type));
+        if (static_cast<int>(cond.vector_consulta.size()) != sch[cv].max_len)
+            throw DBException("El vector de la consulta tiene " +
+                              std::to_string(cond.vector_consulta.size()) +
+                              " componentes y '" + cond.column + "' es VECTOR(" +
+                              std::to_string(sch[cv].max_len) + ")");
+        columna_extra      = "distancia";
+        extra_es_distancia = true;
+
+        const IndexInfo* iv = ti.findIndex(cond.column);
+        if (iv && iv->kind == IndexKind::IVF) {
+            filas = t->searchVectorUmbral(cond.column, cond.vector_consulta, cond.umbral,
+                                          cond.vec_estricto, cond.vec_coseno, st.probes,
+                                          &puntajes);
+        } else {
+            // Sin indice el umbral se resuelve recorriendo: es exacto y cuesta
+            // una distancia por fila.
+            for (const Tuple& f : t->scan()) {
+                const Value& v = f.at(static_cast<std::size_t>(cv));
+                if (v.type != Type::VECTOR || v.vec.size() != cond.vector_consulta.size())
+                    continue;
+                const double d = vecdist::entre(v.vec, cond.vector_consulta, cond.vec_coseno);
+                if (cond.vec_estricto ? (d < cond.umbral) : (d <= cond.umbral)) {
+                    filas.push_back(f);
+                    puntajes.push_back(d);
+                }
+            }
+            // Un umbral no ordena por si solo, pero devolver los mas parecidos
+            // primero es lo que el usuario espera de una consulta de similitud.
+            std::vector<std::size_t> idx(filas.size());
+            for (std::size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+            std::sort(idx.begin(), idx.end(), [&](std::size_t a, std::size_t b) {
+                return puntajes[a] != puntajes[b] ? puntajes[a] < puntajes[b] : a < b;
+            });
+            std::vector<Tuple> fo;
+            std::vector<double> po;
+            fo.reserve(idx.size());
+            po.reserve(idx.size());
+            for (std::size_t i : idx) { fo.push_back(filas[i]); po.push_back(puntajes[i]); }
+            filas.swap(fo);
+            puntajes.swap(po);
         }
     } else if (st.knn) {
         int ck = sch.indexOf(st.knn_column);
@@ -842,18 +1095,27 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     // ---- Filtro residual: las condiciones que no condujeron el acceso ----
     long long antes_del_filtro = static_cast<long long>(filas.size());
     if (!filtros.empty() && !knn_ya_filtrado) {
-        std::vector<Tuple> quedan;
+        // Si la consulta trae una columna calculada (puntaje o distancia), el
+        // filtro tiene que recortarla EN PARALELO. Dejarlas desalineadas haria
+        // que la columna desapareciera del resultado sin decir nada.
+        const bool con_extra = (puntajes.size() == filas.size());
+        std::vector<Tuple>  quedan;
+        std::vector<double> quedan_p;
         quedan.reserve(filas.size());
-        for (const Tuple& f : filas) {
+        for (std::size_t i = 0; i < filas.size(); ++i) {
+            const Tuple& f = filas[i];
             bool ok = true;
             for (const Predicate& w : filtros) {
                 int cf = sch.indexOf(w.column);
                 if (cf < 0) throw DBException("No existe la columna '" + w.column + "'");
                 if (!cumple(f.at(static_cast<std::size_t>(cf)), w)) { ok = false; break; }
             }
-            if (ok) quedan.push_back(f);
+            if (!ok) continue;
+            quedan.push_back(f);
+            if (con_extra) quedan_p.push_back(puntajes[i]);
         }
         filas.swap(quedan);
+        if (con_extra) puntajes.swap(quedan_p);
     }
     r.exec_ms = msDesde(t_exec);
     r.metodo  = t->lastPlan().metodo;
@@ -894,7 +1156,7 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     // se anade al final del resultado. Sin el, un ranking es una lista de filas
     // en un orden que el usuario no puede verificar.
     const bool con_puntaje = !puntajes.empty() && puntajes.size() == filas.size();
-    if (con_puntaje) r.columns.push_back("score");
+    if (con_puntaje) r.columns.push_back(columna_extra);
 
     long long tope = (st.limit >= 0) ? st.limit : static_cast<long long>(filas.size());
     for (std::size_t fi = 0; fi < filas.size(); ++fi) {
@@ -904,7 +1166,9 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
         for (int ci : proyeccion) fila.push_back(f.at(static_cast<std::size_t>(ci)).str());
         if (con_puntaje) {
             char buf[32];
-            std::snprintf(buf, sizeof(buf), "%.4f", puntajes[fi]);
+            // Una distancia coseno util vive en las milesimas: con cuatro
+            // decimales dos vecinos distintos saldrian con el mismo numero.
+            std::snprintf(buf, sizeof(buf), extra_es_distancia ? "%.6f" : "%.4f", puntajes[fi]);
             fila.push_back(buf);
         }
         r.rows.push_back(std::move(fila));
@@ -938,7 +1202,29 @@ QueryResult Database::ejecutarDelete(const Statement& st) {
 
     auto t_exec = Clock::now();
     std::vector<RID> objetivo;
-    if (cond.kind == PredKind::WITHIN) {
+    bool vecdist_exacto = false;
+    if (cond.kind == PredKind::VECDIST) {
+        if (tipo != Type::VECTOR)
+            throw DBException("El operador <=> exige una columna VECTOR: '" + cond.column +
+                              "' es " + typeName(tipo));
+        if (static_cast<int>(cond.vector_consulta.size()) != sch[ci].max_len)
+            throw DBException("El vector de la consulta tiene " +
+                              std::to_string(cond.vector_consulta.size()) +
+                              " componentes y '" + cond.column + "' es VECTOR(" +
+                              std::to_string(sch[ci].max_len) + ")");
+        // A PROPOSITO sin indice. El IVF es aproximado: si el vecino cayo en
+        // una celda que no se visito, no aparece. En un SELECT eso es una fila
+        // que falta en una lista; en un DELETE seria una fila que SI cumplia la
+        // condicion y que se queda sin borrar, sin que nadie se entere. Borrar
+        // es irreversible, asi que aqui se recorre la tabla entera y se calcula
+        // la distancia de cada fila: exacto, O(N), y sin sorpresas.
+        vecdist_exacto = true;
+        Tuple f;
+        for (const RID& rid : t->scanRIDs()) {
+            if (!t->getByRID(rid, f)) continue;
+            if (cumple(f.at(static_cast<std::size_t>(ci)), cond)) objetivo.push_back(rid);
+        }
+    } else if (cond.kind == PredKind::WITHIN) {
         objetivo = t->searchRIDsWithin(cond.column, cond.wx0, cond.wy0, cond.wx1, cond.wy1);
     } else if (cond.kind == PredKind::CONTIENE) {
         objetivo = t->searchRIDsContains(cond.column, cond.qlon, cond.qlat);
@@ -995,6 +1281,11 @@ QueryResult Database::ejecutarDelete(const Statement& st) {
                               (filtros.empty() ? std::string()
                                                : ", " + std::to_string(objetivo.size()) +
                                                  " tras el filtro residual")});
+    if (vecdist_exacto)
+        r.plan.push_back(PlanStep{
+            "Recorrido exacto (sin IVF)", 0.0,
+            "borrar es irreversible y el indice es aproximado: se calcula la distancia "
+            "de todas las filas en vez de fiarse de las celdas visitadas"});
     r.plan.push_back(PlanStep{"DELETE (heap + indice)", 0.0, std::to_string(borradas) + " borradas"});
     return r;
 }

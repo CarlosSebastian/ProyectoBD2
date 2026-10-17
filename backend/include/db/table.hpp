@@ -24,6 +24,15 @@
 //  desactualizado, y la siguiente consulta MATCH lo reconstruye antes de
 //  responder. Asi el resultado nunca es incorrecto, aunque la escritura salga
 //  barata y la primera lectura posterior cara.
+//
+//  Para columnas VECTOR se suma la ruta vectorial (Entregable 2, parte 4):
+//     - KNN     'ORDER BY col <=> [..] LIMIT k'  -> IVF, o scan exhaustivo
+//     - umbral  'WHERE col <=> [..] <= d'        -> IVF con sobre-pedido
+//  El IVF es APROXIMADO: visita solo las nprobe celdas mas prometedoras, asi
+//  que puede dejarse fuera algun vecino. Es el precio de no comparar contra
+//  todos, y el experimento mide exactamente cuanto se pierde (recall) frente a
+//  cuanto se gana (latencia). Como el invertido, es de construccion masiva: se
+//  marca sucio al escribir y se reconstruye antes de la siguiente consulta.
 // ============================================================================
 #pragma once
 
@@ -37,6 +46,7 @@
 #include "db/extendible_hash.hpp"
 #include "db/heap_file.hpp"
 #include "db/inverted.hpp"
+#include "db/ivf.hpp"
 #include "db/record.hpp"
 #include "db/rtree.hpp"
 #include "db/sequential_file.hpp"
@@ -80,6 +90,11 @@ public:
     std::vector<Tuple> searchRange(const std::string& col, const Value& lo, const Value& hi);
     std::vector<Tuple> scan();
 
+    // Todos los RID de la tabla, en el orden en que los da el motor. Lo usa el
+    // planificador cuando tiene que resolver algo EXACTAMENTE y no puede
+    // fiarse de un indice aproximado.
+    std::vector<RID> scanRIDs();
+
     std::vector<RID> searchRIDsEq(const std::string& col, const Value& v);
     std::vector<RID> searchRIDsRange(const std::string& col, const Value& lo, const Value& hi);
 
@@ -120,6 +135,33 @@ public:
     bool textoDesactualizado() const { return texto_sucio_; }
     // Acceso de solo lectura para las metricas del plan y los tests.
     const InvertedIndex* indiceTexto(const std::string& col) const;
+
+    // ---- consulta vectorial (columna VECTOR con indice IVF) ----
+    // k vecinos mas cercanos, ordenados por distancia creciente. 'coseno' tiene
+    // que coincidir con la metrica del indice; si no, se lanza, porque pedir
+    // coseno a un indice entrenado en L2 devolveria vecinos equivocados en
+    // silencio. probes < 0 usa el valor por defecto del indice.
+    // Si 'distancias' no es nulo, recibe la distancia de cada fila.
+    std::vector<Tuple> searchVector(const std::string& col, const std::vector<float>& q,
+                                    int k, bool coseno, int probes = -1,
+                                    std::vector<double>* distancias = nullptr);
+    std::vector<RID>   searchRIDsVector(const std::string& col, const std::vector<float>& q,
+                                        int k, bool coseno, int probes = -1);
+    // Todas las filas a distancia <= umbral (o < si 'estricto'). El IVF solo
+    // sabe devolver top-k, asi que se pide k y se va DOBLANDO hasta que el
+    // ultimo vecino ya pasa del umbral o se agota el indice: asi el resultado
+    // no depende de un k adivinado.
+    std::vector<Tuple> searchVectorUmbral(const std::string& col, const std::vector<float>& q,
+                                          double umbral, bool estricto, bool coseno,
+                                          int probes = -1,
+                                          std::vector<double>* distancias = nullptr);
+    std::vector<RID>   searchRIDsVectorUmbral(const std::string& col, const std::vector<float>& q,
+                                              double umbral, bool estricto, bool coseno,
+                                              int probes = -1);
+    // Reconstruye los indices IVF de la tabla desde el heap (tres pasadas).
+    void reconstruirVector();
+    bool vectorDesactualizado() const { return vector_sucio_; }
+    const IVFIndex* indiceVector(const std::string& col) const;
 
     const PlanInfo& lastPlan() const { return last_plan_; }
 
@@ -178,11 +220,14 @@ private:
         std::unique_ptr<ExtendibleHash<Key32>>        hs_str;
         std::unique_ptr<RTree>                        rt;
         std::unique_ptr<InvertedIndex>                inv;
+        std::unique_ptr<IVFIndex>                     ivf;
         texto::Idioma                                 idioma = texto::Idioma::EN;
+        int                                           listas  = 0;   // solo IVF
+        IVFIndex::Metrica                             metrica = IVFIndex::Metrica::COSENO;
 
         void soltarEstructuras() {
             bt_int.reset(); bt_str.reset(); hs_int.reset(); hs_str.reset();
-            rt.reset(); inv.reset();
+            rt.reset(); inv.reset(); ivf.reset();
         }
     };
 
@@ -193,6 +238,16 @@ private:
     Indice*       indicePara(const std::string& col);
     bool   indexedColumn(const std::string& col) const { return indicePara(col) != nullptr; }
     int    columnaPunto(const std::string& col) const;   // -1 si no es POINT
+    int    columnaVector(const std::string& col) const;  // -1 si no es VECTOR
+    // Lanza si la metrica pedida no es la del indice.
+    static void exigirMetrica(const Indice& ix, bool coseno);
+    // Top-k creciente hasta cubrir el umbral. Compartido por las dos variantes
+    // de busqueda por umbral (tuplas y RIDs).
+    std::vector<IVFIndex::Resultado> ivfUmbral(Indice& ix, const std::vector<float>& q,
+                                               double umbral, bool estricto, int probes);
+    // Comprueba que el vector de la consulta tenga la dimension declarada.
+    void exigirDimension(const Indice& ix, const std::string& col,
+                         const std::vector<float>& q) const;
     int    columnaGeom(const std::string& col) const;    // -1 si no es POINT ni POLYGON
     // Caja envolvente del valor geometrico de una columna (punto o poligono).
     static MBR cajaDe(const Value& v);
@@ -215,6 +270,9 @@ private:
     std::vector<Indice> indices_;
     // Hay un indice invertido y la tabla cambio desde que se construyo.
     bool                texto_sucio_ = false;
+    // Lo mismo para el IVF: k-means se entrena sobre el conjunto completo, asi
+    // que insertar una fila no es "anadir a una lista", es reparticionar.
+    bool                vector_sucio_ = false;
     std::string         data_dir_;
     int                 pool_size_ = 64;
 
