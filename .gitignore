@@ -23,3 +23,12 @@ informe/figuras/*.png
 # Ademas, al estar ignorados, 'git clean -fd' ya no los borra.
 informe/
 benchmarks/graficas.py
+
+# Aplicacion de IA (RAG): el corpus y los embeddings son datos generados.
+ai/corpus/*
+!ai/corpus/.gitkeep
+!ai/corpus/muestra_100.jsonl
+ai/cache/*
+!ai/cache/.gitkeep
+__pycache__/
+graphify-out/

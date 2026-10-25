@@ -24,7 +24,7 @@ Opciones útiles:
 ./benchmarks/run_experimentos.sh   # los 4 experimentos -> benchmarks/resultados.md
 make run PORT=9000                 # otro puerto
 ./build/dbserver --pool 8          # buffer pool pequeño: hace visible el I/O físico
-make test                          # 6 suites de tests (4365 verificaciones)
+make test                          # las 9 suites de tests
 make bench                         # corre los cuatro experimentos
 make demo                          # recorrido end-to-end por consola
 make PAGE=8192 bench               # Experimento 4: variar el tamaño de bloque
@@ -61,9 +61,16 @@ backend/
   include/third_party/httplib.h    servidor HTTP (cpp-httplib, MIT)
   src/             implementaciones + api_server.cpp + demo.cpp + dump_page.cpp
   tests/           test_heap, test_bplus, test_hash, test_sequential,
-                   test_catalog, test_sql
+                   test_catalog, test_sql, test_rtree, test_inverted, test_ivf
 frontend/
   index.html       cliente SQL de 4 paneles (sin dependencias)
+  rag.html         chat del RAG (lo sirve ai/rag_server.py en :8000)
+ai/
+  descargar_arxiv.py     baja papers de arXiv a ai/corpus/ (JSONL)
+  ingesta.py             embeddings + COPY + índices en el motor
+  rag_server.py          recuperación híbrida + LLM, expone /ask
+  rag_common.py          clientes HTTP del motor y de Ollama
+  corpus/, cache/        datos generados (ignorados por git)
 benchmarks/
   gen_dataset.cpp        generador del dataset sintético
   exp1..exp4_*.cpp       los cuatro experimentos del enunciado
@@ -238,6 +245,104 @@ páginas (log₂ P transferencias) aunque no haya ningún índice creado. Las fi
 que ya no entran en su bloque van a un archivo de overflow (`.ovf`), encadenado
 por clave, y el motor reorganiza solo cuando el overflow supera el 20 % de las
 filas.
+
+## Aplicación de IA: RAG sobre papers de arXiv
+
+Responde preguntas sobre literatura científica. **Toda la recuperación la hace
+el motor**: una consulta `MATCH` (BM25 sobre el índice invertido) y otra
+`ORDER BY emb <=> [...]` (IVF, coseno), fusionadas con Reciprocal Rank Fusion.
+Fuera del motor solo van los modelos de IA, que corren en Ollama. El código es
+Python con biblioteca estándar: **no hay `pip install`**.
+
+### Requisitos
+
+| Qué | Para qué | Cómo |
+|---|---|---|
+| `g++` (C++17) | compilar el motor | ver «Levantar el sistema» arriba |
+| Python 3.8+ | descarga, ingesta y servidor RAG | `python --version` |
+| [Ollama](https://ollama.com) | embeddings y LLM, en local | instalarlo y dejarlo corriendo |
+
+```bash
+ollama pull all-minilm      # embeddings, 384 dimensiones (23 MB)
+ollama pull qwen2.5:7b      # generación de la respuesta (4,7 GB)
+```
+
+Para usar otros modelos: variables de entorno `RAG_EMB` y `RAG_LLM`. Si cambias
+el de embeddings cambia la dimensión: borra `ai/cache/` y vuelve a correr la
+ingesta.
+
+### Paso a paso
+
+Todos los comandos se lanzan **desde la raíz del repositorio**.
+
+**1. Descargar el corpus** (una sola vez; no necesita el motor):
+
+```bash
+python ai/descargar_arxiv.py                # ~25 000 papers, unos 5 min
+python ai/descargar_arxiv.py --por-cat 200  # prueba rápida: 1 000 papers
+```
+
+Guarda `ai/corpus/arxiv_papers.jsonl`. Es reanudable: si se corta, vuelve a
+correrlo. Acepta categorías de arXiv (`--cats cs.DB cs.IR`) o búsquedas por
+palabra clave (`--cats cocina=all:cooking`; `ti:data_science` es la frase
+exacta `"data science"`).
+
+**2. Levantar el motor** (terminal 1, se queda corriendo en :8080):
+
+```bash
+make run              # o, sin make:  ./build.sh run
+```
+
+En Windows con MSYS2, desde PowerShell:
+`$env:MSYSTEM='UCRT64'; $env:CHERE_INVOKING='1'; C:\msys64\usr\bin\bash.exe -lc "./build.sh run"`
+
+**3. Cargar los papers en el motor** (terminal 2, con el motor ya corriendo):
+
+```bash
+python ai/ingesta.py
+```
+
+Calcula un embedding por paper con Ollama (se guardan en `ai/cache/` y no se
+repiten), los carga con `COPY` y crea los tres índices: B+ sobre `id`,
+`INVERTED` sobre `abstract` e `IVF` sobre `emb`. Es repetible: si la tabla ya
+existe, la vacía y la recarga. Con 25 000 papers, el cálculo de embeddings es lo
+que más tarda.
+
+**4. Levantar el servidor RAG** (terminal 3, en :8000):
+
+```bash
+python ai/rag_server.py
+```
+
+**5. Abrir http://localhost:8000.** Los tres indicadores de arriba tienen que
+estar en verde: `motor ✓`, `ollama ✓` y `N papers`. Escribe una pregunta (por
+ejemplo *¿Qué se ha investigado sobre generación de recetas con IA?*); la
+primera respuesta tarda unos segundos porque Ollama carga el modelo.
+
+### Qué muestra la página
+
+Cada respuesta trae el texto generado (con citas `[id]` que llevan al paper),
+los papers recuperados con su rango BM25 y vectorial, el SQL ejecutado, y las
+**lecturas de disco, accesos a página y latencia de cada consulta al motor**.
+El selector permite comparar *solo BM25*, *solo vectorial* e *híbrida*. El
+corpus está en inglés y `all-minilm` es monolingüe, así que el LLM reescribe la
+pregunta como consulta en inglés antes de buscar (casilla desactivable).
+
+### Si algo falla
+
+| Síntoma | Causa y arreglo |
+|---|---|
+| `motor ✗` en la página, o «No se pudo contactar con el motor» | falta el paso 2: levanta el motor |
+| `ollama ✗`, o «No se pudo contactar con Ollama» | Ollama no está corriendo, o falta el `ollama pull` del modelo |
+| `0 papers` | falta el paso 3 (`python ai/ingesta.py`) |
+| `No existe ai/corpus/arxiv_papers.jsonl` | falta el paso 1 |
+| La ingesta se corta a medias | vuelve a correrla: los embeddings ya calculados no se pierden |
+
+Una fila del motor debe caber en una página de 4 KB, así que la ingesta recorta
+cada abstract a 1 700 caracteres (el embedding sí usa el texto completo). Los
+índices `INVERTED` e `IVF` no admiten altas incrementales: el motor los
+reconstruye al primer uso tras cargar datos, y por eso la ingesta los
+«calienta» al terminar.
 
 ## API REST
 

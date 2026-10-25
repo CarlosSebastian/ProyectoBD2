@@ -1,0 +1,3 @@
+Aqui vive la literatura cientifica cruda (arxiv_papers.jsonl), un paper por linea.
+Se genera con:  python ai/descargar_arxiv.py
+Esta ignorada por git (pesa decenas de MB); solo se versiona muestra_100.jsonl.

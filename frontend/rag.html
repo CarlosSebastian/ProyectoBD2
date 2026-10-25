@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAG sobre papers · BD2</title>
+<style>
+  :root{
+    --bg:#f4f5f7; --panel:#ffffff; --border:#dcdfe4; --text:#1c2024; --muted:#6b7280;
+    --accent:#2563eb; --ok:#15803d; --bad:#b91c1c; --radius:8px;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{--bg:#14171a; --panel:#1c2024; --border:#2f353b; --text:#e6e8ea; --muted:#98a1ab;
+          --accent:#60a5fa; --ok:#4ade80; --bad:#f87171}
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 16px;
+         background:var(--panel);border-bottom:1px solid var(--border)}
+  header h1{font-size:15px;margin:0;font-weight:600}
+  .pill{font-size:11px;padding:2px 8px;border-radius:99px;border:1px solid var(--border);color:var(--muted)}
+  .pill.ok{color:var(--ok);border-color:var(--ok)} .pill.bad{color:var(--bad);border-color:var(--bad)}
+  main{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:12px;padding:12px;
+       max-width:1400px;margin:0 auto}
+  @media (max-width:900px){main{grid-template-columns:1fr}}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+  .panel>h2{margin:0;padding:9px 12px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;
+            color:var(--muted);border-bottom:1px solid var(--border)}
+  .body{padding:12px}
+  textarea{width:100%;min-height:70px;resize:vertical;padding:8px;border:1px solid var(--border);
+           border-radius:6px;background:var(--bg);color:var(--text);font:inherit}
+  .barra{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px}
+  select,input[type=number]{padding:4px 6px;border:1px solid var(--border);border-radius:6px;
+           background:var(--bg);color:var(--text);font:inherit}
+  input[type=number]{width:56px}
+  button{padding:7px 16px;border:0;border-radius:6px;background:var(--accent);color:#fff;
+         font:inherit;font-weight:600;cursor:pointer}
+  button:disabled{opacity:.5;cursor:wait}
+  label{color:var(--muted);font-size:12px}
+  #respuesta{white-space:pre-wrap;min-height:40px}
+  .cita{color:var(--accent);cursor:pointer;font-weight:600}
+  .vacio{color:var(--muted)}
+  .error{color:var(--bad)}
+  .fuente{border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-bottom:8px}
+  .fuente.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+  .fuente h3{margin:0 0 2px;font-size:13px}
+  .fuente .meta{color:var(--muted);font-size:11px;font-family:var(--mono)}
+  .fuente p{margin:6px 0 0;font-size:12px;color:var(--muted);display:-webkit-box;
+            -webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+  .fuente.abierta p{display:block}
+  a{color:var(--accent)}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--border);vertical-align:top}
+  th{color:var(--muted);font-weight:600}
+  td.n{font-family:var(--mono);text-align:right}
+  details{margin-top:8px;font-size:12px;color:var(--muted)}
+  pre{margin:4px 0;white-space:pre-wrap;word-break:break-all;font:11px/1.4 var(--mono)}
+</style>
+</head>
+<body>
+<header>
+  <h1>RAG sobre papers de arXiv</h1>
+  <span class="pill" id="p-motor">motor …</span>
+  <span class="pill" id="p-ollama">ollama …</span>
+  <span class="pill" id="p-papers">— papers</span>
+  <span class="pill" id="p-modelos"></span>
+</header>
+
+<main>
+  <div>
+    <section class="panel">
+      <h2>Pregunta</h2>
+      <div class="body">
+        <textarea id="pregunta" placeholder="Ej.: ¿Qué se ha investigado sobre generación de recetas con IA?"></textarea>
+        <div class="barra">
+          <label>Búsqueda
+            <select id="modo">
+              <option value="hibrido">Híbrida (BM25 + vectorial)</option>
+              <option value="bm25">Solo BM25</option>
+              <option value="vectorial">Solo vectorial</option>
+            </select>
+          </label>
+          <label>Papers <input type="number" id="k" value="5" min="1" max="10"></label>
+          <label title="El corpus está en inglés: el LLM traduce la pregunta a una consulta en inglés antes de buscar">
+            <input type="checkbox" id="reescribir" checked> Reescribir en inglés</label>
+          <button id="enviar">Preguntar</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-top:12px">
+      <h2>Respuesta</h2>
+      <div class="body">
+        <div id="respuesta" class="vacio">Aún no hay respuesta.</div>
+        <div id="consulta" class="meta" style="margin-top:8px;color:var(--muted);font-size:12px"></div>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-top:12px">
+      <h2>Fuentes recuperadas por el motor</h2>
+      <div class="body" id="fuentes"><span class="vacio">—</span></div>
+    </section>
+  </div>
+
+  <div>
+    <section class="panel">
+      <h2>Métricas del motor (por consulta SQL)</h2>
+      <div class="body" id="metricas"><span class="vacio">—</span></div>
+    </section>
+    <section class="panel" style="margin-top:12px">
+      <h2>Tiempos de la petición</h2>
+      <div class="body" id="tiempos"><span class="vacio">—</span></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const ms = v => v == null ? '—' : (v >= 1000 ? (v/1000).toFixed(1) + ' s' : v.toFixed(1) + ' ms');
+
+async function salud() {
+  try {
+    const s = await (await fetch('/api/salud')).json();
+    $('#p-motor').textContent = s.motor ? 'motor ✓' : 'motor ✗';
+    $('#p-motor').className = 'pill ' + (s.motor ? 'ok' : 'bad');
+    $('#p-ollama').textContent = s.ollama ? 'ollama ✓' : 'ollama ✗';
+    $('#p-ollama').className = 'pill ' + (s.ollama ? 'ok' : 'bad');
+    $('#p-papers').textContent = s.papers + ' papers';
+    $('#p-papers').className = 'pill ' + (s.papers > 0 ? 'ok' : 'bad');
+    $('#p-modelos').textContent = s.emb + ' · ' + s.llm;
+  } catch (e) { $('#p-motor').className = 'pill bad'; }
+}
+
+function pintarRespuesta(txt) {
+  $('#respuesta').className = '';
+  $('#respuesta').innerHTML = esc(txt).replace(/\[(\d+)\]/g,
+    (m, id) => `<span class="cita" data-id="${id}">[${id}]</span>`);
+}
+
+function pintarFuentes(fs) {
+  if (!fs.length) { $('#fuentes').innerHTML = '<span class="vacio">Sin resultados.</span>'; return; }
+  $('#fuentes').innerHTML = fs.map(d => `
+    <div class="fuente" id="f-${d.id}">
+      <h3>[${d.id}] ${esc(d.titulo)}</h3>
+      <div class="meta">${esc(d.cat)} · ${d.anio} ·
+        <a href="https://arxiv.org/abs/${esc(d.arxiv_id)}" target="_blank" rel="noopener">${esc(d.arxiv_id)}</a>
+        · RRF ${d.rrf.toFixed(4)}
+        · BM25 ${d.rank_bm25 ? '#' + d.rank_bm25 + ' (' + d.bm25.toFixed(2) + ')' : '—'}
+        · vector ${d.rank_vec ? '#' + d.rank_vec + ' (d=' + d.distancia.toFixed(3) + ')' : '—'}</div>
+      <p>${esc(d.abstract)}</p>
+    </div>`).join('');
+}
+
+function pintarMetricas(ms_) {
+  if (!ms_.length) { $('#metricas').innerHTML = '<span class="vacio">—</span>'; return; }
+  const fila = m => m.error
+    ? `<tr><td>${esc(m.consulta)}</td><td colspan="4" class="error">${esc(m.error)}</td></tr>`
+    : `<tr><td>${esc(m.consulta)}</td><td class="n">${m.filas}</td><td class="n">${m.disk_reads}</td>
+           <td class="n">${m.page_accesses}</td><td class="n">${ms(m.total_ms)}</td></tr>`;
+  $('#metricas').innerHTML = `<table>
+    <tr><th>Consulta</th><th>Filas</th><th>I/O reads</th><th>Accesos pág.</th><th>Tiempo</th></tr>
+    ${ms_.map(fila).join('')}</table>` +
+    ms_.filter(m => !m.error).map(m => `<details><summary>${esc(m.consulta)} · ${esc(m.metodo)}</summary>
+      <pre>${esc(m.sql)}</pre><pre>${esc(m.plan.join('\n'))}</pre></details>`).join('');
+}
+
+function pintarTiempos(t) {
+  const filas = [['Reescritura de la pregunta (LLM)', t.reescritura_ms], ['Embedding (all-minilm)', t.embedding_ms],
+                 ['Recuperación en el motor', t.motor_ms], ['Generación de la respuesta (LLM)', t.generacion_ms]];
+  $('#tiempos').innerHTML = '<table>' + filas.map(([n, v]) =>
+    `<tr><td>${n}</td><td class="n">${ms(v)}</td></tr>`).join('') + '</table>';
+}
+
+async function preguntar() {
+  const pregunta = $('#pregunta').value.trim();
+  if (!pregunta) return;
+  const btn = $('#enviar'); btn.disabled = true; btn.textContent = 'Pensando…';
+  $('#respuesta').className = 'vacio'; $('#respuesta').textContent = 'Buscando en el motor y generando la respuesta…';
+  try {
+    const r = await fetch('/ask', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pregunta, modo: $('#modo').value, k: +$('#k').value,
+                            reescribir: $('#reescribir').checked})});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.status);
+    pintarRespuesta(d.respuesta);
+    $('#consulta').textContent = 'Consulta de búsqueda: “' + d.consulta + '” · modo ' + d.modo;
+    pintarFuentes(d.fuentes); pintarMetricas(d.metricas); pintarTiempos(d.tiempos);
+  } catch (e) {
+    $('#respuesta').className = 'error'; $('#respuesta').textContent = 'Error: ' + e.message;
+  } finally { btn.disabled = false; btn.textContent = 'Preguntar'; salud(); }
+}
+
+document.addEventListener('click', e => {
+  const c = e.target.closest('.cita');
+  if (c) {
+    document.querySelectorAll('.fuente.sel').forEach(x => x.classList.remove('sel'));
+    const f = document.getElementById('f-' + c.dataset.id);
+    if (f) { f.classList.add('sel', 'abierta'); f.scrollIntoView({behavior: 'smooth', block: 'center'}); }
+  }
+});
+$('#enviar').addEventListener('click', preguntar);
+$('#pregunta').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) preguntar(); });
+salud();
+</script>
+</body>
+</html>
