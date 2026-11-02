@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <cstdlib>
+#include <sstream>
 
 namespace db {
 
@@ -144,6 +145,7 @@ private:
         if (k == "SELECT") return parseSelect();
         if (k == "DELETE") return parseDelete();
         if (k == "COPY")   return parseCopy();
+        if (k == "SET")    return parseSet();
         throw DBException("Sentencia no soportada: '" + k +
                           "'. Se admiten CREATE TABLE, CREATE INDEX, INSERT, SELECT y DELETE.");
     }
@@ -213,10 +215,31 @@ private:
         return Value::makePolygon(std::move(vs));
     }
 
+    // Las componentes de un vector escrito dentro de una cadena:
+    // '[0.12, -0.34, 0.56]'. El enunciado lo escribe asi, y es tambien como lo
+    // manda pgvector, que trata el vector como un literal de texto.
+    static std::vector<float> vectorDeTexto(const std::string& crudo) {
+        std::string limpio = crudo;
+        for (char& c : limpio)
+            if (c == '[' || c == ']' || c == ',' || c == ';') c = ' ';
+        std::vector<float> vs;
+        std::istringstream ss(limpio);
+        double x;
+        while (ss >> x) vs.push_back(static_cast<float>(x));
+        if (vs.empty())
+            throw DBException("El vector '" + crudo + "' no tiene ninguna componente");
+        return vs;
+    }
+
     // Literal vector: [v1, v2, ..., vd]. Se admiten enteros, decimales y
     // notacion cientifica; todo se guarda en float32, que es como lo almacena
-    // el registro.
+    // el registro. Tambien vale la forma entrecomillada '[v1, ..., vd]'.
     std::vector<float> esperaVector() {
+        if (cur().tipo == Tok::STRING) {
+            std::vector<float> vs = vectorDeTexto(cur().texto);
+            avanza();
+            return vs;
+        }
         esperaSimbolo("[");
         std::vector<float> vs;
         if (esSimbolo("]")) {
@@ -247,6 +270,12 @@ private:
         if (esPalabra("POINT"))   return esperaPunto();
         if (esPalabra("POLYGON")) return esperaPoligono();
         if (esSimbolo("["))       return Value::makeVector(esperaVector());
+        // Una cadena que empieza por '[' es un vector, no texto. Se mira el
+        // contenido y no el tipo del token porque el enunciado entrecomilla
+        // los vectores.
+        if (cur().tipo == Tok::STRING && !cur().texto.empty() &&
+            cur().texto.find('[') != std::string::npos)
+            return Value::makeVector(esperaVector());
         if (cur().tipo == Tok::NUMBER) {
             Value v = cur().decimal ? Value::makeDouble(std::atof(cur().texto.c_str()))
                                     : Value::makeInt(std::atoll(cur().texto.c_str()));
@@ -349,6 +378,75 @@ private:
         return st;
     }
 
+    // SET ivf.probes = 5;
+    // Configuracion de sesion. Se parsea generica --- clave punteada igual a un
+    // entero --- para que anadir otra perilla no exija tocar el parser.
+    Statement parseSet() {
+        Statement st;
+        st.kind = StmtKind::SET_;
+        std::string clave = esperaIdent();
+        while (esSimbolo(".")) { avanza(); clave += "." + esperaIdent(); }
+        esperaSimbolo("=");
+        st.set_clave = clave;
+        st.set_valor = esperaEntero();
+        finSentencia();
+        return st;
+    }
+
+    // WITH ( clave = valor, ... ) para los parametros de un indice.
+    void parseWith(Statement* st) {
+        esperaSimbolo("(");
+        while (true) {
+            const std::string clave = esperaIdent();
+            esperaSimbolo("=");
+
+            std::string valor_txt;
+            long long   valor_num = 0;
+            bool        es_num    = false;
+            if (cur().tipo == Tok::NUMBER) { valor_num = esperaEntero(); es_num = true; }
+            else if (cur().tipo == Tok::STRING || cur().tipo == Tok::IDENT) {
+                valor_txt = upper(cur().texto);
+                avanza();
+            } else {
+                throw DBException("WITH: se esperaba un valor para '" + clave +
+                                  "' y se encontro '" + cur().texto + "'");
+            }
+
+            if (clave == "LISTS" || clave == "LISTAS") {
+                if (!es_num || valor_num <= 0)
+                    throw DBException("WITH: lists tiene que ser un entero positivo");
+                if (st->index_kind != IndexKind::IVF)
+                    throw DBException("WITH: lists solo aplica a un indice IVF");
+                st->index_listas = static_cast<int>(valor_num);
+            } else if (clave == "METRIC" || clave == "METRICA") {
+                if (st->index_kind != IndexKind::IVF)
+                    throw DBException("WITH: metric solo aplica a un indice IVF");
+                if (valor_txt == "COSINE" || valor_txt == "COSENO")      st->index_metrica = "COSINE";
+                else if (valor_txt == "L2" || valor_txt == "EUCLIDEAN")  st->index_metrica = "L2";
+                else throw DBException("WITH: metrica no soportada: '" + valor_txt +
+                                       "'. Use COSINE o L2.");
+            } else if (clave == "SCORING") {
+                if (st->index_kind != IndexKind::INVERTED)
+                    throw DBException("WITH: scoring solo aplica a un indice INVERTED");
+                if (valor_txt == "TFIDF_COSINE" || valor_txt == "TFIDF" ||
+                    valor_txt == "COSINE")                      st->index_scoring = "TFIDF_COSINE";
+                else if (valor_txt == "BM25" || valor_txt == "OKAPI") st->index_scoring = "BM25";
+                else throw DBException("WITH: scoring no soportado: '" + valor_txt +
+                                       "'. Use TFIDF_COSINE o BM25.");
+            } else if (clave == "LANGUAGE" || clave == "IDIOMA") {
+                if (st->index_kind != IndexKind::INVERTED)
+                    throw DBException("WITH: language solo aplica a un indice INVERTED");
+                st->index_idioma = valor_txt;
+            } else {
+                throw DBException("WITH: parametro desconocido '" + clave +
+                                  "'. Se admiten lists, metric, scoring y language.");
+            }
+            if (esSimbolo(",")) { avanza(); continue; }
+            break;
+        }
+        esperaSimbolo(")");
+    }
+
     Statement parseCreateIndex() {
         Statement st;
         st.kind       = StmtKind::CREATE_INDEX;
@@ -409,6 +507,7 @@ private:
                 throw DBException(std::string(es_listas ? "LISTS" : "METRIC") +
                                   " solo aplica a un indice IVF");
         }
+        if (esPalabra("WITH")) { avanza(); parseWith(&st); }
         finSentencia();
         return st;
     }
@@ -447,7 +546,33 @@ Statement parseInsert() {
         if (esSimbolo("*")) { avanza(); }
         else {
             while (true) {
-                st.select_columns.push_back(esperaNombre());
+                // COSINE_SCORE() AS relevancia  --- la relevancia textual no es
+                // una columna de la tabla, es el resultado del ranking. Se deja
+                // pedir por nombre para que el ORDER BY pueda referirse a ella.
+                if (esPalabra("COSINE_SCORE") || esPalabra("SCORE")) {
+                    avanza();
+                    esperaSimbolo("(");
+                    esperaSimbolo(")");
+                    st.columna_puntaje = "score";
+                    if (esPalabra("AS")) { avanza(); st.columna_puntaje = esperaNombre(); }
+                } else {
+                    const std::string nom = esperaNombre();
+                    // col <=> [..] AS dist   --- la distancia vectorial pedida
+                    // como columna. Es la misma consulta de similitud, escrita
+                    // en el SELECT en vez de en el ORDER BY.
+                    if (esSimbolo("<=>") || esSimbolo("<->")) {
+                        const bool cos = esSimbolo("<=>");
+                        avanza();
+                        st.knn_column    = nom;
+                        st.knn_vector    = esperaVector();
+                        st.knn_vectorial = true;
+                        st.knn_coseno    = cos;
+                        st.columna_puntaje = "distancia";
+                        if (esPalabra("AS")) { avanza(); st.columna_puntaje = esperaNombre(); }
+                    } else {
+                        st.select_columns.push_back(nom);
+                    }
+                }
                 if (esSimbolo(",")) { avanza(); continue; }
                 break;
             }
@@ -464,20 +589,32 @@ Statement parseInsert() {
                 st.knn     = true;
                 st.knn_geo = true;
             } else {
-                st.knn_column = esperaNombre();
+                // OJO: el nombre se guarda aparte y NO en st.knn_column, porque
+                // todavia no se sabe si es una columna o el alias de una
+                // expresion que ya venia resuelta desde el SELECT. Escribir
+                // st.knn_column aqui pisaria la columna real de esa expresion.
+                const std::string nombre_orden = esperaNombre();
                 // El OPERADOR elige la distancia: <=> es coseno y <-> es L2.
                 // No es decoracion: tiene que coincidir con la metrica con la
                 // que se entreno el indice, porque las dos no ordenan igual.
                 if (esSimbolo("<=>") || esSimbolo("<->")) {
                     const bool cos = esSimbolo("<=>");
                     avanza();
-                    if (esSimbolo("[")) {
+                    // El vector puede venir suelto, [..], o entrecomillado,
+                    // '[..]', que es como lo escribe el enunciado.
+                    const bool hay_vector =
+                        esSimbolo("[") ||
+                        (cur().tipo == Tok::STRING &&
+                         cur().texto.find('[') != std::string::npos);
+                    if (hay_vector) {
                         // Similitud vectorial. Camino aparte del espacial: otra
                         // distancia, otro indice y otro tipo de columna.
+                        st.knn_column    = nombre_orden;
                         st.knn_vector    = esperaVector();
                         st.knn_vectorial = true;
                         st.knn_coseno    = cos;
                     } else if (!cos) {
+                        st.knn_column = nombre_orden;
                         Value p = esperaPunto();
                         st.knn   = true;
                         st.knn_x = p.d;
@@ -485,18 +622,44 @@ Statement parseInsert() {
                     } else {
                         throw DBException(
                             "El operador <=> compara embeddings, no puntos: ORDER BY " +
-                            st.knn_column + " <=> [v1, ..., vd]. Para un POINT use <->. "
+                            nombre_orden + " <=> [v1, ..., vd]. Para un POINT use <->. "
                             "Se encontro '" + cur().texto + "'.");
                     }
+                } else if (!st.columna_puntaje.empty() &&
+                           upper(nombre_orden) == upper(st.columna_puntaje)) {
+                    // ORDER BY <alias de la columna calculada>. No cambia nada:
+                    // el indice ya entrega en ese orden. Se acepta porque es
+                    // como lo escribe el enunciado, y se valida el sentido:
+                    // un puntaje se ordena DESC y una distancia ASC. Pedir lo
+                    // contrario no es un orden distinto sino otra consulta --- los
+                    // k PEORES --- y el indice de top-k no sabe responderla.
+                    const bool es_distancia = st.knn_vectorial || st.knn;
+                    bool desc = !es_distancia;
+                    if (esPalabra("ASC"))       { avanza(); desc = false; }
+                    else if (esPalabra("DESC")) { avanza(); desc = true;  }
+                    if (desc == es_distancia)
+                        throw DBException(
+                            std::string("ORDER BY ") + nombre_orden + " " +
+                            (desc ? "DESC" : "ASC") + " no se puede resolver con un indice "
+                            "de top-k: " + (es_distancia
+                                ? "una distancia se ordena ASC (lo mas parecido primero)"
+                                : "un puntaje de relevancia se ordena DESC (lo mas relevante primero)") +
+                            ". Al reves estarias pidiendo los peores, que es otra consulta.");
+                    st.orden_alias = nombre_orden;
+                    st.orden_desc  = desc;
                 } else {
                     throw DBException(
-                        "Solo se admite ordenar por distancia: ORDER BY " + st.knn_column +
-                        " <-> POINT(x, y), ORDER BY " + st.knn_column +
-                        " <=> [v1, ..., vd], o bien ORDER BY ST_DISTANCE(" + st.knn_column +
-                        ", POINT(lon, lat)). Se encontro '" + cur().texto + "'.");
+                        "Solo se admite ordenar por distancia: ORDER BY " + nombre_orden +
+                        " <-> POINT(x, y), ORDER BY " + nombre_orden +
+                        " <=> [v1, ..., vd], ORDER BY ST_DISTANCE(" + nombre_orden +
+                        ", POINT(lon, lat)), o por el alias de una columna calculada del "
+                        "SELECT. Se encontro '" + cur().texto + "'.");
                 }
             }
         }
+        // Un ASC suelto tras ORDER BY ... <=> [..] es redundante pero legal:
+        // el orden por distancia ya es ascendente.
+        if (esPalabra("ASC")) avanza();
         if (esPalabra("LIMIT")) { avanza(); st.limit = esperaEntero(); }
         // PROBES va DESPUES de LIMIT porque no es parte del orden ni del
         // recorte: es cuantas celdas del IVF se visitan, o sea cuanto esfuerzo
@@ -552,6 +715,28 @@ Statement parseInsert() {
             pr.qlon = q.d;
             pr.qlat = q.y;
             pr.kind = PredKind::CONTIENE;
+            return pr;
+        }
+
+        // Radio geografico, forma del enunciado:
+        //    col WITHIN_RADIUS((lon, lat), km)
+        // Ojo con la unidad: aqui el radio viene en KILOMETROS, mientras que
+        // ST_DISTANCE(...) <= x lo toma en metros. Se convierte al entrar para
+        // que el motor siga teniendo una sola representacion.
+        if (cur().tipo == Tok::IDENT && ts_[p_ + 1].tipo == Tok::IDENT &&
+            ts_[p_ + 1].texto == "WITHIN_RADIUS") {
+            pr.column = esperaNombre();
+            esperaPalabra("WITHIN_RADIUS");
+            esperaSimbolo("(");
+            esperaSimbolo("(");
+            pr.qlon = esperaDouble();
+            esperaSimbolo(",");
+            pr.qlat = esperaDouble();
+            esperaSimbolo(")");
+            esperaSimbolo(",");
+            pr.metros = esperaDouble() * 1000.0;
+            esperaSimbolo(")");
+            pr.kind = PredKind::RADIO;
             return pr;
         }
 
@@ -617,6 +802,7 @@ Statement parseInsert() {
                 else if (modelo == "BM25" || modelo == "OKAPI") pr.usar_tfidf = false;
                 else throw DBException("Modelo de ranking no soportado: '" + modelo +
                                        "'. Use BM25 o TFIDF.");
+                pr.ranking_explicito = true;
             }
             pr.kind = PredKind::MATCH;
             return pr;

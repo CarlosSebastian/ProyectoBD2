@@ -97,10 +97,37 @@ g++ -std=c++17 -O2 -Ibackend/include -Ibenchmarks -DDB_PAGE_SIZE=$PAGE \
     benchmarks/exp6_texto.cpp $LIB -o "build/exp6_texto$EXE"
 "./build/exp6_texto$EXE" data 50000 20 >> "$SALIDA"
 
-echo "==> exp7 (modulo vectorial)"
+# El Experimento 7 necesita el dataset multimedia, que prepara un script de
+# Python aparte (SIFT, codebook y red no son cosa del motor). Si no esta, se
+# salta con un aviso en vez de fallar el benchmark entero.
+if [ -f "data/bovw_palabras.csv" ]; then
+    echo "==> exp7 (BoVW contra embeddings densos)"
+    g++ -std=c++17 -O2 -Ibackend/include -Ibenchmarks -DDB_PAGE_SIZE=$PAGE \
+        benchmarks/exp7_bovw.cpp $LIB -o "build/exp7_bovw$EXE"
+    "./build/exp7_bovw$EXE" data >> "$SALIDA"
+else
+    echo "==> exp7 OMITIDO: falta data/bovw_palabras.csv"
+    {
+        echo ""
+        echo "## EXPERIMENTO 7 - no ejecutado"
+        echo ""
+        echo "Falta el dataset multimedia. Para generarlo:"
+        echo ""
+        echo '    python benchmarks/bovw_preparar.py --imagenes <carpeta> --onnx <resnet18.onnx> --salida data'
+        echo ""
+    } >> "$SALIDA"
+fi
+
+echo "==> exp8 (ANN: recall contra latencia)"
 g++ -std=c++17 -O2 -Ibackend/include -Ibenchmarks -DDB_PAGE_SIZE=$PAGE \
-    benchmarks/exp7_vectorial.cpp $LIB -o "build/exp7_vectorial$EXE"
-"./build/exp7_vectorial$EXE" data 20000 50 >> "$SALIDA"
+    benchmarks/exp8_ann.cpp $LIB -o "build/exp8_ann$EXE"
+"./build/exp8_ann$EXE" data 20000 50 >> "$SALIDA"
 
 echo ""
 echo "==> listo: $SALIDA"
+echo ""
+echo "    Falta la segunda mitad del Experimento 6 (el GIN de PostgreSQL), que"
+echo "    necesita un servidor y por eso no corre aqui:"
+echo ""
+echo "      python benchmarks/exp6_gin.py --csv data/exp6_corpus.csv \\"
+echo "                                    --consultas data/exp6_consultas.txt"

@@ -1,5 +1,6 @@
 // ============================================================================
-//  Experimento 7 - Modulo vectorial: IVF, recall y latencia
+//  Experimento 8 - Compromiso eficiencia contra calidad en busqueda
+//                  aproximada (ANN)
 //
 //  Un indice vectorial no se juzga como los otros cuatro. El B+, el hash y el
 //  R-Tree son EXACTOS: lo unico que se mide en ellos es el costo. El IVF es
@@ -31,7 +32,7 @@
 //  es justo esa estructura la que k-means puede encontrar. Con vectores
 //  uniformes no hay nada que agrupar y el IVF saldria injustamente mal.
 //
-//     ./build/exp7_vectorial [dir] [N_max] [consultas]
+//     ./build/exp8_ann [dir] [N_max] [consultas]
 // ============================================================================
 #include <cmath>
 #include <set>
@@ -111,9 +112,10 @@ std::vector<float> consultaDe(const std::vector<float>& datos, int dim, int i) {
 }
 
 struct Calidad {
-    double recall = 0.0;
-    double ms     = 0.0;
-    double accesos = 0.0;
+    double recall   = 0.0;
+    double ms       = 0.0;
+    double accesos  = 0.0;
+    double lecturas = 0.0;   // bloques FISICOS traidos de disco
 };
 
 // Recall@k medio y costo medio sobre un juego de consultas. La referencia es
@@ -135,14 +137,16 @@ Calidad medir(const IVFIndex& ivf, const std::vector<std::vector<float>>& consul
         for (const IVFIndex::Resultado& r : aprox)
             if (verdad.count({r.rid.page_id, r.rid.slot})) ++aciertos;
 
-        q.recall  += verdad.empty() ? 1.0 : static_cast<double>(aciertos) / static_cast<double>(verdad.size());
-        q.ms      += m.ms;
-        q.accesos += static_cast<double>(m.accesos);
+        q.recall   += verdad.empty() ? 1.0 : static_cast<double>(aciertos) / static_cast<double>(verdad.size());
+        q.ms       += m.ms;
+        q.accesos  += static_cast<double>(m.accesos);
+        q.lecturas += static_cast<double>(m.lecturas);
     }
     const double n = static_cast<double>(std::max<std::size_t>(1, consultas.size()));
-    q.recall /= n;
-    q.ms     /= n;
-    q.accesos /= n;
+    q.recall   /= n;
+    q.ms       /= n;
+    q.accesos  /= n;
+    q.lecturas /= n;
     return q;
 }
 
@@ -164,7 +168,7 @@ int main(int argc, char** argv) {
     const int DIM         = 128;
     const int K           = 10;
 
-    titulo("EXPERIMENTO 7 - Modulo vectorial: IVF, recall y latencia");
+    titulo("EXPERIMENTO 8 - Eficiencia contra calidad en busqueda aproximada (ANN)");
     std::cout << "\nVectores agrupados en nubes gaussianas, dimension " << DIM
               << ", metrica coseno.\n"
                  "Recall@" << K << " medido contra fuerza bruta sobre el mismo indice, "
@@ -177,7 +181,7 @@ int main(int argc, char** argv) {
     for (int N : {1000, 2500, 5000, 10000, 20000, 40000}) {
         if (N > N_MAX) break;
         const std::vector<float> datos = generarVectores(N, DIM, 24, 2026);
-        Montaje m = montar(dir, "exp7_a");
+        Montaje m = montar(dir, "exp8_a");
         Cronometro c;
         m.ivf->construir(fuenteDe(datos, N, DIM), DIM, 0, IVFIndex::Metrica::COSENO);
         const Medicion med = c.parar();
@@ -205,7 +209,7 @@ int main(int argc, char** argv) {
         separador(8);
         for (int nl : {1, 4, 16, 64, 141, 400, 1000}) {
             if (nl > N) break;
-            Montaje m = montar(dir, "exp7_b");
+            Montaje m = montar(dir, "exp8_b");
             m.ivf->construir(fuenteDe(datos, N, DIM), DIM, nl, IVFIndex::Metrica::COSENO);
             const int np = m.ivf->nprobePorDefecto();
             const Calidad q = medir(*m.ivf, consultas, K, np);
@@ -234,7 +238,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < N_CONSULTAS; ++i)
             consultas.push_back(consultaDe(datos, DIM, (i * 7919) % N));
 
-        Montaje m = montar(dir, "exp7_c");
+        Montaje m = montar(dir, "exp8_c");
         m.ivf->construir(fuenteDe(datos, N, DIM), DIM, 0, IVFIndex::Metrica::COSENO);
         const int nlist = m.ivf->listas();
 
@@ -250,14 +254,18 @@ int main(int argc, char** argv) {
                   << ", fuerza bruta: " << num(ms_exacta, 3) << " ms y "
                   << num(ac_exacta, 1) << " accesos a pagina por consulta.\n\n";
 
-        fila({"nprobe", "% celdas", "recall@10", "accesos/consulta", "ms/consulta",
-              "aceleracion", "% del I/O exacto"});
-        separador(7);
-        for (int np : {1, 2, 4, 8, 16, 32, 64, nlist}) {
+        // Los valores de probes son los que fija el enunciado.
+        fila({"nprobe", "% celdas", "recall@10", "accesos/consulta", "bloques leidos",
+              "ms/consulta", "aceleracion", "% del I/O exacto"});
+        separador(8);
+        std::vector<int> probes = {1, 2, 5, 10, 20, 50};
+        if (std::find(probes.begin(), probes.end(), nlist) == probes.end())
+            probes.push_back(nlist);          // el extremo: visitarlo todo
+        for (int np : probes) {
             if (np > nlist) continue;
             const Calidad q = medir(*m.ivf, consultas, K, np);
             fila({std::to_string(np), num(100.0 * np / nlist, 1) + " %",
-                  num(q.recall, 4), num(q.accesos, 1), num(q.ms, 3),
+                  num(q.recall, 4), num(q.accesos, 1), num(q.lecturas, 1), num(q.ms, 3),
                   num(q.ms > 0 ? ms_exacta / q.ms : 0.0, 1) + "x",
                   num(ac_exacta > 0 ? 100.0 * q.accesos / ac_exacta : 0.0, 1) + " %"});
         }
@@ -286,7 +294,7 @@ int main(int argc, char** argv) {
             for (int i = 0; i < N_CONSULTAS; ++i)
                 consultas.push_back(consultaDe(datos, dim, (i * 7919) % N));
 
-            Montaje m = montar(dir, "exp7_d");
+            Montaje m = montar(dir, "exp8_d");
             m.ivf->construir(fuenteDe(datos, N, dim), dim, 0, IVFIndex::Metrica::COSENO);
             const int bytes = 8 + 4 + dim * 4;
             const Calidad q = medir(*m.ivf, consultas, K, m.ivf->nprobePorDefecto());

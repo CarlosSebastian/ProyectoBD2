@@ -87,9 +87,13 @@ private:
     QueryResult ejecutarSelect(const Statement& st);
     QueryResult ejecutarDelete(const Statement& st);
     QueryResult ejecutarCopy(const Statement& st);
+    QueryResult ejecutarSet(const Statement& st);
 
     std::string data_dir_;
     int         pool_size_;
+    // Valor por defecto de PROBES fijado con 'SET ivf.probes = n'. -1 = sin
+    // fijar, y entonces manda el que calcula el propio indice.
+    int         probes_sesion_ = -1;
     Catalog     catalog_;
     std::map<std::string, std::unique_ptr<Table>> abiertas_;
 };

@@ -239,6 +239,7 @@ QueryResult Database::ejecutarStatement(const Statement& st) {
         case StmtKind::SELECT:       r = ejecutarSelect(st);      break;
         case StmtKind::DELETE_:      r = ejecutarDelete(st);      break;
         case StmtKind::COPY:         r = ejecutarCopy(st);        break;
+        case StmtKind::SET_:         r = ejecutarSet(st);         break;
     }
     if (st.kind == StmtKind::CREATE_TABLE || st.kind == StmtKind::CREATE_INDEX ||
         st.kind == StmtKind::INSERT       || st.kind == StmtKind::DELETE_    ||
@@ -409,8 +410,10 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
     ix.column = st.index_column;
     ix.kind   = st.index_kind;
     ix.file   = st.table + "_" + st.index_column + ".idx";
-    if (st.index_kind == IndexKind::INVERTED)
-        ix.idioma = texto::nombreIdioma(texto::idiomaDesdeNombre(st.index_idioma));
+    if (st.index_kind == IndexKind::INVERTED) {
+        ix.idioma  = texto::nombreIdioma(texto::idiomaDesdeNombre(st.index_idioma));
+        ix.scoring = st.index_scoring;
+    }
     if (st.index_kind == IndexKind::IVF) {
         ix.listas  = st.index_listas;          // 0 => que el IVF use sqrt(N)
         ix.metrica = IVFIndex::nombreMetrica(IVFIndex::metricaDesdeNombre(st.index_metrica));
@@ -425,7 +428,8 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
     r.metodo  = "DDL";
     r.message = "Indice '" + st.index_name + "' creado sobre " + st.table + "(" + st.index_column +
                 ") usando " + indexKindName(st.index_kind) +
-                (st.index_kind == IndexKind::INVERTED ? " (idioma " + ix.idioma + ")" : "") + ". " +
+                (st.index_kind == IndexKind::INVERTED
+                     ? " (idioma " + ix.idioma + ", scoring " + ix.scoring + ")" : "") + ". " +
                 std::to_string(t->count()) + " filas indexadas. La tabla tiene ahora " +
                 std::to_string(t->numIndices()) + " indice(s).";
     if (st.index_kind == IndexKind::IVF) {
@@ -600,6 +604,29 @@ QueryResult Database::ejecutarCopy(const Statement& st) {
     return r;
 }
 
+// SET <clave> = <n>. Configuracion de sesion: no toca disco ni el catalogo,
+// solo cambia el valor por defecto que usaran las siguientes consultas.
+QueryResult Database::ejecutarSet(const Statement& st) {
+    QueryResult r;
+    auto t0 = Clock::now();
+    if (st.set_clave == "IVF.PROBES" || st.set_clave == "PROBES") {
+        if (st.set_valor <= 0)
+            throw DBException("ivf.probes tiene que ser positivo; se recibio " +
+                              std::to_string(st.set_valor));
+        probes_sesion_ = static_cast<int>(st.set_valor);
+        r.metodo  = "SET";
+        r.message = "ivf.probes = " + std::to_string(probes_sesion_) +
+                    " para las siguientes consultas. Una consulta puede pedir otro "
+                    "valor con PROBES n, que tiene prioridad.";
+    } else {
+        throw DBException("Parametro de sesion desconocido: '" + st.set_clave +
+                          "'. Se admite ivf.probes.");
+    }
+    r.exec_ms = msDesde(t0);
+    r.plan.push_back(PlanStep{"SET", r.exec_ms, r.message});
+    return r;
+}
+
 QueryResult Database::ejecutarInsert(const Statement& st) {
     QueryResult r;
     auto t0 = Clock::now();
@@ -688,6 +715,8 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     // notaria mirando el resultado.
     const IndexInfo* ix_vec = st.knn_vectorial ? ti.findIndex(st.knn_column) : nullptr;
     const bool knn_cos = st.knn_coseno;
+    // PROBES de la consulta > SET de la sesion > el que calcula el indice.
+    const int probes_ef = st.probes > 0 ? st.probes : probes_sesion_;
 
     // Texto de una sola linea con el reparto de las celdas del IVF. Un reparto
     // muy desigual es la explicacion de por que dos consultas con el mismo
@@ -723,7 +752,7 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
         ruta = "IndexVectorKNN";
         detalle_ruta = "IVF sobre " + st.knn_column + ", k=" +
                        (st.limit >= 0 ? std::to_string(st.limit) : std::string("todos")) +
-                       ", " + detalleIVF(t->indiceVector(st.knn_column), st.probes);
+                       ", " + detalleIVF(t->indiceVector(st.knn_column), probes_ef);
         if (t->vectorDesactualizado())
             detalle_ruta += "; el indice se reconstruira antes de responder";
     } else if (st.knn) {
@@ -747,18 +776,26 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
             throw DBException("MATCH necesita un indice INVERTED sobre '" + cond.column +
                               "'. Crealo con: CREATE INDEX ix ON " + st.table +
                               " (" + cond.column + ") USING INVERTED;");
-        ruta = "IndexMatch";
+        // Si la consulta no trajo USING, el modelo de puntuacion lo decide el
+        // indice: es con lo que se creo y es lo que el usuario declaro querer.
+        if (!cond.ranking_explicito) cond.usar_tfidf = (ix->scoring == "TFIDF_COSINE");
+        const bool booleana = InvertedIndex::tieneBooleanos(cond.consulta);
+        ruta = booleana ? "IndexBooleanMatch" : "IndexMatch";
         const InvertedIndex* inv = t->indiceTexto(cond.column);
         detalle_ruta = std::string("indice invertido sobre ") + cond.column +
                        ", ranking " + (cond.usar_tfidf ? "TF-IDF (coseno)" : "BM25") +
                        ", idioma " + ix->idioma;
+        if (booleana)
+            detalle_ruta += "; recuperacion booleana por mezcla de dos punteros O(n+m) "
+                            "sobre las listas de posteo, y el ranking solo ordena a los "
+                            "documentos que el booleano admitio";
         if (inv) {
             detalle_ruta += ", " + std::to_string(inv->numTerminos()) + " terminos sobre " +
                             std::to_string(inv->numDocs()) + " documentos";
             // Cuantos documentos toca realmente cada termino de la consulta:
             // es la medida de cuanto trabajo se ahorra frente a leerlos todos.
             std::string dfs;
-            for (const std::string& term : inv->analizar(cond.consulta)) {
+            for (const std::string& term : inv->terminosDe(cond.consulta)) {
                 if (!dfs.empty()) dfs += ", ";
                 dfs += term + " (df=" + std::to_string(inv->df(term)) + ")";
             }
@@ -771,7 +808,7 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
             ruta = "IndexVectorRange";
             detalle_ruta = "IVF sobre " + cond.column + ", umbral " +
                            (cond.vec_estricto ? "< " : "<= ") + std::to_string(cond.umbral) +
-                           ", " + detalleIVF(t->indiceVector(cond.column), st.probes) +
+                           ", " + detalleIVF(t->indiceVector(cond.column), probes_ef) +
                            "; se pide top-k y se dobla k hasta cubrir el umbral";
         } else {
             ruta = "SeqScan";
@@ -814,29 +851,47 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
             detalle_ruta = "el indice HASH no ordena: un rango exige recorrido completo";
         }
     }
+    // ---- Estrategia del plan hibrido, con los nombres del enunciado ----
+    //
+    // POST-FILTERING: manda un indice que ordena por relevancia o por
+    // distancia (invertido, R-Tree, IVF). Ese indice no sabe nada del resto
+    // del WHERE, asi que trae candidatos y el predicado se aplica DESPUES,
+    // sobre ellos. Como filtrar puede dejar menos de k, hay sobre-peticion.
+    //
+    // PRE-FILTERING: manda un predicado relacional resuelto por B+ o hash. El
+    // conjunto queda acotado ANTES de evaluar nada caro, y lo que sobra se
+    // comprueba fila a fila sobre esas pocas filas.
+    //
+    // Cual de las dos sale ganando depende de la selectividad, y es justo lo
+    // que el planificador decide con puntajeRuta().
+    std::string estrategia;
     if (cond.kind == PredKind::MATCH && !filtros.empty()) {
         std::string cols;
         for (const Predicate& f : filtros) { if (!cols.empty()) cols += ", "; cols += f.column; }
-        detalle_ruta += "  [conduce la relevancia; filtra " + cols +
-                        " con sobre-peticion hasta reunir k]";
+        estrategia = "Post-filtering";
+        detalle_ruta += "  [Post-filtering: conduce la relevancia textual y se filtra " + cols +
+                        " sobre los candidatos, con sobre-peticion hasta reunir k]";
     } else if (st.knn_vectorial && cond.kind != PredKind::NONE) {
         std::string cols = cond.column;
         for (const Predicate& f : filtros) cols += ", " + f.column;
-        detalle_ruta += "  [conduce la similitud; filtra " + cols +
-                        " con sobre-peticion hasta reunir k]";
+        estrategia = "Post-filtering";
+        detalle_ruta += "  [Post-filtering: conduce la similitud ANN y se filtra " + cols +
+                        " sobre los candidatos, con sobre-peticion hasta reunir k]";
     } else if (st.knn && cond.kind != PredKind::NONE) {
-        // El KNN conduce y TODO el WHERE queda como filtro, con sobre-peticion.
         std::string cols = cond.column;
         for (const Predicate& f : filtros) cols += ", " + f.column;
-        detalle_ruta += "  [conduce la distancia; filtra " + cols +
-                        " con sobre-peticion hasta reunir k]";
+        estrategia = "Post-filtering";
+        detalle_ruta += "  [Post-filtering: conduce la distancia espacial y se filtra " + cols +
+                        " sobre los candidatos, con sobre-peticion hasta reunir k]";
     } else if (!filtros.empty()) {
-        // Plan hibrido: una condicion conduce el acceso y las demas se quedan
-        // como filtro. Decir cual conduce y cuales no es justo lo que hace
-        // legible la decision del planificador.
         std::string cols;
         for (const Predicate& f : filtros) { if (!cols.empty()) cols += ", "; cols += f.column; }
-        detalle_ruta += "  [conduce " + cond.column + "; filtra " + cols + "]";
+        const IndexInfo* ic = ti.findIndex(cond.column);
+        const bool relacional = ic && (ic->kind == IndexKind::BPLUS || ic->kind == IndexKind::HASH);
+        estrategia = relacional ? "Pre-filtering" : "Filtro en memoria";
+        detalle_ruta += "  [" + estrategia + ": conduce " + cond.column +
+                        (relacional ? std::string(" por ") + indexKindName(ic->kind) : std::string()) +
+                        " y despues se comprueba " + cols + " sobre las filas recuperadas]";
     }
     double plan_ms = msDesde(t_plan);
     r.plan.push_back(PlanStep{"Planificacion: " + ruta, plan_ms, detalle_ruta});
@@ -844,6 +899,11 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     // ---- Ejecucion ----
     auto t_exec = Clock::now();
     DiskCounter::Snapshot io_exec = DiskCounter::global().snapshot();
+    // El enunciado pide el desglose: cuantos bloques se leyeron del INDICE y
+    // cuantos de la TABLA. Es lo que deja ver si un indice esta ahorrando
+    // lecturas de verdad o solo moviendolas de sitio.
+    const long long io_heap0  = t->heapReads();
+    const long long io_index0 = t->indexReads();
     std::vector<Tuple> filas;
     // Paralelo a 'filas' cuando la consulta es por relevancia: el puntaje no
     // es una columna de la tabla, pero sin el no se puede juzgar el ranking.
@@ -932,14 +992,14 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
             // reunir k supervivientes o hasta agotar el indice.
             if (todas.empty()) {
                 filas = t->searchVector(st.knn_column, st.knn_vector, k, knn_cos,
-                                        st.probes, &puntajes);
+                                        probes_ef, &puntajes);
             } else {
                 knn_ya_filtrado = true;
                 int pedir = (k < 0) ? -1 : std::max(k, 1);
                 while (true) {
                     std::vector<double> ds;
                     std::vector<Tuple> cand = t->searchVector(st.knn_column, st.knn_vector,
-                                                              pedir, knn_cos, st.probes, &ds);
+                                                              pedir, knn_cos, probes_ef, &ds);
                     filas.clear();
                     puntajes.clear();
                     for (std::size_t i = 0; i < cand.size(); ++i) {
@@ -976,7 +1036,7 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
         const IndexInfo* iv = ti.findIndex(cond.column);
         if (iv && iv->kind == IndexKind::IVF) {
             filas = t->searchVectorUmbral(cond.column, cond.vector_consulta, cond.umbral,
-                                          cond.vec_estricto, cond.vec_coseno, st.probes,
+                                          cond.vec_estricto, cond.vec_coseno, probes_ef,
                                           &puntajes);
         } else {
             // Sin indice el umbral se resuelve recorriendo: es exacto y cuesta
@@ -1122,7 +1182,11 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     DiskCounter::Delta dEjec = DiskCounter::global().since(io_exec);
     r.plan.push_back(PlanStep{"Ejecucion: " + r.metodo, r.exec_ms,
                               std::to_string(dEjec.page_accesses) + " accesos a pagina, " +
-                              std::to_string(dEjec.reads) + " lecturas de disco"});
+                              std::to_string(dEjec.reads) + " lecturas de disco (" +
+                              std::to_string(t->indexReads() - io_index0) + " del indice, " +
+                              std::to_string(t->heapReads() - io_heap0) + " de la tabla)"});
+    if (!estrategia.empty())
+        r.plan.push_back(PlanStep{"Estrategia: " + estrategia, 0.0, detalle_ruta});
     if (t->lastPlan().descartados > 0) {
         // Visible a proposito: es la diferencia entre lo que el indice puede
         // prometer (cajas envolventes) y lo que la consulta realmente pide.
@@ -1156,7 +1220,12 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     // se anade al final del resultado. Sin el, un ranking es una lista de filas
     // en un orden que el usuario no puede verificar.
     const bool con_puntaje = !puntajes.empty() && puntajes.size() == filas.size();
-    if (con_puntaje) r.columns.push_back(columna_extra);
+    // Si la consulta pidio la columna con un alias (COSINE_SCORE() AS x, o
+    // col <=> [..] AS x), se muestra con ese nombre: es por el que el ORDER BY
+    // se refiere a ella.
+    if (con_puntaje)
+        r.columns.push_back(st.columna_puntaje.empty() ? std::string(columna_extra)
+                                                       : st.columna_puntaje);
 
     long long tope = (st.limit >= 0) ? st.limit : static_cast<long long>(filas.size());
     for (std::size_t fi = 0; fi < filas.size(); ++fi) {

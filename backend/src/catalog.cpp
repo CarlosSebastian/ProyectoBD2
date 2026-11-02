@@ -74,8 +74,9 @@ void Catalog::load() {
                 if (ss >> listas) ix.listas  = listas;
                 if (ss >> met)    ix.metrica = met;
             } else {
-                std::string idi;
-                if (ss >> idi) ix.idioma = idi;  // ausente en catalogos viejos
+                std::string idi, sco;
+                if (ss >> idi) ix.idioma  = idi;   // ausentes en catalogos viejos
+                if (ss >> sco) ix.scoring = sco;
             }
             cur.indexes.push_back(ix);
         } else if (tag == "END" && open) {
@@ -98,7 +99,7 @@ void Catalog::save() const {
             out << "COL " << c.name << " " << typeName(c.type) << " " << c.max_len << "\n";
         for (const auto& ix : t.indexes) {
             out << "INDEX " << ix.column << " " << indexKindName(ix.kind) << " " << ix.file;
-            if (ix.kind == IndexKind::INVERTED)   out << " " << ix.idioma;
+            if (ix.kind == IndexKind::INVERTED)   out << " " << ix.idioma << " " << ix.scoring;
             else if (ix.kind == IndexKind::IVF)   out << " " << ix.listas << " " << ix.metrica;
             out << "\n";
         }

@@ -42,6 +42,14 @@
 //  el promedio avgdl no se puede normalizar, y el ranking se lo quedarian
 //  siempre los documentos mas largos.
 //
+//  RECUPERACION BOOLEANA
+//  Ademas del ranking, el indice resuelve consultas booleanas AND, OR y
+//  AND NOT. Y lo hace sin ordenar nada: las listas de postings ya estan
+//  ordenadas por doc_id, asi que combinar dos es recorrerlas a la vez con un
+//  puntero en cada una, avanzando siempre el menor. Cuesta O(n+m), que es lo
+//  mismo que leerlas. Esa es la razon de fondo por la que las listas se
+//  guardan ordenadas y no en el orden en que aparecieron los documentos.
+//
 //  LO QUE ESTE INDICE NO HACE
 //  No admite insercion incremental. Un indice invertido se construye en masa;
 //  anadir un documento obligaria a desplazar casi todas las listas de postings.
@@ -104,8 +112,30 @@ public:
     // ---- consulta ----
     // Devuelve como mucho k resultados ordenados por puntaje descendente.
     // k < 0 significa "todos los que coincidan".
+    //
+    // Si la consulta lleva operadores booleanos, primero se resuelve el
+    // conjunto booleano y DESPUES se rankea solo a los supervivientes. Las dos
+    // cosas se combinan en una sola consulta a proposito: el booleano dice
+    // que documentos son admisibles y el ranking en que orden mostrarlos.
     std::vector<Resultado> buscar(const std::string& consulta, int k,
                                   Ranking r = Ranking::BM25) const;
+
+    // ---- recuperacion booleana ----
+    // Gramatica:   expr := operando { (AND | OR | [AND] NOT) operando }
+    // Sin parentesis y sin precedencia: se evalua de izquierda a derecha, que
+    // es justo lo que permite resolver cada paso con un merge de dos punteros.
+    // Los operadores se escriben en MAYUSCULAS para poder distinguirlos de
+    // palabras del corpus que se escriban igual.
+    // Devuelve los doc_id que satisfacen la expresion, en orden creciente.
+    //
+    // Un operando que el analisis lexico deja vacio (una stopword, o una
+    // palabra mas corta que el minimo) es NEUTRO y se ignora: 'the AND gato'
+    // devuelve lo mismo que 'gato'. Fallar ahi seria peor, porque el usuario
+    // no tiene por que saber cual es la lista de stopwords.
+    std::vector<std::uint32_t> booleana(const std::string& expresion) const;
+
+    // true si la consulta lleva operadores booleanos en mayusculas.
+    static bool tieneBooleanos(const std::string& consulta);
 
     // ---- metadatos ----
     std::uint32_t numDocs()     const { return num_docs_; }
@@ -125,6 +155,11 @@ public:
         return texto::tokenizar(s, idioma_);
     }
 
+    // Lo mismo, pero quitando antes los operadores booleanos. Es lo que hay
+    // que mostrar en el plan de ejecucion: AND y NOT no son terminos y no
+    // tienen df.
+    std::vector<std::string> terminosDe(const std::string& consulta) const;
+
 private:
     struct EntradaDicc {
         std::uint32_t df     = 0;
@@ -141,6 +176,8 @@ private:
     void leerRango(page_id_t zona, std::uint64_t offset, std::uint32_t n, char* dest) const;
 
     bool buscarTermino(const std::string& t, EntradaDicc* out) const;
+    // doc_id donde aparece un termino YA analizado, en orden creciente.
+    std::vector<std::uint32_t> docsDe(const std::string& termino) const;
     std::vector<Posting> leerPostings(const EntradaDicc& e) const;
     bool leerDoc(std::uint32_t doc_id, RID* rid, std::uint32_t* largo, float* norma) const;
 

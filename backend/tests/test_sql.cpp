@@ -927,6 +927,64 @@ int main() {
     }
 
 
+    SECTION("MATCH booleano: AND, OR y AND NOT por SQL");
+    {
+        const std::string DIR = "data/_tbool";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE docs (id INT PRIMARY KEY, cuerpo TEXT);");
+        db.execute("INSERT INTO docs VALUES "
+                   "(1,'inverted index spimi'),"
+                   "(2,'inverted index bm25'),"
+                   "(3,'spimi external sorting'),"
+                   "(4,'bm25 ranking model');");
+        db.execute("CREATE INDEX ix ON docs (cuerpo) USING INVERTED;");
+
+        auto ids = [&](const std::string& sql) {
+            std::set<std::string> s;
+            for (const auto& fila : db.execute(sql).rows) s.insert(fila[0]);
+            return s;
+        };
+
+        CHECK(ids("SELECT id FROM docs WHERE cuerpo MATCH 'inverted AND index';") ==
+              (std::set<std::string>{"1", "2"}), "AND: los dos que tienen ambos");
+        CHECK(ids("SELECT id FROM docs WHERE cuerpo MATCH 'inverted AND NOT bm25';") ==
+              (std::set<std::string>{"1"}), "AND NOT descarta el que trae el termino negado");
+        CHECK(ids("SELECT id FROM docs WHERE cuerpo MATCH 'spimi OR bm25';") ==
+              (std::set<std::string>{"1", "2", "3", "4"}), "OR une las dos listas");
+        CHECK(ids("SELECT id FROM docs WHERE cuerpo MATCH 'inverted AND spimi';") ==
+              (std::set<std::string>{"1"}), "AND de dos terminos poco frecuentes");
+        CHECK(ids("SELECT id FROM docs WHERE cuerpo MATCH 'spimi AND NOT spimi';").empty(),
+              "una expresion contradictoria no devuelve nada");
+
+        // El ranking sigue vivo: la consulta booleana trae su columna de
+        // puntaje y los resultados salen ordenados por relevancia.
+        QueryResult r = db.execute(
+            "SELECT id FROM docs WHERE cuerpo MATCH 'inverted OR spimi' LIMIT 10;");
+        CHECK(r.ok, "la consulta booleana responde");
+        CHECK_EQ(r.columns.back(), std::string("score"), "trae el puntaje");
+        for (std::size_t i = 1; i < r.rows.size(); ++i)
+            CHECK(std::stod(r.rows[i - 1].back()) >= std::stod(r.rows[i].back()),
+                  "ordenado por relevancia descendente");
+
+        // El plan tiene que decir que uso recuperacion booleana, y no contar
+        // AND ni NOT como terminos con df.
+        QueryResult p = db.execute("SELECT id FROM docs WHERE cuerpo MATCH 'inverted AND NOT bm25';");
+        bool dice_booleana = false, cuenta_operadores = false;
+        for (const PlanStep& ps : p.plan) {
+            if (ps.detalle.find("booleana") != std::string::npos) dice_booleana = true;
+            if (ps.detalle.find("and (df=") != std::string::npos ||
+                ps.detalle.find("not (df=") != std::string::npos) cuenta_operadores = true;
+        }
+        CHECK(dice_booleana, "el plan publica que la recuperacion fue booleana");
+        CHECK(!cuenta_operadores, "los operadores no aparecen como terminos del indice");
+
+        // Sin operadores el comportamiento de siempre no cambia.
+        CHECK_EQ(ids("SELECT id FROM docs WHERE cuerpo MATCH 'inverted index';").size(),
+                 static_cast<std::size_t>(2), "una consulta sin operadores sigue siendo OR por ranking");
+    }
+
     // =======================================================================
     //  Entregable 2, parte 4: modulo vectorial por SQL
     // =======================================================================
@@ -1139,6 +1197,151 @@ int main() {
               "el indice valido si se crea");
         CHECK(!db.execute("SELECT id FROM v ORDER BY e <=> [1,0] LIMIT 1;").ok,
               "una consulta con dimension distinta se rechaza");
+    }
+
+    // =======================================================================
+    //  Sintaxis del enunciado del 28-oct. Son literalmente las consultas de
+    //  la seccion 5.4, adaptadas a tablas de prueba. Se comprueba tambien que
+    //  la sintaxis anterior sigue funcionando: las dos tienen que convivir.
+    // =======================================================================
+    SECTION("sintaxis del enunciado: WITH (...), WITHIN_RADIUS, COSINE_SCORE y SET");
+    {
+        const std::string DIR = "data/_tsx";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+
+        // ---- 1. WITH (...) en la creacion de indices ----
+        db.execute("CREATE TABLE locales (id INT PRIMARY KEY, nombre CHAR(30), ubicacion POINT);");
+        CHECK(db.execute("CREATE INDEX idx_geo ON locales (ubicacion) USING RTREE;").ok,
+              "RTREE sin parametros");
+
+        db.execute("CREATE TABLE documentos (id INT PRIMARY KEY, titulo CHAR(40), cuerpo TEXT);");
+        QueryResult ct = db.execute(
+            "CREATE INDEX idx_texto ON documentos (cuerpo) USING INVERTED "
+            "WITH (scoring = 'TFIDF_COSINE');");
+        CHECK(ct.ok, "INVERTED con WITH (scoring = ...)");
+        CHECK(ct.message.find("TFIDF_COSINE") != std::string::npos,
+              "el mensaje confirma el scoring");
+
+        db.execute("CREATE TABLE multimedia (id INT PRIMARY KEY, categoria CHAR(12), "
+                   "precio FLOAT, embedding VECTOR(3));");
+        db.execute("INSERT INTO multimedia VALUES "
+                   "(1,'footwear',120.0,[1.0,0.0,0.0]),"
+                   "(2,'footwear',240.0,[0.98,0.02,0.0]),"
+                   "(3,'footwear',900.0,[0.97,0.01,0.02]),"
+                   "(4,'shirts',  100.0,[0.0,1.0,0.0]),"
+                   "(5,'shirts',   80.0,[0.0,0.0,1.0]),"
+                   "(6,'footwear', 50.0,[0.0,0.9,0.1]);");
+        QueryResult cv = db.execute(
+            "CREATE INDEX idx_vec ON multimedia (embedding) USING IVF "
+            "WITH (lists = 3, metric = 'COSINE');");
+        CHECK(cv.ok, "IVF con WITH (lists = ..., metric = ...)");
+        CHECK(cv.message.find("3 celdas") != std::string::npos, "toma el lists del WITH");
+        CHECK(cv.message.find("COSENO") != std::string::npos, "toma la metrica del WITH");
+
+        // Lo que el WITH tiene que rechazar.
+        CHECK(!db.execute("CREATE INDEX m1 ON multimedia (embedding) USING IVF "
+                          "WITH (lists = 0);").ok, "lists = 0 se rechaza");
+        CHECK(!db.execute("CREATE INDEX m2 ON multimedia (embedding) USING IVF "
+                          "WITH (metric = 'MANHATTAN');").ok, "una metrica rara se rechaza");
+        CHECK(!db.execute("CREATE INDEX m3 ON multimedia (embedding) USING IVF "
+                          "WITH (scoring = 'BM25');").ok, "scoring no aplica a un IVF");
+        CHECK(!db.execute("CREATE INDEX m4 ON multimedia (embedding) USING IVF "
+                          "WITH (loquesea = 1);").ok, "un parametro desconocido se rechaza");
+
+        // ---- 2. WITHIN_RADIUS, en kilometros ----
+        db.execute("INSERT INTO locales VALUES "
+                   "(1,'UTEC Barranco',POINT(-77.0220,-12.1350)),"
+                   "(2,'Plaza de Armas',POINT(-77.0300,-12.0460)),"
+                   "(3,'Cusco',POINT(-71.9780,-13.5320));");
+        QueryResult wr = db.execute(
+            "SELECT id, nombre FROM locales WHERE ubicacion WITHIN_RADIUS((-77.0282, -12.1354), 2.5);");
+        CHECK(wr.ok, "WITHIN_RADIUS responde");
+        CHECK_EQ(wr.rows.size(), static_cast<std::size_t>(1), "solo UTEC cae dentro de 2.5 km");
+        CHECK_EQ(wr.rows[0][1], std::string("UTEC Barranco"), "y es el correcto");
+        // 2.5 km tienen que ser 2500 m: la forma vieja da exactamente lo mismo.
+        CHECK_EQ(db.execute("SELECT id FROM locales WHERE "
+                            "ST_DISTANCE(ubicacion, POINT(-77.0282,-12.1354)) <= 2500;").rows.size(),
+                 wr.rows.size(), "WITHIN_RADIUS en km equivale a ST_DISTANCE en metros");
+
+        // ---- 3. COSINE_SCORE() AS alias + ORDER BY alias DESC ----
+        db.execute("INSERT INTO documentos VALUES "
+                   "(1,'Uno','aprendizaje profundo con redes'),"
+                   "(2,'Dos','aprendizaje basico de bases'),"
+                   "(3,'Tres','aprendizaje profundo avanzado y redes'),"
+                   "(4,'Cuatro','bases de datos distribuidas');");
+        QueryResult cs = db.execute(
+            "SELECT id, titulo, COSINE_SCORE() AS relevancia FROM documentos "
+            "WHERE cuerpo MATCH 'aprendizaje AND profundo AND NOT basico' "
+            "ORDER BY relevancia DESC LIMIT 10;");
+        CHECK(cs.ok, "la consulta del enunciado responde");
+        CHECK_EQ(cs.columns.back(), std::string("relevancia"), "la columna toma el alias del AS");
+        CHECK_EQ(cs.rows.size(), static_cast<std::size_t>(2), "los dos que son profundos y no basicos");
+        for (std::size_t i = 1; i < cs.rows.size(); ++i)
+            CHECK(std::stod(cs.rows[i - 1].back()) >= std::stod(cs.rows[i].back()),
+                  "ordenado por relevancia descendente");
+        // El scoring del indice manda si la consulta no pide otro.
+        bool dice_tfidf = false;
+        for (const PlanStep& ps : cs.plan)
+            if (ps.detalle.find("TF-IDF") != std::string::npos) dice_tfidf = true;
+        CHECK(dice_tfidf, "sin USING manda el scoring con el que se creo el indice");
+        // Pedir un puntaje ASC no es un orden distinto, es otra consulta.
+        CHECK(!db.execute("SELECT id, COSINE_SCORE() AS rel FROM documentos "
+                          "WHERE cuerpo MATCH 'aprendizaje' ORDER BY rel ASC LIMIT 3;").ok,
+              "ORDER BY puntaje ASC se rechaza con un motivo");
+
+        // ---- 4. SET ivf.probes + 'col <=> ... AS alias' + hibrida ----
+        QueryResult sp = db.execute("SET ivf.probes = 3;");
+        CHECK(sp.ok, "SET ivf.probes se acepta");
+        CHECK(!db.execute("SET ivf.probes = 0;").ok, "un valor no positivo se rechaza");
+        CHECK(!db.execute("SET loquesea.x = 1;").ok, "un parametro de sesion desconocido se rechaza");
+
+        QueryResult hv = db.execute(
+            "SELECT id, categoria, precio, embedding <=> '[1.0, 0.0, 0.0]' AS dist_coseno "
+            "FROM multimedia WHERE categoria = 'footwear' AND precio <= 250.0 "
+            "ORDER BY dist_coseno ASC LIMIT 5;");
+        CHECK(hv.ok, "la consulta vectorial hibrida del enunciado responde");
+        CHECK_EQ(hv.columns.back(), std::string("dist_coseno"), "la distancia toma el alias");
+        // footwear con precio <= 250: los id 1, 2 y 6. El 3 es footwear pero
+        // cuesta 900, y los 4 y 5 son shirts.
+        CHECK_EQ(hv.rows.size(), static_cast<std::size_t>(3), "solo footwear de 250 o menos");
+        CHECK_EQ(hv.rows[0][0], std::string("1"), "el mas parecido primero");
+        CHECK_EQ(hv.rows[2][0], std::string("6"), "y el que apunta a otro lado, ultimo");
+        // El SET se aplico: el plan tiene que decir nprobe=3.
+        bool dice_probes = false, dice_post = false, dice_io = false;
+        for (const PlanStep& ps : hv.plan) {
+            if (ps.detalle.find("nprobe=3") != std::string::npos)    dice_probes = true;
+            if (ps.detalle.find("Post-filtering") != std::string::npos) dice_post = true;
+            if (ps.detalle.find("del indice,") != std::string::npos)  dice_io = true;
+        }
+        CHECK(dice_probes, "el SET de la sesion llega hasta el indice");
+        CHECK(dice_post, "el plan nombra la estrategia Post-filtering");
+        CHECK(dice_io, "el plan desglosa las lecturas del indice y de la tabla");
+
+        // Un PROBES explicito gana al SET de la sesion.
+        bool gana_explicito = false;
+        for (const PlanStep& ps : db.execute(
+                 "SELECT id FROM multimedia ORDER BY embedding <=> '[1,0,0]' "
+                 "LIMIT 2 PROBES 1;").plan)
+            if (ps.detalle.find("nprobe=1") != std::string::npos) gana_explicito = true;
+        CHECK(gana_explicito, "PROBES en la consulta tiene prioridad sobre el SET");
+
+        // ---- 5. Pre-filtering: cuando manda un indice relacional ----
+        db.execute("CREATE INDEX idx_cat ON multimedia (categoria) USING BTREE;");
+        bool dice_pre = false;
+        for (const PlanStep& ps : db.execute(
+                 "SELECT id FROM multimedia WHERE categoria = 'shirts' AND precio <= 90.0;").plan)
+            if (ps.detalle.find("Pre-filtering") != std::string::npos) dice_pre = true;
+        CHECK(dice_pre, "con un indice relacional conduciendo, el plan dice Pre-filtering");
+
+        // ---- 6. la sintaxis anterior no se rompio ----
+        CHECK(db.execute("CREATE TABLE v2 (id INT PRIMARY KEY, e VECTOR(3));").ok, "tabla nueva");
+        db.execute("INSERT INTO v2 VALUES (1,[1,0,0]),(2,[0,1,0]);");
+        CHECK(db.execute("CREATE INDEX i2 ON v2 (e) USING IVF LISTS 2 METRIC COSINE;").ok,
+              "LISTS y METRIC sueltos siguen valiendo");
+        CHECK(db.execute("SELECT id FROM v2 ORDER BY e <=> [1,0,0] LIMIT 1 PROBES 2;").ok,
+              "el vector sin comillas sigue valiendo");
     }
 
     DONE("test_sql");

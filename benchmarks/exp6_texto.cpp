@@ -13,6 +13,11 @@
 //    C. Consulta. BM25 por el indice frente a la unica alternativa sin
 //       indice: leer los N documentos, tokenizarlos y puntuarlos. Las dos
 //       rutas tienen que devolver EL MISMO top-10, o la comparacion no vale.
+//    E. Recuperacion BOOLEANA (AND, OR, AND NOT) con consultas de 1, 3 y 5
+//       terminos, otra vez contra el recorrido completo. Aqui no hay ranking
+//       que comparar: los dos conjuntos tienen que ser IDENTICOS.
+//    F. Exporta el corpus y las consultas para poder medir lo mismo contra el
+//       indice GIN de PostgreSQL (ver benchmarks/exp6_gin.py).
 //
 //  El corpus es sintetico pero con vocabulario ZIPFIANO, que es lo que de
 //  verdad importa: en lenguaje natural unas pocas palabras aparecen en casi
@@ -23,6 +28,7 @@
 //     ./build/exp6_texto [dir] [N_max] [consultas]
 // ============================================================================
 #include <cmath>
+#include <fstream>
 #include <map>
 #include <set>
 #include <tuple>
@@ -393,6 +399,148 @@ int main(int argc, char** argv) {
                      "paginas. Es el motivo por el que quitar stopwords importa: son\n"
                      "justo los terminos con df cercano a N, los mas caros y los que menos\n"
                      "discriminan.\n";
+    }
+
+    // ======================================================================
+    std::cout << "\n### E. Recuperacion booleana: indice contra recorrido completo\n\n";
+    {
+        const int N = std::min(N_MAX, 20000);
+        const std::string nom = "exp6_e";
+        limpiar(dir, nom);
+        const std::vector<std::string> docs = generarCorpus(N);
+        {
+            Table t(dir, infoTexto(nom, false), 64);
+            cargar(t, docs);
+        }
+        Table t(dir, infoTexto(nom, true), 64);
+        t.reconstruirTexto();
+        t.flush();
+        const InvertedIndex* inv = t.indiceTexto("cuerpo");
+
+        // Lo que contiene cada documento, para la fuerza bruta.
+        //
+        // OJO con el orden: el indice numera los documentos (doc_id 0, 1, 2...)
+        // en el orden en que se los entrega el HEAP, que NO tiene por que ser
+        // el orden del vector 'docs'. Recorrer 'docs' y usar su posicion como
+        // doc_id da una comparacion que falla sin que nada este mal. Por eso la
+        // referencia se construye recorriendo la tabla con scanRIDs(), que es
+        // exactamente la misma fuente que uso reconstruirTexto().
+        std::vector<std::set<std::string>> contiene;
+        contiene.reserve(static_cast<std::size_t>(N));
+        {
+            Tuple tup;
+            for (const RID& r : t.scanRIDs()) {
+                if (!t.getByRID(r, tup)) continue;
+                std::set<std::string> c;
+                for (const std::string& w : texto::tokenizar(tup.at(1).s, texto::Idioma::EN))
+                    c.insert(w);
+                contiene.push_back(std::move(c));
+            }
+        }
+
+        // La columna del escaneo es una COTA INFERIOR: los documentos ya
+        // estan tokenizados en memoria, asi que mide solo la evaluacion de la
+        // expresion. Un escaneo de verdad pagaria ademas leer y tokenizar.
+        fila({"operador", "terminos", "indice: accesos", "indice: ms",
+              "scan: ms (cota inf.)", "ms x", "filas", "identico"});
+        separador(8);
+
+        std::mt19937 rng(321);
+        for (const char* op : {"AND", "OR", "AND NOT"}) {
+            for (int nt : {1, 3, 5}) {
+                double ms_ix = 0, ms_sc = 0, accesos = 0, filas = 0;
+                bool identico = true;
+                for (int q = 0; q < N_CONSULTAS; ++q) {
+                    std::vector<std::string> ws;
+                    std::string expr;
+                    for (int j = 0; j < nt; ++j) {
+                        if (j) { expr += " "; expr += op; expr += " "; }
+                        const std::string w = "voc" + std::to_string(palabraZipf(rng));
+                        ws.push_back(texto::tokenizar(w, texto::Idioma::EN).front());
+                        expr += w;
+                    }
+
+                    t.resetStats();
+                    Cronometro c1;
+                    const std::vector<std::uint32_t> got = inv->booleana(expr);
+                    const Medicion m1 = c1.parar();
+                    ms_ix += m1.ms;
+                    accesos += static_cast<double>(m1.accesos);
+
+                    // Fuerza bruta: se evalua la expresion documento a
+                    // documento, sin tocar ninguna lista de posteo.
+                    Cronometro c2;
+                    std::vector<std::uint32_t> esp;
+                    for (std::size_t d = 0; d < contiene.size(); ++d) {
+                        bool v = contiene[d].count(ws[0]) > 0;
+                        for (std::size_t j = 1; j < ws.size(); ++j) {
+                            const bool x = contiene[d].count(ws[j]) > 0;
+                            if      (std::string(op) == "AND") v = v && x;
+                            else if (std::string(op) == "OR")  v = v || x;
+                            else                               v = v && !x;
+                        }
+                        if (v) esp.push_back(static_cast<std::uint32_t>(d));
+                    }
+                    ms_sc += c2.parar().ms;
+                    filas += static_cast<double>(got.size());
+                    if (got != esp) identico = false;
+                }
+                const double n = static_cast<double>(N_CONSULTAS);
+                fila({op, std::to_string(nt), num(accesos / n, 1), num(ms_ix / n, 4),
+                      num(ms_sc / n, 4),
+                      num(ms_ix > 0 ? ms_sc / ms_ix : 0.0, 1) + "x",
+                      num(filas / n, 0), identico ? "si" : "NO"});
+            }
+        }
+        std::cout <<
+          "\nEl costo lo manda LEER las listas, no mezclarlas: los accesos a pagina\n"
+          "crecen casi proporcionalmente al numero de terminos (de ~8 con uno a ~43 con\n"
+          "cinco) sea cual sea el operador, porque hay que traer una lista por termino.\n"
+          "La mezcla en si es lineal y practicamente gratis al lado de eso.\n\n"
+          "El AND de tres o mas terminos tomados al azar devuelve CERO documentos casi\n"
+          "siempre. No es un defecto de la medicion, es como se comporta un AND sobre\n"
+          "vocabulario zipfiano: la probabilidad de que un mismo documento contenga tres\n"
+          "palabras independientes es el producto de tres fracciones pequenas. Esa es,\n"
+          "en una linea, la razon por la que los buscadores dejaron de exigir que\n"
+          "aparezcan todos los terminos y pasaron a RANKEAR: con el booleano puro, una\n"
+          "consulta de cinco palabras no devuelve nada.\n\n"
+          "Frente al recorrido completo el indice gana entre 30 y 55 veces, y eso que la\n"
+          "columna del escaneo es una cota inferior que no incluye leer ni tokenizar.\n";
+
+        // ------------------------------------------------------------------
+        std::cout << "\n### F. Export para comparar contra el indice GIN de PostgreSQL\n\n";
+        const std::string ruta_csv = dir + "/exp6_corpus.csv";
+        const std::string ruta_qry = dir + "/exp6_consultas.txt";
+        {
+            std::ofstream f(ruta_csv);
+            f << "id,cuerpo\n";
+            for (int i = 0; i < N; ++i)
+                f << (i + 1) << "," << docs[static_cast<std::size_t>(i)] << "\n";
+        }
+        {
+            // Las mismas familias de consultas que mide la seccion E, en el
+            // formato que entiende el script de PostgreSQL.
+            std::ofstream f(ruta_qry);
+            std::mt19937 r2(321);
+            for (const char* op : {"AND", "OR", "AND NOT"})
+                for (int nt : {1, 3, 5})
+                    for (int q = 0; q < N_CONSULTAS; ++q) {
+                        std::string expr;
+                        for (int j = 0; j < nt; ++j) {
+                            if (j) { expr += " "; expr += op; expr += " "; }
+                            expr += "voc" + std::to_string(palabraZipf(r2));
+                        }
+                        f << op << "\t" << nt << "\t" << expr << "\n";
+                    }
+        }
+        std::cout << "Corpus de " << N << " documentos en  " << ruta_csv << "\n"
+                  << "Consultas en                  " << ruta_qry << "\n\n"
+                     "PostgreSQL se usa aqui SOLO como punto de comparacion, no como\n"
+                     "almacenamiento: la restriccion del enunciado es no apoyarse en un motor\n"
+                     "ajeno para guardar o indexar los datos del proyecto, y el indice que se\n"
+                     "mide sigue siendo el propio. Para la otra mitad de la tabla:\n\n"
+                     "    python benchmarks/exp6_gin.py --csv " << ruta_csv
+                  << " --consultas " << ruta_qry << "\n";
     }
 
     std::cout << "\n";

@@ -6,7 +6,9 @@
 //    CREATE TABLE t ( col TIPO [PRIMARY KEY], ... ) [USING HEAP|SEQUENTIAL];
 //    CREATE INDEX nombre ON t ( col ) [USING BTREE|HASH|RTREE|INVERTED|IVF]
 //                                     [LANGUAGE 'EN'|'ES']
-//                                     [LISTS n] [METRIC COSINE|L2];
+//                                     [LISTS n] [METRIC COSINE|L2]
+//                                     [WITH ( clave = valor, ... )];
+//    SET ivf.probes = n;
 //    INSERT INTO t VALUES ( v1, v2, ... ) [, ( ... ) ...];
 //    SELECT * | c1,c2 FROM t [WHERE <cond>]
 //           [ORDER BY col <-> POINT(x,y) | col <=> [v1,...,vd]]
@@ -27,6 +29,12 @@
 //  fusionan en un solo rango; las de columnas distintas quedan como una lista.
 //  El planificador elige UNA para resolver el acceso y aplica el resto como
 //  filtro sobre las filas recuperadas.
+//
+//  Los parametros de un indice se pueden escribir de dos formas, y las dos
+//  valen: sueltas (LISTS 100 METRIC COSINE, LANGUAGE 'ES') o dentro de un
+//  WITH ( lists = 100, metric = 'COSINE' ), que es como las escribe el
+//  enunciado. Se aceptan las dos a proposito: la primera ya estaba en uso en
+//  el cliente web y en los tests, y romperla no aportaria nada.
 //
 //  Tipos: INT | FLOAT | DOUBLE | CHAR(n) | VARCHAR(n) | POINT | POLYGON
 //         | VECTOR(d) | EMBEDDING(d)
@@ -77,7 +85,7 @@
 
 namespace db {
 
-enum class StmtKind { CREATE_TABLE, CREATE_INDEX, INSERT, SELECT, DELETE_, COPY };
+enum class StmtKind { CREATE_TABLE, CREATE_INDEX, INSERT, SELECT, DELETE_, COPY, SET_ };
 
 enum class EngineKind { HEAP, SEQUENTIAL };
 std::string engineName(EngineKind e);
@@ -116,7 +124,10 @@ struct Predicate {
     // SU idioma, porque consulta y documentos tienen que pasar por el mismo
     // tokenizador o los terminos no coinciden.
     std::string consulta;
-    bool        usar_tfidf = false;          // false => BM25 (el de por defecto)
+    bool        usar_tfidf = false;          // false => BM25
+    // true si la consulta trajo un USING explicito. Si es false manda el
+    // scoring con el que se creo el indice.
+    bool        ranking_explicito = false;
 
     // VECDIST: col <=> [..] <= umbral. El vector se guarda tal como se escribio
     // y la validacion de la dimension se hace al ejecutar, donde ya se conoce el
@@ -140,6 +151,10 @@ struct Statement {
     std::string index_column;
     IndexKind   index_kind = IndexKind::BPLUS;
     std::string index_idioma = "EN";          // solo INVERTED
+    // Solo INVERTED: modelo de puntuacion por defecto del indice, "BM25" o
+    // "TFIDF_COSINE". Una consulta puede pedir el otro con USING, pero si no
+    // dice nada manda el del indice.
+    std::string index_scoring = "BM25";
     // Solo IVF. listas = 0 significa "elige tu": el motor usa sqrt(n), que es
     // la regla de dedo habitual para IVF-Flat.
     int         index_listas = 0;
@@ -147,6 +162,12 @@ struct Statement {
 
     // INSERT
     std::vector<std::vector<Value>> rows; 
+
+    // SET <clave> = <n>;   la clave llega en MAYUSCULAS, p. ej. "IVF.PROBES".
+    // Es configuracion de sesion, no una consulta: cambia el valor por defecto
+    // que usaran las siguientes sentencias.
+    std::string set_clave;
+    long long   set_valor = 0;
 
     // COPY: cargar un CSV entero. Sin esto, meter doce mil abstracts exigiria
     // doce mil sentencias INSERT, que es inviable a mano y absurdo por HTTP.
@@ -178,8 +199,19 @@ struct Statement {
     bool        knn_vectorial = false;
     std::vector<float> knn_vector;
     bool        knn_coseno = true;            // lo fija la metrica del indice
-    // PROBES n. -1 => usar el valor por defecto del indice.
+    // PROBES n. -1 => usar el valor de la sesion, y si tampoco hay, el del indice.
     int         probes = -1;
+
+    // Columna calculada que la consulta pide en el SELECT: COSINE_SCORE() o
+    // 'col <=> [..]'. Guarda el nombre con el que hay que mostrarla (el alias
+    // del AS, o "score" / "distancia" si no se puso alias). Vacio = la
+    // consulta no la pidio explicitamente.
+    std::string columna_puntaje;
+    // ORDER BY <alias>: el alias al que se refiere, y en que sentido. Se
+    // valida contra 'columna_puntaje'; ordenar por el alias no cambia el
+    // resultado, porque el indice ya entrega en ese orden.
+    std::string orden_alias;
+    bool        orden_desc = false;
 };
 
 // Lanza DBException con un mensaje legible si la sentencia no es valida.

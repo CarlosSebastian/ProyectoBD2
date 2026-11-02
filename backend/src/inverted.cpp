@@ -1,11 +1,13 @@
 #include "db/inverted.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <memory>
 #include <queue>
+#include <sstream>
 
 namespace db {
 
@@ -490,9 +492,13 @@ void InvertedIndex::construir(const std::function<bool(RID&, std::string&)>& sig
             // termino, que recien se conoce aqui, despues de juntar todos los
             // bloques. Por eso se acumula durante la mezcla y no antes.
             if (num_docs_ > 0 && df_t > 0) {
-                const double idf = std::log(static_cast<double>(num_docs_) / df_t);
+                // log en base 10, como la formula del enunciado. El coseno no
+                // cambia --- el cambio de base multiplica numerador y denominador
+                // por la misma constante --- pero los pesos que se reporten en el
+                // informe tienen que salir de la misma formula que se documenta.
+                const double idf = std::log10(static_cast<double>(num_docs_) / df_t);
                 for (const Posting& p : juntas) {
-                    const double w = (1.0 + std::log(static_cast<double>(p.tf))) * idf;
+                    const double w = (1.0 + std::log10(static_cast<double>(p.tf))) * idf;
                     normas[p.doc] += w * w;
                 }
             }
@@ -556,12 +562,178 @@ void InvertedIndex::construir(const std::function<bool(RID&, std::string&)>& sig
 //  el documento queda puntuado de una vez. Asi nunca hay que guardar un
 //  acumulador por documento, solo los k mejores vistos hasta ahora.
 // ===========================================================================
+// ===========================================================================
+//  Recuperacion booleana
+//
+//  Las listas de postings estan ordenadas por doc_id. Eso convierte cada
+//  operador en un recorrido simultaneo de dos listas con un puntero en cada
+//  una, avanzando siempre el menor: O(n+m) y sin memoria extra mas alla del
+//  resultado. Es el algoritmo clasico de mezcla, y es la razon por la que un
+//  indice invertido guarda las listas ordenadas en vez de en el orden en que
+//  fueron apareciendo los documentos.
+// ===========================================================================
+namespace {
+
+std::string enMayusculas(const std::string& s) {
+    std::string o = s;
+    for (char& c : o) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return o;
+}
+
+bool esOperador(const std::string& palabra) {
+    return palabra == "AND" || palabra == "OR" || palabra == "NOT";
+}
+
+// Parte la expresion en palabras por espacios, sin tocar mayusculas: hacen
+// falta para distinguir el operador AND de la palabra "and" del corpus.
+std::vector<std::string> porEspacios(const std::string& s) {
+    std::vector<std::string> out;
+    std::istringstream ss(s);
+    std::string w;
+    while (ss >> w) out.push_back(w);
+    return out;
+}
+
+std::vector<std::uint32_t> interseccion(const std::vector<std::uint32_t>& a,
+                                        const std::vector<std::uint32_t>& b) {
+    std::vector<std::uint32_t> out;
+    out.reserve(a.size() < b.size() ? a.size() : b.size());
+    std::size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        if      (a[i] == b[j]) { out.push_back(a[i]); ++i; ++j; }
+        else if (a[i] <  b[j])   ++i;
+        else                     ++j;
+    }
+    return out;
+}
+
+std::vector<std::uint32_t> unionDe(const std::vector<std::uint32_t>& a,
+                                   const std::vector<std::uint32_t>& b) {
+    std::vector<std::uint32_t> out;
+    out.reserve(a.size() + b.size());
+    std::size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        if      (a[i] == b[j]) { out.push_back(a[i]); ++i; ++j; }
+        else if (a[i] <  b[j])   out.push_back(a[i++]);
+        else                     out.push_back(b[j++]);
+    }
+    while (i < a.size()) out.push_back(a[i++]);
+    while (j < b.size()) out.push_back(b[j++]);
+    return out;
+}
+
+// a \ b : los de 'a' que no estan en 'b'.
+std::vector<std::uint32_t> diferencia(const std::vector<std::uint32_t>& a,
+                                      const std::vector<std::uint32_t>& b) {
+    std::vector<std::uint32_t> out;
+    out.reserve(a.size());
+    std::size_t i = 0, j = 0;
+    while (i < a.size()) {
+        while (j < b.size() && b[j] < a[i]) ++j;
+        if (j < b.size() && b[j] == a[i]) { ++i; continue; }
+        out.push_back(a[i++]);
+    }
+    return out;
+}
+
+}  // namespace
+
+std::vector<std::uint32_t> InvertedIndex::docsDe(const std::string& termino) const {
+    std::vector<std::uint32_t> out;
+    EntradaDicc e;
+    if (!buscarTermino(termino, &e) || e.df == 0) return out;
+    const std::vector<Posting> ps = leerPostings(e);
+    out.reserve(ps.size());
+    for (const Posting& p : ps) out.push_back(p.doc);
+    return out;
+}
+
+bool InvertedIndex::tieneBooleanos(const std::string& consulta) {
+    for (const std::string& w : porEspacios(consulta))
+        if (esOperador(w)) return true;
+    return false;
+}
+
+std::vector<std::string> InvertedIndex::terminosDe(const std::string& consulta) const {
+    std::string limpio;
+    for (const std::string& w : porEspacios(consulta)) {
+        if (esOperador(w)) continue;
+        if (!limpio.empty()) limpio += ' ';
+        limpio += w;
+    }
+    return texto::tokenizar(limpio, idioma_);
+}
+
+std::vector<std::uint32_t> InvertedIndex::booleana(const std::string& expresion) const {
+    std::vector<std::uint32_t> acum;
+    if (num_docs_ == 0) return acum;
+
+    enum class Op { AND, OR };
+    Op   op      = Op::AND;
+    bool negar   = false;
+    bool primero = true;
+
+    for (const std::string& crudo : porEspacios(expresion)) {
+        const std::string U = enMayusculas(crudo);
+        if (U == "AND") { op = Op::AND; continue; }
+        if (U == "OR")  { op = Op::OR;  continue; }
+        if (U == "NOT") { negar = true; continue; }   // vale "AND NOT" y "NOT" suelto
+
+        // ---- el operando ----
+        // Una palabra puede dar varios terminos (o ninguno). Si da varios se
+        // exigen TODOS, que es lo que espera quien escribio una sola palabra.
+        const std::vector<std::string> ts = texto::tokenizar(crudo, idioma_);
+        if (ts.empty()) { negar = false; op = Op::AND; continue; }   // neutro
+
+        std::vector<std::uint32_t> docs = docsDe(ts[0]);
+        for (std::size_t t = 1; t < ts.size(); ++t)
+            docs = interseccion(docs, docsDe(ts[t]));
+
+        if (primero) {
+            if (negar) {
+                // 'NOT x' al principio: todo el corpus menos x. Hace falta el
+                // universo, que aqui es barato porque los doc_id son densos.
+                std::vector<std::uint32_t> universo(num_docs_);
+                for (std::uint32_t d = 0; d < num_docs_; ++d) universo[d] = d;
+                acum = diferencia(universo, docs);
+            } else {
+                acum = std::move(docs);
+            }
+            primero = false;
+        } else if (negar) {
+            // Cualquier NOT se resuelve como diferencia contra lo acumulado:
+            // 'a OR NOT b' no esta soportado como tal y se trata igual que
+            // 'a AND NOT b'. El enunciado solo pide AND NOT.
+            acum = diferencia(acum, docs);
+        } else if (op == Op::AND) {
+            acum = interseccion(acum, docs);
+        } else {
+            acum = unionDe(acum, docs);
+        }
+        negar = false;
+        op    = Op::AND;
+    }
+    return acum;
+}
+
 std::vector<InvertedIndex::Resultado>
 InvertedIndex::buscar(const std::string& consulta, int k, Ranking r) const {
     std::vector<Resultado> salida;
     if (num_docs_ == 0) return salida;
 
-    const std::vector<std::string> terminos = texto::tokenizar(consulta, idioma_);
+    // Si la consulta es booleana, el conjunto admisible se resuelve PRIMERO y
+    // el ranking solo decide el orden dentro de ese conjunto. Al reves ---
+    // rankear todo y filtrar despues --- se puntuarian documentos que la
+    // consulta ya habia descartado.
+    const bool es_booleana = tieneBooleanos(consulta);
+    std::vector<std::uint32_t> admitidos;
+    if (es_booleana) {
+        admitidos = booleana(consulta);
+        if (admitidos.empty()) return salida;
+    }
+
+    const std::vector<std::string> terminos =
+        es_booleana ? terminosDe(consulta) : texto::tokenizar(consulta, idioma_);
     if (terminos.empty()) return salida;
 
     std::unordered_map<std::string, std::uint32_t> tf_consulta;
@@ -590,8 +762,8 @@ InvertedIndex::buscar(const std::string& consulta, int k, Ranking r) const {
             // restaria puntaje, que no es lo que uno espera de una coincidencia.
             L.idf = std::log(1.0 + (N - df_t + 0.5) / (df_t + 0.5));
         } else {
-            L.idf = std::log(N / df_t);
-            L.wq  = (1.0 + std::log(static_cast<double>(kv.second))) * L.idf;
+            L.idf = std::log10(N / df_t);
+            L.wq  = (1.0 + std::log10(static_cast<double>(kv.second))) * L.idf;
         }
         listas.push_back(std::move(L));
     }
@@ -610,11 +782,24 @@ InvertedIndex::buscar(const std::string& consulta, int k, Ranking r) const {
     std::vector<Resultado> mejores;
     if (k > 0) mejores.reserve(static_cast<std::size_t>(k) + 1);
 
+    // 'actual' solo crece, asi que basta un puntero que avanza sobre el
+    // conjunto booleano: no hace falta buscar nada.
+    std::size_t ia = 0;
+
     while (true) {
         std::uint32_t actual = UINT32_MAX;
         for (const Lista& L : listas)
             if (L.i < L.ps.size() && L.ps[L.i].doc < actual) actual = L.ps[L.i].doc;
         if (actual == UINT32_MAX) break;
+
+        if (es_booleana) {
+            while (ia < admitidos.size() && admitidos[ia] < actual) ++ia;
+            if (ia >= admitidos.size() || admitidos[ia] != actual) {
+                for (Lista& L : listas)
+                    if (L.i < L.ps.size() && L.ps[L.i].doc == actual) ++L.i;
+                continue;
+            }
+        }
 
         RID rid;
         std::uint32_t largo = 0;
@@ -634,7 +819,7 @@ InvertedIndex::buscar(const std::string& consulta, int k, Ranking r) const {
                 const double norm = K1 * (1.0 - B + B * (avgdl_ > 0 ? dl / avgdl_ : 1.0));
                 score += L.idf * (tf * (K1 + 1.0)) / (tf + norm);
             } else {
-                const double wd = (1.0 + std::log(tf)) * L.idf;
+                const double wd = (1.0 + std::log10(tf)) * L.idf;
                 score += wd * L.wq;
             }
             ++L.i;

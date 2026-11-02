@@ -4,7 +4,7 @@
 //  Se persiste en un archivo de texto plano (data/catalog.txt) con formato:
 //     TABLE <nombre> <archivo_datos> <motor> <clave_primaria>
 //     COL   <nombre> <TIPO> <max_len>
-//     INDEX <columna> <BPLUS|HASH|RTREE|INVERTED> <archivo> [<idioma>]
+//     INDEX <columna> <BPLUS|HASH|RTREE|INVERTED> <archivo> [<idioma> [<scoring>]]
 //     INDEX <columna> IVF <archivo> <listas> <COSINE|L2>
 //  La cola de la linea depende del tipo: el idioma solo lo lleva el indice
 //  invertido y los parametros de celdas y metrica solo el IVF. Ambas son
@@ -36,6 +36,9 @@ struct IndexInfo {
     // Solo INVERTED: "EN" o "ES". Decide stopwords y stemmer, y tiene que ser
     // el mismo al indexar y al consultar.
     std::string idioma = "EN";
+    // Solo INVERTED: "BM25" o "TFIDF_COSINE". Es el modelo con el que se
+    // responde si la consulta no pide otro con USING.
+    std::string scoring = "BM25";
     // Solo IVF. El numero de celdas se guarda porque hay que poder reconstruir
     // el indice con la MISMA particion, y la metrica porque una consulta en
     // coseno contra un indice entrenado en L2 daria vecinos equivocados sin

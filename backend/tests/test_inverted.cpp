@@ -13,8 +13,10 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <iterator>
 #include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -549,6 +551,247 @@ int main() {
                   << " B   indice completo=" << con_indice << " B ("
                   << ix.numPages() << " paginas, " << ix.numTerminos() << " terminos, "
                   << ix.numDocs() << " documentos)\n";
+    }
+
+    // =======================================================================
+    //  Recuperacion booleana (Entregable 2, enunciado del 28-oct)
+    //
+    //  La referencia es una segunda implementacion escrita con conjuntos de la
+    //  STL: set_intersection, set_union y set_difference. Es a proposito un
+    //  algoritmo distinto del que usa el indice (mezcla de dos punteros sobre
+    //  vectores ordenados), porque comparar una implementacion consigo misma
+    //  no prueba nada.
+    // =======================================================================
+    SECTION("booleanas: AND, OR y AND NOT contra una referencia con std::set");
+    {
+        const std::vector<std::string> docs = corpusChico();
+        std::vector<std::uint32_t> largos;
+        const auto ref = referencia(docs, texto::Idioma::EN, &largos);
+
+        const std::string f = ruta("ti_bool.idx");
+        resetFile(f);
+        DiskManager dm(f);
+        BufferPool bp(&dm, 32);
+        InvertedIndex ix(&bp);
+        construir(ix, docs, texto::Idioma::EN, ruta("spimi_bool"), 4096);
+
+        auto docsDe = [&](const std::string& palabra) {
+            std::set<std::uint32_t> s;
+            const std::vector<std::string> ts = texto::tokenizar(palabra, texto::Idioma::EN);
+            bool primero = true;
+            for (const std::string& t : ts) {
+                std::set<std::uint32_t> aqui;
+                auto it = ref.find(t);
+                if (it != ref.end())
+                    for (const auto& kv : it->second) aqui.insert(kv.first);
+                if (primero) { s = aqui; primero = false; continue; }
+                std::set<std::uint32_t> r;
+                std::set_intersection(s.begin(), s.end(), aqui.begin(), aqui.end(),
+                                      std::inserter(r, r.end()));
+                s = r;
+            }
+            return s;
+        };
+
+        // Segunda implementacion, con las mismas reglas: izquierda a derecha,
+        // sin precedencia, el operando vacio es neutro.
+        auto evalRef = [&](const std::string& expr) {
+            std::set<std::uint32_t> acum;
+            bool primero = true, negar = false;
+            int  op = 0;                                  // 0 = AND, 1 = OR
+            std::istringstream ss(expr);
+            std::string w;
+            while (ss >> w) {
+                std::string U = w;
+                for (char& c : U) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (U == "AND") { op = 0; continue; }
+                if (U == "OR")  { op = 1; continue; }
+                if (U == "NOT") { negar = true; continue; }
+                if (texto::tokenizar(w, texto::Idioma::EN).empty()) { negar = false; op = 0; continue; }
+
+                const std::set<std::uint32_t> d = docsDe(w);
+                std::set<std::uint32_t> r;
+                if (primero) {
+                    if (negar) {
+                        std::set<std::uint32_t> uni;
+                        for (std::uint32_t i = 0; i < docs.size(); ++i) uni.insert(i);
+                        std::set_difference(uni.begin(), uni.end(), d.begin(), d.end(),
+                                            std::inserter(r, r.end()));
+                        acum = r;
+                    } else {
+                        acum = d;
+                    }
+                    primero = false;
+                } else {
+                    if (negar)
+                        std::set_difference(acum.begin(), acum.end(), d.begin(), d.end(),
+                                            std::inserter(r, r.end()));
+                    else if (op == 0)
+                        std::set_intersection(acum.begin(), acum.end(), d.begin(), d.end(),
+                                              std::inserter(r, r.end()));
+                    else
+                        std::set_union(acum.begin(), acum.end(), d.begin(), d.end(),
+                                       std::inserter(r, r.end()));
+                    acum = r;
+                }
+                negar = false;
+                op    = 0;
+            }
+            return acum;
+        };
+
+        auto comprobar = [&](const std::string& expr) {
+            const std::vector<std::uint32_t> got = ix.booleana(expr);
+            const std::set<std::uint32_t>    esp = evalRef(expr);
+            CHECK_EQ(got.size(), esp.size(), ("cardinalidad de: " + expr).c_str());
+            CHECK(std::set<std::uint32_t>(got.begin(), got.end()) == esp,
+                  ("mismos documentos: " + expr).c_str());
+            CHECK(std::is_sorted(got.begin(), got.end()),
+                  ("el resultado sale ordenado: " + expr).c_str());
+        };
+
+        comprobar("inverted AND index");
+        comprobar("inverted OR bm25");
+        comprobar("document AND NOT inverted");
+        comprobar("quick AND lazy");
+        comprobar("quick AND NOT lazy");
+        comprobar("single AND pass");
+        comprobar("inverted OR lazy OR bm25");
+        comprobar("document AND inverted AND NOT queries");
+        comprobar("NOT inverted");
+        comprobar("inverted AND inverted");             // idempotente
+        comprobar("inverted AND NOT inverted");         // vacio
+        comprobar("noexisteestapalabra AND inverted");  // vacio
+        comprobar("noexisteestapalabra OR inverted");
+        comprobar("the AND inverted");                  // 'the' es stopword: neutro
+
+        // Las leyes de conjuntos tienen que cumplirse sobre el indice real.
+        CHECK(ix.booleana("inverted AND index") == ix.booleana("index AND inverted"),
+              "AND es conmutativo");
+        CHECK(ix.booleana("inverted OR bm25") == ix.booleana("bm25 OR inverted"),
+              "OR es conmutativo");
+        CHECK(ix.booleana("inverted AND NOT inverted").empty(),
+              "x AND NOT x es vacio");
+        CHECK(ix.booleana("the AND inverted") == ix.booleana("inverted"),
+              "una stopword como operando es neutra");
+
+        // Deteccion de operadores y limpieza de terminos para el plan.
+        CHECK(InvertedIndex::tieneBooleanos("a AND b"), "AND se detecta");
+        CHECK(InvertedIndex::tieneBooleanos("a OR b"), "OR se detecta");
+        CHECK(InvertedIndex::tieneBooleanos("a AND NOT b"), "NOT se detecta");
+        CHECK(!InvertedIndex::tieneBooleanos("inverted index"), "sin operadores, no");
+        CHECK(!InvertedIndex::tieneBooleanos("android order notation"),
+              "and/or/not en minusculas son palabras, no operadores");
+        const std::vector<std::string> ts = ix.terminosDe("inverted AND NOT bm25");
+        CHECK(std::find(ts.begin(), ts.end(), std::string("and")) == ts.end() &&
+              std::find(ts.begin(), ts.end(), std::string("not")) == ts.end(),
+              "los operadores no cuentan como terminos");
+    }
+
+    // =======================================================================
+    SECTION("booleanas: corpus grande y expresiones aleatorias contra fuerza bruta");
+    {
+        std::mt19937 rng(2026);
+        const std::vector<std::string> vocab = {
+            "alfa", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"
+        };
+        std::vector<std::string> docs;
+        std::vector<std::set<std::string>> contiene;
+        for (int d = 0; d < 300; ++d) {
+            std::string s;
+            std::set<std::string> c;
+            for (const std::string& w : vocab)
+                if (rng() % 3 == 0) { s += w; s += ' '; c.insert(w); }
+            if (s.empty()) { s = "alfa "; c.insert("alfa"); }
+            docs.push_back(s);
+            contiene.push_back(c);
+        }
+
+        const std::string f = ruta("ti_bool_big.idx");
+        resetFile(f);
+        DiskManager dm(f);
+        BufferPool bp(&dm, 16);
+        InvertedIndex ix(&bp);
+        construir(ix, docs, texto::Idioma::EN, ruta("spimi_boolbig"), 2048);
+
+        // Fuerza bruta: se recorre documento por documento aplicando la
+        // expresion. No usa listas de posteo en absoluto.
+        auto fuerzaBruta = [&](const std::vector<std::string>& ops,
+                               const std::vector<int>& conectores) {
+            std::vector<std::uint32_t> out;
+            for (std::uint32_t d = 0; d < docs.size(); ++d) {
+                bool v = contiene[d].count(ops[0]) > 0;
+                for (std::size_t i = 1; i < ops.size(); ++i) {
+                    const bool t = contiene[d].count(ops[i]) > 0;
+                    if      (conectores[i - 1] == 0) v = v && t;      // AND
+                    else if (conectores[i - 1] == 1) v = v || t;      // OR
+                    else                             v = v && !t;     // AND NOT
+                }
+                if (v) out.push_back(d);
+            }
+            return out;
+        };
+
+        int vacias = 0;
+        for (int q = 0; q < 200; ++q) {
+            const int n = 2 + static_cast<int>(rng() % 3);          // 2 a 4 operandos
+            std::vector<std::string> ops;
+            std::vector<int> conectores;
+            std::string expr;
+            for (int i = 0; i < n; ++i) {
+                if (i > 0) {
+                    const int c = static_cast<int>(rng() % 3);
+                    conectores.push_back(c);
+                    expr += (c == 0 ? " AND " : c == 1 ? " OR " : " AND NOT ");
+                }
+                const std::string& w = vocab[rng() % vocab.size()];
+                ops.push_back(w);
+                expr += w;
+            }
+            const std::vector<std::uint32_t> got = ix.booleana(expr);
+            const std::vector<std::uint32_t> esp = fuerzaBruta(ops, conectores);
+            CHECK(got == esp, "la expresion coincide con el recorrido completo");
+            if (got.empty()) ++vacias;
+        }
+        // Si casi todas salieran vacias la prueba no estaria probando nada.
+        CHECK(vacias < 150, "las expresiones generadas no son casi todas vacias");
+        std::cout << "   200 expresiones aleatorias, " << (200 - vacias)
+                  << " con resultados\n";
+    }
+
+    // =======================================================================
+    SECTION("booleana + ranking: el booleano admite y el ranking ordena");
+    {
+        const std::vector<std::string> docs = corpusChico();
+        const std::string f = ruta("ti_bool_rank.idx");
+        resetFile(f);
+        DiskManager dm(f);
+        BufferPool bp(&dm, 32);
+        InvertedIndex ix(&bp);
+        construir(ix, docs, texto::Idioma::EN, ruta("spimi_boolrank"), 4096);
+
+        const std::string expr = "document AND NOT inverted";
+        const std::vector<std::uint32_t> admitidos = ix.booleana(expr);
+        const auto res = ix.buscar(expr, -1);
+
+        CHECK(!admitidos.empty(), "la expresion deja documentos");
+        CHECK_EQ(res.size(), admitidos.size(),
+                 "se rankean exactamente los documentos que el booleano admitio");
+        std::set<std::uint32_t> delBooleano(admitidos.begin(), admitidos.end());
+        for (const auto& x : res)
+            CHECK(delBooleano.count(x.doc_id) == 1,
+                  "ningun documento se cuela fuera del conjunto booleano");
+        for (std::size_t i = 1; i < res.size(); ++i)
+            CHECK(res[i - 1].score >= res[i].score, "ordenado por relevancia");
+
+        // Sin el booleano la misma consulta devuelve MAS documentos: es la
+        // prueba de que el AND NOT esta recortando de verdad.
+        CHECK(ix.buscar("document inverted", -1).size() > res.size(),
+              "sin el booleano entran mas documentos");
+
+        // Una expresion imposible no devuelve nada, ni siquiera por ranking.
+        CHECK(ix.buscar("inverted AND NOT inverted", -1).empty(),
+              "una expresion vacia no rankea nada");
     }
 
     DONE("test_inverted");
