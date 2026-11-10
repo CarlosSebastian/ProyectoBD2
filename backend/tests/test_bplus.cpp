@@ -13,7 +13,8 @@
 using namespace db;
 
 int main() {
-    const std::string F = "data/test_bplus.idx";
+    dirPrueba("_tbplus");
+    const std::string F = "data/_tbplus/test_bplus.idx";
     resetFile(F);
 
     const int N = 20000;
@@ -92,7 +93,7 @@ int main() {
 
     SECTION("claves de texto (FixedStr<32>)");
     {
-        const std::string F2 = "data/test_bplus_str.idx";
+        const std::string F2 = "data/_tbplus/test_bplus_str.idx";
         resetFile(F2);
         DiskManager dm(F2);
         BufferPool  bp(&dm, 64);
@@ -124,7 +125,7 @@ int main() {
     // ---------------------------------------------------------------------
     SECTION("claves duplicadas (indice no unico)");
     {
-        const std::string F3 = "data/test_bplus_dup.idx";
+        const std::string F3 = "data/_tbplus/test_bplus_dup.idx";
         resetFile(F3);
         DiskManager dm(F3);
         BufferPool  bp(&dm, 64);

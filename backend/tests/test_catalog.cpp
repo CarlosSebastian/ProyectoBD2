@@ -24,6 +24,7 @@ static TableInfo tiendasInfo(IndexKind kind) {
 }
 
 int main() {
+    dirPrueba("_tcat");
     SECTION("serializacion de tuplas");
     {
         Schema sch({Column("id", Type::INT), Column("nombre", Type::VARCHAR, 10), Column("x", Type::DOUBLE)});
@@ -42,13 +43,13 @@ int main() {
 
     SECTION("catalogo: crear, guardar y releer");
     {
-        resetFile("data/catalog.txt");
+        resetFile("data/_tcat/catalog.txt");
         {
-            Catalog cat("data/catalog.txt");
+            Catalog cat("data/_tcat/catalog.txt");
             cat.createTable(tiendasInfo(IndexKind::BPLUS));
             CHECK(cat.exists("tiendas"), "la tabla quedo registrada");
         }
-        Catalog cat2("data/catalog.txt");           // se relee del disco
+        Catalog cat2("data/_tcat/catalog.txt");           // se relee del disco
         CHECK(cat2.exists("tiendas"), "la tabla sobrevive al reinicio");
         const TableInfo& ti = cat2.get("tiendas");
         CHECK_EQ(ti.schema.size(), static_cast<std::size_t>(3), "columnas del esquema");
@@ -62,9 +63,9 @@ int main() {
 
     SECTION("Table con indice B+ Tree: eleccion de plan");
     {
-        resetFile("data/t_tiendas.dat");
-        resetFile("data/t_tiendas_id.idx");
-        Table t("data", tiendasInfo(IndexKind::BPLUS));
+        resetFile("data/_tcat/t_tiendas.dat");
+        resetFile("data/_tcat/t_tiendas_id.idx");
+        Table t("data/_tcat", tiendasInfo(IndexKind::BPLUS));
         for (int i = 0; i < 2000; ++i)
             t.insert(Tuple{{Value::makeInt(i), Value::makeStr("Tienda " + std::to_string(i)),
                             Value::makeDouble(i * 1.5)}});
@@ -86,9 +87,9 @@ int main() {
 
     SECTION("Table con Hash: los rangos caen a full scan");
     {
-        resetFile("data/t_tiendas.dat");
-        resetFile("data/t_tiendas_id.idx");
-        Table t("data", tiendasInfo(IndexKind::HASH));
+        resetFile("data/_tcat/t_tiendas.dat");
+        resetFile("data/_tcat/t_tiendas_id.idx");
+        Table t("data/_tcat", tiendasInfo(IndexKind::HASH));
         for (int i = 0; i < 2000; ++i)
             t.insert(Tuple{{Value::makeInt(i), Value::makeStr("Tienda " + std::to_string(i)),
                             Value::makeDouble(i * 1.5)}});
@@ -127,9 +128,9 @@ int main() {
     // ------------------------------------------------------------------
     SECTION("dos indices a la vez: B+ sobre la clave y R-Tree sobre un POINT");
     {
-        resetFile("data/t_sitios.dat");
-        resetFile("data/t_sitios_id.idx");
-        resetFile("data/t_sitios_ubic.idx");
+        resetFile("data/_tcat/t_sitios.dat");
+        resetFile("data/_tcat/t_sitios_id.idx");
+        resetFile("data/_tcat/t_sitios_ubic.idx");
 
         TableInfo ti;
         ti.name       = "sitios";
@@ -144,7 +145,7 @@ int main() {
         const MBR ventana(0.0, 0.0, 100.0, 100.0);
         const int N = 400;
         {
-            Table t("data", ti, 32);
+            Table t("data/_tcat", ti, 32);
             CHECK_EQ(t.numIndices(), static_cast<std::size_t>(2), "la tabla abrio dos indices");
 
             for (int i = 0; i < N; ++i) {
@@ -197,7 +198,7 @@ int main() {
 
         SECTION("los dos indices sobreviven a cerrar y reabrir la tabla");
         {
-            Table t("data", ti, 32);
+            Table t("data/_tcat", ti, 32);
             CHECK_EQ(t.numIndices(), static_cast<std::size_t>(2), "dos indices tras reabrir");
             CHECK_EQ(t.searchEq("id", Value::makeInt(123)).size(),
                      static_cast<std::size_t>(1), "el B+ sigue respondiendo");
@@ -207,7 +208,7 @@ int main() {
 
         SECTION("buildIndex reconstruye AMBOS en una sola pasada del heap");
         {
-            Table t("data", ti, 32);
+            Table t("data/_tcat", ti, 32);
             t.buildIndex();
             CHECK_EQ(t.searchEq("id", Value::makeInt(77)).size(),
                      static_cast<std::size_t>(1), "B+ repoblado");

@@ -698,6 +698,48 @@ static Predicate repartirCondiciones(const TableInfo& ti, const std::string& cla
     return todas[mejor];
 }
 
+// ---------------------------------------------------------------------------
+//  Recorrido de un SELECT, de punta a punta.
+//
+//  Util para no perderse: una consulta pasa por cuatro capas, y cada una vive
+//  en un archivo distinto.
+//
+//    sql.cpp      el texto se convierte en un Statement. El WHERE queda como
+//                 uno o varios Predicate, cada uno con un PredKind que dice de
+//                 que FORMA es la condicion: EQ, RANGO, WITHIN, RADIO,
+//                 CONTIENE, MATCH, VECDIST. El ORDER BY por distancia no es un
+//                 predicado: queda aparte en st.knn / st.knn_vectorial.
+//
+//    database.cpp (esto) elige UNA ruta de acceso y deja las demas condiciones
+//                 como filtro residual. No mira histogramas ni cardinalidades:
+//                 decide por la forma del predicado, que es lo unico que se
+//                 sabe sin estadisticas. Una igualdad devuelve del orden de
+//                 una fila, una ventana un area acotada, un rango puede
+//                 devolver media tabla.
+//
+//    table.cpp    ejecuta la ruta elegida sobre la tabla y sus indices, y deja
+//                 en last_plan_ el metodo y las paginas leidas.
+//
+//    rtree.hpp / inverted.cpp / ivf.cpp / bplus_tree.hpp
+//                 la estructura de datos que de verdad toca el disco.
+//
+//  Dos reglas que explican casi todas las decisiones de aqui abajo:
+//
+//  1. Una ordenacion (KNN espacial, MATCH, similitud vectorial) MANDA sobre el
+//     WHERE: es ella la que decide la ruta, y el resto del WHERE se aplica
+//     despues sobre los candidatos. Eso es el Post-filtering. Como el indice
+//     ordena sin saber nada del predicado, pedir k y filtrar puede dejar menos
+//     de k, asi que el motor SOBRE-PIDE: duplica la peticion hasta reunir k o
+//     hasta agotar el indice.
+//
+//  2. Sin el indice adecuado, casi todas las rutas tienen un plan B por
+//     escaneo que da el MISMO resultado, mas caro. La unica excepcion es la
+//     similitud vectorial, donde recorrer la tabla comparando cientos de
+//     floats por fila es exactamente lo que el indice existe para evitar.
+//
+//  Al final se construye QueryResult: filas, columna calculada (score o
+//  distancia), contadores de I/O y el plan por etapas que pinta el cliente.
+// ---------------------------------------------------------------------------
 QueryResult Database::ejecutarSelect(const Statement& st) {
     QueryResult r;
     Table* t = abrir(st.table);
@@ -727,7 +769,10 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
         const std::vector<std::uint32_t> tam = iv->tamanosDeListas();
         std::uint32_t mayor = 0;
         for (std::uint32_t c : tam) if (c > mayor) mayor = c;
-        const int np = probes_pedidos > 0 ? probes_pedidos : iv->nprobePorDefecto();
+        // Se recorta a nlist: pedir mas celdas de las que hay no es un error,
+        // pero publicar "nprobe=3/2" en el plan queda raro y se lee como un bug.
+        int np = probes_pedidos > 0 ? probes_pedidos : iv->nprobePorDefecto();
+        if (np > iv->listas()) np = iv->listas();
         d = "metrica " + IVFIndex::nombreMetrica(iv->metrica()) +
             ", nprobe=" + std::to_string(np) + "/" + std::to_string(iv->listas()) +
             " celdas, " + std::to_string(iv->size()) + " vectores (la celda mayor tiene " +
@@ -1072,6 +1117,11 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
         if (sch[ck].type != Type::POINT)
             throw DBException("ORDER BY por distancia exige una columna POINT: '" +
                               st.knn_column + "' es " + typeName(sch[ck].type));
+        // Sin este numero <-> y ST_DISTANCE se ven identicos en la tabla:
+        // mismas filas, mismo orden, ninguna pista de que uno mide grados y el
+        // otro metros sobre la esfera.
+        columna_extra      = "distancia";
+        extra_es_distancia = true;
         const int k = st.limit >= 0 ? static_cast<int>(st.limit) : -1;
 
         // Un WHERE junto a un ORDER BY por distancia obliga a SOBRE-PEDIR. El
@@ -1084,9 +1134,9 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
         if (cond.kind != PredKind::NONE) todas.push_back(cond);
         for (const Predicate& f : filtros) todas.push_back(f);
 
-        auto vecinos = [&](int cuantos) {
-            return st.knn_geo ? t->searchKNNGeo(st.knn_column, st.knn_x, st.knn_y, cuantos)
-                              : t->searchKNN(st.knn_column, st.knn_x, st.knn_y, cuantos);
+        auto vecinos = [&](int cuantos, std::vector<double>* ds) {
+            return st.knn_geo ? t->searchKNNGeo(st.knn_column, st.knn_x, st.knn_y, cuantos, ds)
+                              : t->searchKNN(st.knn_column, st.knn_x, st.knn_y, cuantos, ds);
         };
         auto pasaTodas = [&](const Tuple& f) {
             for (const Predicate& w : todas) {
@@ -1098,22 +1148,30 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
         };
 
         if (todas.empty()) {
-            filas = vecinos(k);
+            filas = vecinos(k, &puntajes);
         } else {
             knn_ya_filtrado = true;
             int pedir = (k < 0) ? -1 : std::max(k, 1);
             while (true) {
-                std::vector<Tuple> cand = vecinos(pedir);
+                std::vector<double> ds;
+                std::vector<Tuple> cand = vecinos(pedir, &ds);
                 filas.clear();
-                for (const Tuple& f : cand) if (pasaTodas(f)) filas.push_back(f);
+                puntajes.clear();
+                for (std::size_t i = 0; i < cand.size(); ++i) {
+                    if (!pasaTodas(cand[i])) continue;
+                    filas.push_back(cand[i]);
+                    puntajes.push_back(i < ds.size() ? ds[i] : 0.0);
+                }
                 if (k < 0) break;                                   // orden total
                 if (static_cast<int>(filas.size()) >= k) break;      // ya alcanzan
                 if (static_cast<int>(cand.size()) < pedir) break;    // el indice se agoto
                 if (pedir > 1 << 24) break;                          // tope de seguridad
                 pedir *= 2;
             }
-            if (k >= 0 && static_cast<int>(filas.size()) > k)
+            if (k >= 0 && static_cast<int>(filas.size()) > k) {
                 filas.resize(static_cast<std::size_t>(k));
+                puntajes.resize(static_cast<std::size_t>(k));
+            }
         }
     } else if (cond.kind == PredKind::NONE) {
         filas = t->scan();
@@ -1122,14 +1180,21 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     } else if (cond.kind == PredKind::CONTIENE) {
         filas = t->searchContains(cond.column, cond.qlon, cond.qlat);
     } else if (cond.kind == PredKind::RADIO) {
-        filas = t->searchRadio(cond.column, cond.qlon, cond.qlat, cond.metros);
+        columna_extra      = "distancia";
+        extra_es_distancia = true;
+        filas = t->searchRadio(cond.column, cond.qlon, cond.qlat, cond.metros, &puntajes);
         if (cond.radio_estricto) {     // el indice resuelve <=; el < se afina aqui
             const int cr = sch.indexOf(cond.column);
-            std::vector<Tuple> quedan;
+            std::vector<Tuple>  quedan;
+            std::vector<double> ds;
             quedan.reserve(filas.size());
-            for (const Tuple& f : filas)
-                if (cumple(f.at(static_cast<std::size_t>(cr)), cond)) quedan.push_back(f);
+            for (std::size_t i = 0; i < filas.size(); ++i) {
+                if (!cumple(filas[i].at(static_cast<std::size_t>(cr)), cond)) continue;
+                quedan.push_back(filas[i]);
+                ds.push_back(i < puntajes.size() ? puntajes[i] : 0.0);
+            }
             filas.swap(quedan);
+            puntajes.swap(ds);
         }
     } else {
         int ci = sch.indexOf(cond.column);
@@ -1185,8 +1250,20 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
                               std::to_string(dEjec.reads) + " lecturas de disco (" +
                               std::to_string(t->indexReads() - io_index0) + " del indice, " +
                               std::to_string(t->heapReads() - io_heap0) + " de la tabla)"});
-    if (!estrategia.empty())
-        r.plan.push_back(PlanStep{"Estrategia: " + estrategia, 0.0, detalle_ruta});
+    if (!estrategia.empty()) {
+        // Un paso propio para la estrategia, con una explicacion CORTA: repetir
+        // aqui el detalle de la planificacion solo llenaria el panel dos veces.
+        const std::string porque =
+            estrategia == "Post-filtering"
+                ? "el indice ordena por relevancia o distancia y no sabe nada del resto del "
+                  "WHERE: trae candidatos y el predicado se aplica despues, sobre ellos"
+            : estrategia == "Pre-filtering"
+                ? "el predicado relacional acota el conjunto ANTES de evaluar nada caro, y "
+                  "lo que sobra se comprueba sobre esas pocas filas"
+                : "ninguna condicion tiene indice que la resuelva: se filtra en memoria "
+                  "sobre las filas recuperadas";
+        r.plan.push_back(PlanStep{"Estrategia: " + estrategia, 0.0, porque});
+    }
     if (t->lastPlan().descartados > 0) {
         // Visible a proposito: es la diferencia entre lo que el indice puede
         // prometer (cajas envolventes) y lo que la consulta realmente pide.
@@ -1223,9 +1300,12 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
     // Si la consulta pidio la columna con un alias (COSINE_SCORE() AS x, o
     // col <=> [..] AS x), se muestra con ese nombre: es por el que el ORDER BY
     // se refiere a ella.
-    if (con_puntaje)
+    if (con_puntaje) {
         r.columns.push_back(st.columna_puntaje.empty() ? std::string(columna_extra)
                                                        : st.columna_puntaje);
+        r.col_calculada    = static_cast<int>(r.columns.size()) - 1;
+        r.col_es_distancia = extra_es_distancia;
+    }
 
     long long tope = (st.limit >= 0) ? st.limit : static_cast<long long>(filas.size());
     for (std::size_t fi = 0; fi < filas.size(); ++fi) {
@@ -1237,7 +1317,11 @@ QueryResult Database::ejecutarSelect(const Statement& st) {
             char buf[32];
             // Una distancia coseno util vive en las milesimas: con cuatro
             // decimales dos vecinos distintos saldrian con el mismo numero.
-            std::snprintf(buf, sizeof(buf), extra_es_distancia ? "%.6f" : "%.4f", puntajes[fi]);
+            // Una distancia geografica, en cambio, viene en metros, y seis
+            // decimales serian ruido. Se elige por magnitud.
+            const char* fmt = !extra_es_distancia ? "%.4f"
+                            : (std::fabs(puntajes[fi]) < 1.0 ? "%.6f" : "%.2f");
+            std::snprintf(buf, sizeof(buf), fmt, puntajes[fi]);
             fila.push_back(buf);
         }
         r.rows.push_back(std::move(fila));

@@ -106,11 +106,17 @@ public:
                                         double x0, double y0, double x1, double y1);
     // k vecinos mas cercanos, ya ordenados por distancia creciente.
     // k < 0 significa "todos", ordenados igual.
-    std::vector<Tuple> searchKNN(const std::string& col, double px, double py, int k);
+    // Si 'distancias' no es nulo, recibe la distancia de cada fila en el mismo
+    // orden. Sin ella el resultado es una lista que el usuario no puede
+    // verificar: ve el orden pero no el numero que lo justifica.
+    std::vector<Tuple> searchKNN(const std::string& col, double px, double py, int k,
+                                 std::vector<double>* distancias = nullptr);
     // Lo mismo pero por distancia GEOGRAFICA en metros (x = lon, y = lat).
-    std::vector<Tuple> searchKNNGeo(const std::string& col, double lon, double lat, int k);
+    std::vector<Tuple> searchKNNGeo(const std::string& col, double lon, double lat, int k,
+                                    std::vector<double>* distancias = nullptr);
     // Todos los puntos a no mas de 'metros' del punto dado.
-    std::vector<Tuple> searchRadio(const std::string& col, double lon, double lat, double metros);
+    std::vector<Tuple> searchRadio(const std::string& col, double lon, double lat, double metros,
+                                   std::vector<double>* distancias = nullptr);
     std::vector<RID>   searchRIDsRadio(const std::string& col, double lon, double lat, double metros);
     // Poligonos que contienen al punto. Filtra por MBR en el indice y refina
     // con la geometria real.

@@ -549,6 +549,11 @@ void InvertedIndex::construir(const std::function<bool(RID&, std::string&)>& sig
     escribirMeta();
     bp_->flushAll();
 
+    // Los lectores de la mezcla siguen con su ifstream abierto sobre cada
+    // bloque. En Windows std::remove falla sobre un archivo con un handle
+    // vivo, asi que los .tmp sobrevivian a la construccion y se acumulaban en
+    // data/. Cerrarlos antes de borrar es lo unico que faltaba.
+    lectores.clear();
     for (const std::string& r : rutas) std::remove(r.c_str());
     std::remove(ruta_dicc.c_str());
 }

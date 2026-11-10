@@ -29,7 +29,10 @@
 
 using namespace db;
 
-static std::string ruta(const std::string& n) { return "data/" + n; }
+static std::string ruta(const std::string& n) {
+    static const std::string d = dirPrueba("_tivf2");
+    return d + "/" + n;
+}
 
 namespace {
 

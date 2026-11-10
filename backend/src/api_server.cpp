@@ -57,6 +57,8 @@ static std::string resultToJson(const QueryResult& r) {
     }
     os << ",\"rows\":" << json::arr(filas)
        << ",\"row_count\":" << r.row_count
+       << ",\"col_calculada\":" << r.col_calculada
+       << ",\"col_es_distancia\":" << (r.col_es_distancia ? "true" : "false")
        << ",\"plan\":" << planToJson(r.plan)
        << ",\"disk_reads\":" << r.disk_reads
        << ",\"disk_writes\":" << r.disk_writes

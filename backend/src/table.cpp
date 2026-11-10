@@ -399,8 +399,38 @@ std::vector<Tuple> Table::scan() {
 }
 
 // ---------------------------------------------------------------------------
-//  Consultas espaciales. Son las dos rutas que estrena el Entregable 2.
+//  Consultas espaciales (Parte 2).
+//
+//  Hay cinco: ventana (WITHIN), k-NN euclidiano (<->), k-NN geografico y radio
+//  (ST_DISTANCE, WITHIN_RADIUS) y contencion de punto en poligono
+//  (ST_CONTAINS). Todas siguen el mismo esqueleto, asi que basta entender uno:
+//
+//    1. Resolver la columna y comprobar su tipo. columnaPunto() exige POINT;
+//       columnaGeom() acepta POINT o POLYGON, porque la ventana vale para los
+//       dos y la distancia solo para puntos.
+//    2. Si hay un R-Tree sobre esa columna, pedirle los candidatos. Si no lo
+//       hay, recorrer el heap entero. Las dos ramas devuelven lo MISMO: el
+//       indice cambia el costo, nunca el resultado. Por eso el motor puede
+//       responder sin indice en vez de rechazar la consulta.
+//    3. Dejar en last_plan_ el metodo elegido, las paginas leidas y el tiempo.
+//       De ahi sale el panel de plan del cliente, que es lo que permite
+//       comprobar que el indice se uso de verdad.
+//
+//  Cada consulta aparece dos veces. searchRIDsX() hace el trabajo y devuelve
+//  RIDs; searchX() la envuelve y lee las filas. La separacion existe porque
+//  DELETE necesita los RIDs y no las filas, y asi no se duplica la logica.
+//
+//  Sobre POLYGON el indice es solo un FILTRO: guarda la caja envolvente, no la
+//  figura. Un triangulo ocupa la mitad de su caja, asi que el indice devuelve
+//  falsos positivos y hace falta un segundo paso de REFINAMIENTO con la
+//  geometria real. Ese par filtrar + refinar es como funcionan los motores
+//  espaciales de verdad, y se ve explicito en searchRIDsWithin y
+//  searchRIDsContains.
 // ---------------------------------------------------------------------------
+// Ventana: todo lo que cae dentro del rectangulo (x0,y0)-(x1,y1).
+// A diferencia de un rango sobre un B+, aqui la busqueda puede bajar por
+// VARIAS ramas a la vez: las cajas hermanas de un R-Tree pueden solaparse, asi
+// que no hay una sola rama "correcta" por la que descender.
 std::vector<RID> Table::searchRIDsWithin(const std::string& col,
                                          double x0, double y0, double x1, double y1) {
     auto t0 = Clock::now();
@@ -453,6 +483,9 @@ std::vector<RID> Table::searchRIDsWithin(const std::string& col,
     return out;
 }
 
+// Los envoltorios que siguen son todos iguales: piden los RIDs a la variante
+// de arriba y leen cada fila del heap. El contador de registros del plan se
+// ajusta aqui porque una fila puede haberse borrado entre medias.
 std::vector<Tuple> Table::searchWithin(const std::string& col,
                                        double x0, double y0, double x1, double y1) {
     std::vector<Tuple> out;
@@ -464,7 +497,16 @@ std::vector<Tuple> Table::searchWithin(const std::string& col,
     return out;
 }
 
-std::vector<Tuple> Table::searchKNN(const std::string& col, double px, double py, int k) {
+// k vecinos mas cercanos por distancia euclidiana, ya ordenados. El R-Tree lo
+// resuelve con best-first y el resultado es EXACTO, no aproximado: visita solo
+// los nodos que podrian contener un vecino mejor que el peor que ya tiene.
+//
+// Sin indice, o sin LIMIT, no queda otra que calcular la distancia de todas
+// las filas. Con LIMIT se usa nth_element (O(n)) en vez de ordenar entero
+// (O(n log n)), pero el archivo se lee completo igual.
+std::vector<Tuple> Table::searchKNN(const std::string& col, double px, double py, int k,
+                                    std::vector<double>* distancias) {
+    if (distancias) distancias->clear();
     auto t0 = Clock::now();
     long long r0 = lecturasTotales();
 
@@ -477,7 +519,9 @@ std::vector<Tuple> Table::searchKNN(const std::string& col, double px, double py
         last_plan_.metodo = "INDEX RTREE (knn)";
         for (const auto& par : ix->rt->knn(px, py, k)) {
             Tuple t;
-            if (getByRID(par.second, t)) out.push_back(t);
+            if (!getByRID(par.second, t)) continue;
+            out.push_back(std::move(t));
+            if (distancias) distancias->push_back(par.first);
         }
     } else {
         // Sin indice (o sin LIMIT) hay que calcular la distancia de TODAS las
@@ -502,7 +546,10 @@ std::vector<Tuple> Table::searchKNN(const std::string& col, double px, double py
             todos.resize(tope);
         }
         std::sort(todos.begin(), todos.end(), antes);
-        for (auto& par : todos) out.push_back(std::move(par.second));
+        for (auto& par : todos) {
+            out.push_back(std::move(par.second));
+            if (distancias) distancias->push_back(par.first);
+        }
     }
 
     last_plan_.columna        = col;
@@ -568,7 +615,9 @@ std::vector<Tuple> Table::searchContains(const std::string& col, double px, doub
 }
 
 // --- Variantes geograficas: distancia real en metros sobre la esfera -------
-std::vector<Tuple> Table::searchKNNGeo(const std::string& col, double lon, double lat, int k) {
+std::vector<Tuple> Table::searchKNNGeo(const std::string& col, double lon, double lat, int k,
+                                       std::vector<double>* distancias) {
+    if (distancias) distancias->clear();
     auto t0 = Clock::now();
     long long r0 = lecturasTotales();
 
@@ -581,7 +630,9 @@ std::vector<Tuple> Table::searchKNNGeo(const std::string& col, double lon, doubl
         last_plan_.metodo = "INDEX RTREE (knn geo)";
         for (const auto& par : ix->rt->knnGeo(lon, lat, k)) {
             Tuple t;
-            if (getByRID(par.second, t)) out.push_back(t);
+            if (!getByRID(par.second, t)) continue;
+            out.push_back(std::move(t));
+            if (distancias) distancias->push_back(par.first);
         }
     } else {
         last_plan_.metodo = (k >= 0) ? "SEQ SCAN (knn geo)" : "SEQ SCAN (orden por distancia geo)";
@@ -602,7 +653,10 @@ std::vector<Tuple> Table::searchKNNGeo(const std::string& col, double lon, doubl
             todos.resize(tope);
         }
         std::sort(todos.begin(), todos.end(), antes);
-        for (auto& par : todos) out.push_back(std::move(par.second));
+        for (auto& par : todos) {
+            out.push_back(std::move(par.second));
+            if (distancias) distancias->push_back(par.first);
+        }
     }
 
     last_plan_.columna        = col;
@@ -643,11 +697,21 @@ std::vector<RID> Table::searchRIDsRadio(const std::string& col, double lon, doub
 }
 
 std::vector<Tuple> Table::searchRadio(const std::string& col, double lon, double lat,
-                                      double metros) {
+                                      double metros, std::vector<double>* distancias) {
+    if (distancias) distancias->clear();
+    // searchRIDsRadio valida la columna y lanza si no es POINT, asi que se
+    // llama antes de pedir el indice de la columna.
+    const std::vector<RID> rids = searchRIDsRadio(col, lon, lat, metros);
+    const int ci = columnaPunto(col);
     std::vector<Tuple> out;
-    for (const RID& rid : searchRIDsRadio(col, lon, lat, metros)) {
+    for (const RID& rid : rids) {
         Tuple t;
-        if (getByRID(rid, t)) out.push_back(t);
+        if (!getByRID(rid, t)) continue;
+        if (distancias && ci >= 0) {
+            const Value& v = t.values[static_cast<std::size_t>(ci)];
+            distancias->push_back(geo::haversine(lon, lat, v.d, v.y));
+        }
+        out.push_back(std::move(t));
     }
     last_plan_.registros = static_cast<long long>(out.size());
     return out;
@@ -873,7 +937,10 @@ std::vector<Tuple> Table::searchVector(const std::string& col, const std::vector
         if (distancias) distancias->push_back(x.dist);
     }
 
-    const int np = probes > 0 ? probes : ix->ivf->nprobePorDefecto();
+    // Igual que en el plan: pedir mas celdas de las que hay no es un error,
+    // pero publicar "nprobe=3/2" se lee como un bug.
+    int np = probes > 0 ? probes : ix->ivf->nprobePorDefecto();
+    if (np > ix->ivf->listas()) np = ix->ivf->listas();
     last_plan_.metodo         = "INDEX IVF (" + IVFIndex::nombreMetrica(ix->metrica) +
                                 ", nprobe=" + std::to_string(np) + "/" +
                                 std::to_string(ix->ivf->listas()) + ")";
@@ -959,7 +1026,10 @@ std::vector<Tuple> Table::searchVectorUmbral(const std::string& col,
         if (distancias) distancias->push_back(x.dist);
     }
 
-    const int np = probes > 0 ? probes : ix->ivf->nprobePorDefecto();
+    // Igual que en el plan: pedir mas celdas de las que hay no es un error,
+    // pero publicar "nprobe=3/2" se lee como un bug.
+    int np = probes > 0 ? probes : ix->ivf->nprobePorDefecto();
+    if (np > ix->ivf->listas()) np = ix->ivf->listas();
     last_plan_.metodo         = "INDEX IVF UMBRAL (" + IVFIndex::nombreMetrica(ix->metrica) +
                                 ", nprobe=" + std::to_string(np) + "/" +
                                 std::to_string(ix->ivf->listas()) + ")";

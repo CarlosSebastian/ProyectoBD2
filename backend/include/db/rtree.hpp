@@ -343,6 +343,13 @@ public:
     }
 
     // ------------------------------------------------------------------ API
+
+    // Un R-Tree crece SOLO por arriba, y solo aqui. insertRec baja hasta la
+    // hoja y, si parte un nodo, devuelve el hermano nuevo hacia su padre; el
+    // padre intenta absorberlo y puede partirse a su vez. Si ese efecto llega
+    // hasta la raiz, no hay padre que absorba nada: se crea una raiz nueva con
+    // los dos trozos como hijos y la altura sube en uno. Por eso todas las
+    // hojas quedan siempre al mismo nivel, igual que en un B+.
     void insert(const MBR& box, const RID& rid) {
         page_id_t raiz = getRoot();
         if (raiz == INVALID_PAGE_ID) {                  // primer elemento
@@ -492,6 +499,11 @@ public:
     static int internalCapacity() { return INT_MAX_E; }
 
 private:
+    // Lo que insertRec devuelve hacia arriba. Si el nodo no se desbordo,
+    // 'ocurrio' es false y el padre no tiene nada que hacer. Si se partio, el
+    // nodo original se queda con el grupo izquierdo y nace una pagina nueva
+    // con el derecho: el padre tiene que reemplazar la caja del hijo por
+    // mbr_izq y anadir una entrada (mbr_der, derecha).
     struct Split {
         bool      ocurrio = false;
         MBR       mbr_izq, mbr_der;
@@ -512,6 +524,18 @@ private:
     };
 
     // ---- offsets dentro de un nodo ----
+    //
+    // Las tres zonas (cajas, RIDs, hijos) se reservan a CAPACIDAD COMPLETA,
+    // no al numero de entradas vivas. Por eso estos offsets son constantes:
+    // la posicion de la entrada i no depende de n, y anadir o quitar entradas
+    // nunca obliga a mover las demas.
+    //
+    // Un nodo es hoja o interno, nunca las dos cosas, asi que las zonas de
+    // RIDs y de hijos se solapan en el archivo y solo una esta en uso. Cada
+    // una se dimensiona con la capacidad de SU tipo de nodo (LEAF_MAX para los
+    // RIDs, INT_MAX_E para los hijos), que es lo que hace que un nodo interno
+    // quepa mas entradas: un puntero de pagina ocupa menos que un RID.
+    // El bool de ridOff/hijoOff es historico y no se usa.
     static int mbrOff(int i)              { return NODE_HDR + i * MBR_SZ; }
     static int ridOff(int i, bool)        { return NODE_HDR + LEAF_MAX  * MBR_SZ + i * RID_SZ; }
     static int hijoOff(int i, bool)       { return NODE_HDR + INT_MAX_E * MBR_SZ + i * PID_SZ; }
@@ -574,6 +598,18 @@ private:
         for (page_id_t h : bajar) searchRec(h, ventana, out);
     }
 
+    // Busqueda por radio geografico. Las dos mitades miden cosas distintas a
+    // proposito:
+    //   - en una HOJA la caja de un punto es degenerada (minx==maxx), asi que
+    //     (minx, miny) ES el punto y se mide la distancia REAL con haversine:
+    //     de esa comparacion sale la respuesta, y tiene que ser exacta.
+    //   - en un nodo INTERNO la caja cubre muchos puntos, asi que se usa
+    //     mindistGeo, que es una COTA INFERIOR: la distancia del punto de
+    //     consulta a lo mas cercano que esa caja podria contener. Si esa cota
+    //     ya supera el radio, nada de ese subarbol puede entrar y la rama se
+    //     poda entera sin leerla.
+    // Podar con una cota que se pasara descartaria resultados validos; por eso
+    // mindistGeo esta construida para no pasarse nunca.
     void radioRec(page_id_t pid, double lon, double lat, double metros,
                   std::vector<RID>* out) const {
         const char* b = bp_->fetchPage(pid);

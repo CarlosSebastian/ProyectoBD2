@@ -13,7 +13,8 @@
 using namespace db;
 
 int main() {
-    const std::string F = "data/test_hash.idx";
+    dirPrueba("_thash");
+    const std::string F = "data/_thash/test_hash.idx";
     resetFile(F);
 
     const int N = 20000;
@@ -81,7 +82,7 @@ int main() {
 
     SECTION("claves de texto (FixedStr<32>)");
     {
-        const std::string F2 = "data/test_hash_str.idx";
+        const std::string F2 = "data/_thash/test_hash_str.idx";
         resetFile(F2);
         DiskManager dm(F2);
         BufferPool  bp(&dm, 64);

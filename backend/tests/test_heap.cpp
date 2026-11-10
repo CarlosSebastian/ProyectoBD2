@@ -19,7 +19,8 @@ static std::string reg(int i) {   // registros de LONGITUD VARIABLE a proposito
 }
 
 int main() {
-    const std::string F = "data/test_heap.dat";
+    dirPrueba("_theap");
+    const std::string F = "data/_theap/test_heap.dat";
     resetFile(F);
 
     std::map<int, RID> pos;

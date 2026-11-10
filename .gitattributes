@@ -1,0 +1,37 @@
+# Normalizacion de finales de linea.
+#
+# Sin esto, en un clone sobre Windows con core.autocrlf=true git entrega
+# build.sh con CRLF y bash falla con un error que no dice nada util
+# ("bad interpreter: No such file or directory"). El proyecto se entrega para
+# que lo levante otra persona en otra maquina, asi que esto no es cosmetico.
+
+# Git decide que es texto y lo guarda con LF en el repositorio.
+* text=auto
+
+# Los scripts SIEMPRE con LF, incluso en la copia de trabajo de Windows:
+# los ejecuta bash (Git Bash, MSYS2, WSL), no cmd.
+*.sh   text eol=lf
+*.py   text eol=lf
+Makefile text eol=lf
+
+# Fuentes y documentos de texto: normalizados.
+*.cpp  text
+*.hpp  text
+*.md   text
+*.tex  text
+*.html text
+*.css  text
+*.js   text
+*.csv  text
+*.json text
+*.jsonl text
+*.txt  text
+
+# Binarios: nunca tocar.
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+*.dat  binary
+*.idx  binary
+*.ovf  binary
+*.onnx binary

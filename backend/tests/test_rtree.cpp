@@ -61,7 +61,8 @@ std::vector<double> knnFuerzaBruta(const std::vector<Punto>& ps, double px, doub
 }  // namespace
 
 int main() {
-    const std::string F = "data/test_rtree.idx";
+    dirPrueba("_trtree");
+    const std::string F = "data/_trtree/test_rtree.idx";
     resetFile(F);
 
     const int N = 20000;
@@ -131,12 +132,12 @@ int main() {
 
         SECTION("KNN con k mayor que el total devuelve todo el conjunto");
         {
-            DiskManager dm2("data/test_rtree_chico.idx");
-            resetFile("data/test_rtree_chico.idx");
+            DiskManager dm2("data/_trtree/test_rtree_chico.idx");
+            resetFile("data/_trtree/test_rtree_chico.idx");
         }
         {
-            resetFile("data/test_rtree_chico.idx");
-            DiskManager dm2("data/test_rtree_chico.idx");
+            resetFile("data/_trtree/test_rtree_chico.idx");
+            DiskManager dm2("data/_trtree/test_rtree_chico.idx");
             BufferPool  bp2(&dm2, 16);
             RTree       chico(&bp2);
             for (int i = 0; i < 7; ++i) chico.insert(MBR::point(i, i), RID(0, i));
@@ -146,8 +147,8 @@ int main() {
 
         SECTION("puntos duplicados en la misma coordenada");
         {
-            resetFile("data/test_rtree_dup.idx");
-            DiskManager dm3("data/test_rtree_dup.idx");
+            resetFile("data/_trtree/test_rtree_dup.idx");
+            DiskManager dm3("data/_trtree/test_rtree_dup.idx");
             BufferPool  bp3(&dm3, 16);
             RTree       dup(&bp3);
             for (int i = 0; i < 500; ++i) dup.insert(MBR::point(10.0, 20.0), RID(1, i));
@@ -192,7 +193,7 @@ int main() {
 
     SECTION("un .idx de otro tipo no se interpreta como R-Tree");
     {
-        const std::string G = "data/test_rtree_ajeno.idx";
+        const std::string G = "data/_trtree/test_rtree_ajeno.idx";
         resetFile(G);
         {
             DiskManager dm(G);
@@ -254,8 +255,8 @@ int main() {
 
     SECTION("KNN geografico contra fuerza bruta");
     {
-        resetFile("data/test_rtree_geo.idx");
-        DiskManager dmg("data/test_rtree_geo.idx");
+        resetFile("data/_trtree/test_rtree_geo.idx");
+        DiskManager dmg("data/_trtree/test_rtree_geo.idx");
         BufferPool  bpg(&dmg, 64);
         RTree       rg(&bpg);
 
@@ -309,8 +310,8 @@ int main() {
         // En grados el del norte parece mas cerca (0.9 < 1.0), pero en metros
         // esta al doble de distancia, porque un grado de longitud a esa latitud
         // mide la mitad que uno de latitud.
-        resetFile("data/test_rtree_n60.idx");
-        DiskManager dmn("data/test_rtree_n60.idx");
+        resetFile("data/_trtree/test_rtree_n60.idx");
+        DiskManager dmn("data/_trtree/test_rtree_n60.idx");
         BufferPool  bpn(&dmn, 16);
         RTree       rn(&bpn);
         const RID este(0, 1), norte(0, 2);
@@ -371,8 +372,8 @@ int main() {
 
     SECTION("R-Tree sobre poligonos: filtrar + refinar contra fuerza bruta");
     {
-        resetFile("data/test_rtree_poly.idx");
-        DiskManager dmp("data/test_rtree_poly.idx");
+        resetFile("data/_trtree/test_rtree_poly.idx");
+        DiskManager dmp("data/_trtree/test_rtree_poly.idx");
         BufferPool  bpp(&dmp, 64);
         RTree       rp(&bpp);
 

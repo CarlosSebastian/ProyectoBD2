@@ -46,8 +46,9 @@ static std::int64_t claveDe(const Schema& sch, const std::string& payload) {
 }
 
 int main() {
-    const std::string MAIN = "data/test_seq.dat";
-    const std::string OVF  = "data/test_seq.ovf";
+    dirPrueba("_tseq");
+    const std::string MAIN = "data/_tseq/test_seq.dat";
+    const std::string OVF  = "data/_tseq/test_seq.ovf";
     Schema sch = esquema();
 
     const int N = 4000;
@@ -219,8 +220,8 @@ int main() {
         // overflow gigante; con reorganizacion periodica el area principal
         // crece y la busqueda vuelve a costar log2(P).
         auto correr = [&](bool con_reorg, int* pags, long long* ovf, int* sondeos) {
-            const std::string M = con_reorg ? "data/test_seq_con.dat" : "data/test_seq_sin.dat";
-            const std::string O = con_reorg ? "data/test_seq_con.ovf" : "data/test_seq_sin.ovf";
+            const std::string M = con_reorg ? "data/_tseq/test_seq_con.dat" : "data/_tseq/test_seq_sin.dat";
+            const std::string O = con_reorg ? "data/_tseq/test_seq_con.ovf" : "data/_tseq/test_seq_sin.ovf";
             resetFile(M); resetFile(O);
             DiskManager dm(M), dov(O);
             BufferPool  bm(&dm, 64), bo(&dov, 64);
@@ -274,8 +275,8 @@ int main() {
     // ---------------------------------------------------------------------
     SECTION("claves duplicadas repartidas entre paginas");
     {
-        const std::string M = "data/test_seq_dup.dat";
-        const std::string O = "data/test_seq_dup.ovf";
+        const std::string M = "data/_tseq/test_seq_dup.dat";
+        const std::string O = "data/_tseq/test_seq_dup.ovf";
         resetFile(M); resetFile(O);
         DiskManager dm(M), dovf(O);
         BufferPool  bm(&dm, 64), bo(&dovf, 64);
@@ -304,8 +305,8 @@ int main() {
     // ---------------------------------------------------------------------
     SECTION("una pagina principal vacia no rompe la busqueda binaria");
     {
-        const std::string M = "data/test_seq_vacia.dat";
-        const std::string O = "data/test_seq_vacia.ovf";
+        const std::string M = "data/_tseq/test_seq_vacia.dat";
+        const std::string O = "data/_tseq/test_seq_vacia.ovf";
         resetFile(M); resetFile(O);
         DiskManager dm(M), dovf(O);
         BufferPool  bm(&dm, 64), bo(&dovf, 64);

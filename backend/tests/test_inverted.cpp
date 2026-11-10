@@ -28,7 +28,7 @@
 
 using namespace db;
 
-static const char* DIR = "data";
+static const std::string DIR = dirPrueba("_tinv");
 
 static std::string ruta(const std::string& n) { return std::string(DIR) + "/" + n; }
 

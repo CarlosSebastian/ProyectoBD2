@@ -238,7 +238,7 @@ int main() {
     // ---------------------------------------------------------------------
     {
         SECTION("operadores estrictos > y <");
-        const std::string DIR = "data/test_sql_estrictos";
+        const std::string DIR = "data/_tsqlestrictos";
         std::filesystem::remove_all(DIR);
         std::filesystem::create_directories(DIR);
         Database db(DIR);
@@ -274,7 +274,7 @@ int main() {
     // ---------------------------------------------------------------------
     {
         SECTION("un CREATE INDEX rechazado deja la tabla intacta");
-        const std::string DIR = "data/test_sql_idxfloat";
+        const std::string DIR = "data/_tsqlfloat";
         std::filesystem::remove_all(DIR);
         std::filesystem::create_directories(DIR);
         Database db(DIR);
@@ -306,7 +306,7 @@ int main() {
     // ---------------------------------------------------------------------
     {
         SECTION("un .idx viejo de otro tipo no inutiliza la tabla");
-        const std::string DIR = "data/test_sql_idxviejo";
+        const std::string DIR = "data/_tsqlviejo";
         std::filesystem::remove_all(DIR);
         std::filesystem::create_directories(DIR);
         {

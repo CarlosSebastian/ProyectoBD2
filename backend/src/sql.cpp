@@ -147,7 +147,8 @@ private:
         if (k == "COPY")   return parseCopy();
         if (k == "SET")    return parseSet();
         throw DBException("Sentencia no soportada: '" + k +
-                          "'. Se admiten CREATE TABLE, CREATE INDEX, INSERT, SELECT y DELETE.");
+                          "'. Se admiten CREATE TABLE, CREATE INDEX, INSERT, SELECT, "
+                          "DELETE, COPY y SET.");
     }
     const Token& cur() const { return ts_[p_]; }
     void avanza() { if (p_ + 1 < ts_.size()) ++p_; }
@@ -687,8 +688,27 @@ Statement parseInsert() {
         return st;
     }
 
-    // Una sola condicion:
-    //    col = v | col BETWEEN a AND b | col WITHIN (...) | col <op> v
+    // ---- Predicados del WHERE ----
+    //
+    // Cada condicion se reduce a un Predicate con un PredKind, que es lo que
+    // el planificador mira para elegir la ruta. Las formas aceptadas:
+    //
+    //    col = v                                   EQ
+    //    col BETWEEN a AND b  /  col <op> v        RANGO
+    //    col WITHIN (x0, y0, x1, y1)               WITHIN    (rectangulo)
+    //    ST_CONTAINS(col, POINT(x, y))             CONTIENE  (poligono)
+    //    ST_DISTANCE(col, POINT(lon, lat)) <= m    RADIO     (metros)
+    //    col WITHIN_RADIUS((lon, lat), km)         RADIO     (kilometros)
+    //    col MATCH 'palabras'                      MATCH
+    //    col <=> [v1, ..., vd] <= umbral           VECDIST
+    //
+    // Las dos formas del radio producen el MISMO PredKind: el parser convierte
+    // los kilometros a metros al entrar para que el motor tenga una sola
+    // representacion y no haya dos caminos que mantener.
+    //
+    // Importante: una ordenacion por distancia (ORDER BY col <-> POINT(...))
+    // NO es un predicado. No filtra nada, ordena; vive en st.knn y companhia.
+    //
     // ST_DISTANCE(col, POINT(lon, lat)) -> deja en 'col' la columna y en
     // (*lon,*lat) el punto de referencia.
     void esperaStDistance(std::string* col, double* lon, double* lat) {

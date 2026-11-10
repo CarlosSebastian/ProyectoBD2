@@ -21,11 +21,11 @@ Compila todo y sirve el cliente en **http://localhost:8080**.
 Opciones útiles:
 
 ```bash
-./benchmarks/run_experimentos.sh   # los 4 experimentos -> benchmarks/resultados.md
+./benchmarks/run_experimentos.sh   # los 8 experimentos -> benchmarks/resultados.md
 make run PORT=9000                 # otro puerto
 ./build/dbserver --pool 8          # buffer pool pequeño: hace visible el I/O físico
 make test                          # las 9 suites de tests
-make bench                         # corre los cuatro experimentos
+make bench                         # corre los ocho experimentos
 make demo                          # recorrido end-to-end por consola
 make PAGE=8192 bench               # Experimento 4: variar el tamaño de bloque
 
@@ -48,6 +48,23 @@ Acepta los mismos objetivos que el Makefile (`all`, `test`, `demo`, `bench`,
 `run`, `clean`) y las mismas opciones: `PAGE=8192 ./build.sh bench`,
 `POOL=8 ./build.sh run`. En Windows el enlace con Winsock se añade solo.
 
+**Si el puerto 8080 ya está ocupado** por otro servicio, el cliente web carga
+pero toda consulta falla con un `Unexpected token '<'`: lo que contesta en
+`/api/health` es el HTML de error del otro programa, no JSON. Se comprueba con
+
+```bash
+curl http://localhost:8080/api/health     # debe responder {"ok":true,...}
+```
+
+y se resuelve liberando el puerto o usando otro en ambos lados:
+
+```bash
+PORT=9000 ./build.sh run     # y abrir http://localhost:9000
+```
+
+`clean` borra los binarios **y el contenido de `data/`**, o sea las tablas que
+hayas creado. Para recompilar conservando los datos basta `./build.sh run`.
+
 ---
 
 ## Estructura
@@ -56,6 +73,7 @@ Acepta los mismos objetivos que el Makefile (`all`, `test`, `demo`, `bench`,
 backend/
   include/db/      common, disk_manager, disk_counter, buffer_pool, record,
                    heap_file, sequential_file, bplus_tree, extendible_hash,
+                   rtree, inverted, text, ivf,
                    page, storage_engine, catalog, table,
                    sql, database, json
   include/third_party/httplib.h    servidor HTTP (cpp-httplib, MIT)
@@ -73,11 +91,20 @@ ai/
   corpus/, cache/        datos generados (ignorados por git)
 benchmarks/
   gen_dataset.cpp        generador del dataset sintético
-  exp1..exp4_*.cpp       los cuatro experimentos del enunciado
-  run_experimentos.sh    corre los cuatro y escribe resultados.md
+  exp1..exp4_*.cpp       relacional: inserción, puntual, rangos, tamaño de página
+  exp5_espacial.cpp      R-Tree: ventana, KNN, radio y barrido de dimensión
+  exp6_texto.cpp         invertido: BM25 vs TF-IDF, booleanas vs fuerza bruta
+  exp6_gin.py            el mismo corpus contra el GIN de PostgreSQL
+  exp7_bovw.cpp          BoVW (SIFT -> palabras visuales) vs vector denso
+  exp8_ann.cpp           IVF: recall y costo en función de nprobe
+  bovw_preparar.py       SIFT + k-means + ResNet-18 para alimentar exp7
+  run_experimentos.sh    los corre todos y escribe resultados.md
+  graficas.py            figuras del informe (entregable aparte, no va al repo)
   resultados.md          salida cruda de la última corrida
 data/              archivos binarios generados (ignorados por git)
-                   .gitkeep documenta que hay dentro
+                   .gitkeep documenta qué hay dentro
+                   data/_t*/ carpetas de trabajo de los tests: cada suite usa
+                   la suya para no pisar el catálogo de la demo
 ```
 
 ---
@@ -87,7 +114,7 @@ data/              archivos binarios generados (ignorados por git)
 ```sql
 CREATE TABLE empleados (id INT PRIMARY KEY, nombre CHAR(30),
                         dept CHAR(20), salario FLOAT) USING [HEAP|SEQUENTIAL];
-CREATE INDEX idx_emp_id ON empleados (id) USING [BTREE|HASH|RTREE];
+CREATE INDEX idx_emp_id ON empleados (id) USING [BTREE|HASH|RTREE|INVERTED|IVF];
 INSERT INTO empleados VALUES (101, 'Ada Lovelace', 'Analytics', 5200.0);
 INSERT INTO empleados VALUES (102, 'Alan Turing', 'IA', 6100.0),
                              (103, 'Grace Hopper', 'Compiladores', 5900.0);
@@ -95,6 +122,9 @@ SELECT * FROM empleados WHERE id = 101;
 SELECT id, nombre FROM empleados WHERE id >= 100 AND id <= 500 LIMIT 50;
 SELECT * FROM empleados WHERE id BETWEEN 100 AND 500;
 DELETE FROM empleados WHERE id = 101;
+
+-- carga masiva: una pasada por el CSV, sin un INSERT por fila
+COPY empleados FROM 'datos.csv' HEADER DELIMITER ',';
 ```
 
 Una misma petición admite **varias sentencias separadas por punto y coma**: el
@@ -143,7 +173,21 @@ SELECT * FROM lugares WHERE ST_DISTANCE(ubic, POINT(-77.0300,-12.0460)) <= 5000;
 
 -- KNN geográfico
 SELECT * FROM lugares ORDER BY ST_DISTANCE(ubic, POINT(-77.0300,-12.0460)) LIMIT 5;
+
+-- la forma del enunciado para el radio; el segundo argumento va en KILÓMETROS
+SELECT * FROM lugares WHERE ubic WITHIN_RADIUS((-77.0300, -12.0460), 5);
 ```
+
+`WITHIN_RADIUS((lon, lat), km)` y `ST_DISTANCE(...) <= metros` son la misma
+consulta escrita de dos maneras: el parser convierte los kilómetros al entrar
+para que el motor tenga una sola representación. Ojo con las unidades —
+`WITHIN_RADIUS(..., 12)` y `ST_DISTANCE(...) <= 12000` devuelven lo mismo.
+
+Toda consulta por distancia añade una columna `distancia` al resultado, en las
+unidades del operador usado: grados con `<->`, metros con `ST_DISTANCE` y
+`WITHIN_RADIUS`. Sin ese número las dos formas se verían idénticas en la tabla
+—mismas filas, mismo orden— y no habría manera de notar que una mide en el
+plano y la otra sobre la esfera.
 
 La diferencia no es cosmética. A 60° de latitud, un punto a 1,0° al este está a
 55,6 km y uno a 0,9° al norte está a 100,1 km: en grados gana el segundo, en
@@ -245,6 +289,104 @@ páginas (log₂ P transferencias) aunque no haya ningún índice creado. Las fi
 que ya no entran en su bloque van a un archivo de overflow (`.ovf`), encadenado
 por clave, y el motor reorganiza solo cuando el overflow supera el 20 % de las
 filas.
+
+### Módulo de texto (índice invertido)
+
+Una columna `TEXT` (o `VARCHAR` sin longitud) no trunca: el abstract entero
+cabe en la fila. Se indexa con un **índice invertido construido por SPIMI**:
+el corpus nunca pasa entero por memoria, se vuelcan bloques ordenados a disco
+y se mezclan en una sola pasada. Las listas de posteo van comprimidas por
+huecos y varint.
+
+```sql
+CREATE TABLE papers (id INT PRIMARY KEY, titulo CHAR(80), resumen TEXT);
+CREATE INDEX ix_texto ON papers (resumen) USING INVERTED;
+
+-- idioma: cambia el stemmer y la lista de stopwords, y queda en el catálogo
+CREATE INDEX ix_es ON notas (cuerpo) USING INVERTED LANGUAGE 'ES';
+
+-- modelo de ranking por defecto del índice (si se omite, BM25)
+CREATE INDEX ix_tf ON papers (resumen) USING INVERTED WITH (scoring = TFIDF_COSINE);
+
+-- búsqueda por relevancia; añade una columna 'score'
+SELECT id, titulo FROM papers WHERE resumen MATCH 'inverted index' LIMIT 5;
+
+-- el mismo índice, el otro modelo: el USING de la consulta manda sobre el del índice
+SELECT id, titulo FROM papers WHERE resumen MATCH 'inverted index' USING TFIDF LIMIT 5;
+
+-- la forma del enunciado, con la columna calculada nombrada
+SELECT id, titulo, COSINE_SCORE() AS relevancia FROM papers
+ WHERE resumen MATCH 'inverted index' ORDER BY relevancia DESC LIMIT 5;
+```
+
+**BM25** satura la frecuencia de término y normaliza por la longitud media del
+corpus; **TF-IDF con coseno** divide por la norma del propio documento. No es
+que uno sea más preciso: ordenan distinto. Sobre el mismo corpus de cinco
+papers y la misma consulta, BM25 deja empatados a dos documentos que TF-IDF
+separa, porque tienen longitudes distintas.
+
+#### Recuperación booleana
+
+```sql
+SELECT id, titulo FROM papers WHERE resumen MATCH 'inverted AND index';
+SELECT id, titulo FROM papers WHERE resumen MATCH 'index AND NOT inverted';
+SELECT id, titulo FROM papers WHERE resumen MATCH 'spimi OR bm25';
+```
+
+Los operadores van **en mayúsculas**, que es lo que los distingue de una
+palabra del corpus: `AND` es el operador, `and` sería un término (y además una
+stopword). Se evalúan de izquierda a derecha, sin paréntesis ni precedencia, y
+se resuelven por mezcla de dos punteros sobre las listas de posteo ordenadas
+por `doc_id` — O(n+m), sin materializar conjuntos.
+
+La regla que ordena todo el módulo es que **el booleano admite y el ranking
+ordena**: primero se resuelve el conjunto de documentos que cumplen la
+expresión, y solo a esos se les calcula el puntaje. Sin operadores, `MATCH
+'inverted index'` es un OR implícito sobre los términos; con ellos, el
+conjunto se restringe y el orden de los supervivientes sigue siendo por
+relevancia. El plan lo distingue: `IndexMatch` contra `IndexBooleanMatch`.
+
+### Módulo vectorial (IVF)
+
+Una columna `VECTOR(d)` guarda `d` floats de ancho fijo. Se indexa con
+**IVF-Flat**: k-means++ reparte los vectores en celdas y el índice guarda los
+centroides, el directorio y **los vectores dentro del propio índice** (de ahí
+lo de *Flat*). Una consulta mide su distancia a los centroides y baja solo a
+las celdas más cercanas.
+
+```sql
+CREATE TABLE items (id INT PRIMARY KEY, nombre CHAR(20), emb VECTOR(4));
+CREATE INDEX ix_emb ON items (emb) USING IVF LISTS 3 METRIC COSINE;
+-- equivalente: ... USING IVF WITH (lists = 3, metric = COSINE);
+
+-- k vecinos más cercanos; añade una columna 'distancia'
+SELECT id, nombre FROM items ORDER BY emb <=> [0.93,0.07,0.01,0.09] LIMIT 3;
+
+-- cuántas celdas visitar en ESTA consulta
+SELECT id, nombre FROM items ORDER BY emb <=> [0.93,0.07,0.01,0.09] LIMIT 3 PROBES 3;
+
+-- umbral: un radio, no un top-k
+SELECT id, nombre FROM items WHERE emb <=> [0.93,0.07,0.01,0.09] <= 0.02;
+
+-- parámetro de sesión, y el vector entrecomillado como lo escribe el enunciado
+SET ivf.probes = 3;
+SELECT id, nombre, emb <=> '[0.93,0.07,0.01,0.09]' AS dist_coseno
+  FROM items ORDER BY dist_coseno ASC LIMIT 3;
+```
+
+**El operador elige la métrica**: `<=>` es coseno y `<->` es L2. Si no coincide
+con la métrica con la que se entrenó el índice, la consulta **se rechaza** en
+vez de contestar con la distancia equivocada — las dos no ordenan igual, así
+que responder sería peor que fallar.
+
+`nprobe` es la perilla entre recall y costo. Por defecto es `round(√lists)`;
+`PROBES n` lo fija para una consulta y `SET ivf.probes = n` para el resto de la
+sesión (el `PROBES` de la consulta tiene prioridad). Con `nprobe = lists` el
+resultado es **exacto** e idéntico a la fuerza bruta; por debajo es
+**aproximado**, y el plan lo dice: *«solo se compara contra las celdas
+visitadas»*. Eso no es un defecto a esconder, es el trato que uno acepta al
+usar un índice ANN: un `LIMIT 6` con `PROBES 1` puede devolver tres filas, no
+porque calcule mal sino porque no miró el resto del espacio.
 
 ## Aplicación de IA: RAG sobre papers de arXiv
 
@@ -370,13 +512,42 @@ diferencia real entre `IndexScan` y `SeqScan`. Es la misma separación que hace
 
 ## Rutas de acceso
 
-El planificador elige entre cuatro, en este orden:
+El planificador elige una ruta por consulta y la declara en el panel de plan.
+Las relacionales, por orden de preferencia:
 
 1. **IndexScan / IndexRangeScan** — hay un índice B+ o Hash sobre la columna.
 2. **Búsqueda binaria secuencial** — el motor es `SEQUENTIAL` y la columna es la
    que ordena el archivo. No necesita índice.
 3. **SeqScan** — todo lo demás. También es donde cae un rango sobre un índice
    Hash, que no tiene orden.
+
+Y una por cada tipo de consulta no relacional, cuando existe el índice que la
+sostiene:
+
+| ruta | consulta | índice |
+|---|---|---|
+| `IndexWindowScan` | `WITHIN (x0,y0,x1,y1)` | R-Tree |
+| `IndexKNN` · `IndexKNN (geografico)` | `ORDER BY <->` · `ORDER BY ST_DISTANCE` | R-Tree |
+| `IndexRadiusScan` | `ST_DISTANCE <= m` · `WITHIN_RADIUS` | R-Tree |
+| `IndexContainsScan` | `ST_CONTAINS` | R-Tree |
+| `IndexMatch` · `IndexBooleanMatch` | `MATCH` · `MATCH` con `AND`/`OR`/`AND NOT` | invertido |
+| `IndexVectorKNN` | `ORDER BY <=>` | IVF |
+| `IndexVectorRange` | `WHERE <=> <= umbral` | IVF |
+
+Sin el índice correspondiente todas caen a un escaneo que es **exacto pero
+caro**: el motor prefiere responder lento a no responder, y el plan dice por
+qué (`no hay indice RTREE sobre ubic`).
+
+Cuando un `WHERE` mezcla un predicado relacional con uno de ordenación, el plan
+nombra cuál manda:
+
+- **Post-filtering** — el índice de ordenación (invertido, R-Tree o IVF)
+  conduce, y el predicado se aplica sobre los candidatos. Como el índice ordena
+  por relevancia o distancia y no sabe nada del resto del `WHERE`, pedir *k* y
+  filtrar después puede dejar menos de *k*: el motor **sobre-pide**, duplicando
+  la petición hasta reunir *k* supervivientes o agotar el índice.
+- **Pre-filtering** — el predicado relacional (B+ o hash) acota primero el
+  conjunto, y la ordenación se resuelve sobre lo que quedó.
 
 ## Estructura de una página (4 KB)
 

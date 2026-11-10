@@ -37,6 +37,13 @@ struct QueryResult {
     std::string           metodo = "-";               // IndexScan / SeqScan / ...
     std::vector<PlanStep> plan;
 
+    // Columna CALCULADA del resultado: el puntaje de relevancia o la distancia.
+    // No es una columna de la tabla, la produce la consulta. Se dice cual es
+    // por INDICE y no por nombre porque la consulta puede renombrarla con un
+    // AS, y el cliente no tiene forma de adivinar el alias.
+    int  col_calculada    = -1;      // -1 = la consulta no produjo ninguna
+    bool col_es_distancia = false;   // true => menor es mejor (se pinta al reves)
+
     long long disk_reads    = 0;   // transferencias fisicas de bloque
     long long disk_writes   = 0;
     long long page_accesses = 0;   // accesos logicos a pagina (via buffer pool)

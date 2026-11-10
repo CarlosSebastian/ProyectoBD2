@@ -118,6 +118,10 @@
      text-transform:uppercase;letter-spacing:.04em;color:var(--muted);z-index:1}
   td{font-family:var(--mono);font-size:12px}
   tbody tr:hover{background:var(--accent-soft)}
+  /* El atributo hidden pone display:none desde la hoja del navegador, que
+     tiene MENOS peso que esta regla de clase: sin la linea de abajo, la
+     barra se queda visible con el texto de la consulta anterior. */
+  .paginacion[hidden]{display:none}
   .paginacion{display:flex;align-items:center;gap:10px;padding:8px 12px;border-top:1px solid var(--border);
               font-size:12px;color:var(--muted)}
   .vacio{color:var(--muted);padding:20px 4px;text-align:center;font-size:13px}
@@ -357,22 +361,28 @@ function pintarResultados(resp){
   // La columna 'score' la agrega el motor cuando la consulta es un MATCH.
   // Un numero suelto no dice nada; al lado de una barra se ve de un vistazo
   // cuanto mas relevante es el primero que el ultimo.
-  const ciScore = d.columns.indexOf('score');
-  // 'distancia' es la columna que agrega una consulta de similitud vectorial.
-  // Se dibuja con la MISMA barra pero AL REVES: en un puntaje mas alto es
-  // mejor, en una distancia mas bajo es mejor, asi que la barra se invierte
-  // para que la barra mas larga siga significando "el mejor resultado".
-  const ciDist = d.columns.indexOf('distancia');
-  const ciBarra = ciScore >= 0 ? ciScore : ciDist;
+  // Cual es la columna calculada lo dice el MOTOR, no el nombre: la consulta
+  // puede renombrarla con un AS (COSINE_SCORE() AS relevancia) y entonces
+  // buscarla por 'score' o 'distancia' no la encuentra. Se mantiene la
+  // busqueda por nombre como respaldo para respuestas viejas.
+  const ciBarra = (typeof d.col_calculada === 'number' && d.col_calculada >= 0)
+                ? d.col_calculada
+                : Math.max(d.columns.indexOf('score'), d.columns.indexOf('distancia'));
+  // En un puntaje, mas alto es mejor; en una distancia, mas bajo. La barra se
+  // invierte en el segundo caso para que la mas larga siga queriendo decir
+  // "el mejor resultado".
+  const esDist = (typeof d.col_es_distancia === 'boolean')
+               ? d.col_es_distancia
+               : (ciBarra >= 0 && d.columns[ciBarra] === 'distancia');
   let maxScore = 0;
   if (ciBarra >= 0) for (const f of d.rows) maxScore = Math.max(maxScore, parseFloat(f[ciBarra]) || 0);
   const celda = (c, i) => {
     if (i !== ciBarra) return `<td>${escapar(c)}</td>`;
     const v = parseFloat(c) || 0;
     let pct = maxScore > 0 ? Math.round((v / maxScore) * 100) : 0;
-    if (ciBarra === ciDist) pct = 100 - pct;
+    if (esDist) pct = 100 - pct;
     return `<td style="white-space:nowrap">` +
-           `<span style="display:inline-block;width:${ciBarra === ciDist ? 62 : 46}px">${escapar(c)}</span>` +
+           `<span style="display:inline-block;width:${esDist ? 62 : 46}px">${escapar(c)}</span>` +
            `<span style="display:inline-block;width:70px;height:7px;background:var(--border);` +
            `border-radius:4px;vertical-align:middle;overflow:hidden">` +
            `<span style="display:block;width:${pct}%;height:100%;background:#d97706"></span>` +
