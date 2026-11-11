@@ -17,6 +17,7 @@ DB_URL = os.environ.get("DB_URL", "http://127.0.0.1:8080")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 MODELO_EMB = os.environ.get("RAG_EMB", "all-minilm")
 MODELO_LLM = os.environ.get("RAG_LLM", "qwen2.5:7b")
+TABLA = os.environ.get("RAG_TABLA", "arxiv")
 
 
 class ServicioCaido(RuntimeError):
