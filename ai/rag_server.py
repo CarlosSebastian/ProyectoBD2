@@ -58,9 +58,19 @@ def reescribir(pregunta: str) -> str:
     return out or solo_palabras(pregunta)
 
 
+def lecturas_por_archivo(res: dict):
+    for p in res.get("plan", []):
+        m = re.search(r"\((\d+) del indice, (\d+) de la tabla\)", p.get("detalle", ""))
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    return None, None
+
+
 def metricas(nombre: str, sentencia: str, res: dict) -> dict:
+    lect_indice, lect_tabla = lecturas_por_archivo(res)
     return {"consulta": nombre, "sql": sentencia, "metodo": res.get("metodo", ""),
             "filas": res.get("row_count", 0), "disk_reads": res["disk_reads"],
+            "disk_reads_indice": lect_indice, "disk_reads_tabla": lect_tabla,
             "disk_writes": res["disk_writes"], "page_accesses": res["page_accesses"],
             "exec_ms": res["exec_ms"], "total_ms": res["total_ms"],
             "plan": [f'{p["paso"]}: {p["detalle"]}' for p in res.get("plan", [])]}
@@ -70,7 +80,7 @@ def buscar_bm25(consulta: str):
     q = solo_palabras(consulta)
     if not q:
         return [], None
-    s = f"SELECT {COLS} FROM papers WHERE abstract MATCH '{q}' LIMIT {CANDIDATOS};"
+    s = f"SELECT {COLS} FROM {rc.TABLA} WHERE abstract MATCH '{q}' LIMIT {CANDIDATOS};"
     try:
         r = rc.sql(s)
     except RuntimeError as e:         # p. ej. una consulta de puras stopwords
@@ -80,7 +90,7 @@ def buscar_bm25(consulta: str):
 
 def buscar_vectorial(vec: list):
     lit = "[" + ",".join(f"{x:.6g}" for x in vec) + "]"
-    s = f"SELECT {COLS} FROM papers ORDER BY emb <=> {lit} LIMIT {CANDIDATOS} PROBES {PROBES};"
+    s = f"SELECT {COLS} FROM {rc.TABLA} ORDER BY emb <=> {lit} LIMIT {CANDIDATOS} PROBES {PROBES};"
     r = rc.sql(s)
     return rc.filas(r), metricas("Vectorial (IVF, coseno)", s.replace(lit, "[...]"), r)
 
@@ -147,7 +157,7 @@ def salud() -> dict:
     out = {"motor": False, "papers": 0, "ollama": False, "emb": rc.MODELO_EMB, "llm": rc.MODELO_LLM}
     try:
         for tb in rc.tablas():
-            if tb["name"] == "papers":
+            if tb["name"] == rc.TABLA:
                 out["papers"] = tb["rows"]
         out["motor"] = True
     except rc.ServicioCaido:

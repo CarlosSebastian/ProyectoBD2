@@ -156,12 +156,17 @@ function pintarFuentes(fs) {
 
 function pintarMetricas(ms_) {
   if (!ms_.length) { $('#metricas').innerHTML = '<span class="vacio">—</span>'; return; }
+  const n = v => v == null ? '—' : v;
   const fila = m => m.error
-    ? `<tr><td>${esc(m.consulta)}</td><td colspan="4" class="error">${esc(m.error)}</td></tr>`
-    : `<tr><td>${esc(m.consulta)}</td><td class="n">${m.filas}</td><td class="n">${m.disk_reads}</td>
+    ? `<tr><td>${esc(m.consulta)}</td><td colspan="6" class="error">${esc(m.error)}</td></tr>`
+    : `<tr><td>${esc(m.consulta)}</td><td class="n">${m.filas}</td>
+           <td class="n">${n(m.disk_reads_indice)}</td><td class="n">${n(m.disk_reads_tabla)}</td>
+           <td class="n">${m.disk_reads}</td>
            <td class="n">${m.page_accesses}</td><td class="n">${ms(m.total_ms)}</td></tr>`;
   $('#metricas').innerHTML = `<table>
-    <tr><th>Consulta</th><th>Filas</th><th>I/O reads</th><th>Accesos pág.</th><th>Tiempo</th></tr>
+    <tr><th>Consulta</th><th>Filas</th><th title="Bloques leídos del archivo del índice (.idx)">Lect. índice</th>
+        <th title="Bloques leídos del archivo de datos (.dat)">Lect. tabla</th><th>I/O reads</th>
+        <th>Accesos pág.</th><th>Tiempo</th></tr>
     ${ms_.map(fila).join('')}</table>` +
     ms_.filter(m => !m.error).map(m => `<details><summary>${esc(m.consulta)} · ${esc(m.metodo)}</summary>
       <pre>${esc(m.sql)}</pre><pre>${esc(m.plan.join('\n'))}</pre></details>`).join('');

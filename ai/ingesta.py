@@ -73,6 +73,24 @@ def guardar_cache(nuevos: dict) -> None:
             f.write(struct.pack("<i", pid) + struct.pack(f"<{len(v)}f", *v))
 
 
+def copiar(tabla: str, ruta: Path) -> dict:
+    candidatas = []
+    try:
+        candidatas.append(ruta.relative_to(AQUI.parent).as_posix())
+    except ValueError:
+        pass
+    abs_ = ruta.resolve().as_posix()
+    if len(abs_) > 1 and abs_[1] == ":":
+        candidatas.append(f"/mnt/{abs_[0].lower()}{abs_[2:]}")
+    candidatas.append(abs_)
+    for i, c in enumerate(candidatas):
+        try:
+            return rc.sql(f"COPY {tabla} FROM '{c}' HEADER;")
+        except RuntimeError as e:
+            if "No se pudo abrir" not in str(e) or i == len(candidatas) - 1:
+                raise
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--corpus", type=Path, default=CORPUS)
@@ -112,25 +130,30 @@ def main():
                         p["anio"], p["cat"],
                         "[" + ",".join(f"{x:.6g}" for x in cache[p["id"]]) + "]"])
 
+    T = rc.TABLA
     existentes = {t["name"]: t for t in rc.tablas()}
-    if "papers" not in existentes:
-        rc.sql("CREATE TABLE papers (id INT PRIMARY KEY, arxiv_id CHAR(24), titulo CHAR(200), "
+    if T not in existentes:
+        rc.sql(f"CREATE TABLE {T} (id INT PRIMARY KEY, arxiv_id CHAR(24), titulo CHAR(200), "
                f"abstract TEXT, anio INT, cat CHAR(12), emb VECTOR({dim})) USING HEAP;")
-        print("tabla papers creada")
+        print(f"tabla {T} creada")
     else:
-        rc.sql("DELETE FROM papers WHERE id >= 0;")
-        print("tabla papers vaciada")
+        cols = [c["name"] for c in existentes[T]["columns"]]
+        if cols != ["id", "arxiv_id", "titulo", "abstract", "anio", "cat", "emb"]:
+            sys.exit(f"La tabla '{T}' ya existe con otras columnas ({', '.join(cols)}). "
+                     "Usa otro nombre: RAG_TABLA=otra python ai/ingesta.py")
+        rc.sql(f"DELETE FROM {T} WHERE id >= 0;")
+        print(f"tabla {T} vaciada")
 
-    r = rc.sql(f"COPY papers FROM '{ruta_csv.as_posix()}' HEADER;")
+    r = copiar(T, ruta_csv)
     print(f"COPY: {r.get('message', '')}  [{r['disk_writes']} escrituras, {r['exec_ms']:.0f} ms]")
 
     # 3. indices ------------------------------------------------------------
-    ya = {i["column"] for t in rc.tablas() if t["name"] == "papers" for i in t["indexes"]}
+    ya = {i["column"] for t in rc.tablas() if t["name"] == T for i in t["indexes"]}
     n = len(papers)
     listas = a.lists or max(1, min(n, round(math.sqrt(n))))
-    for col, ddl in (("id", "CREATE INDEX ix_papers_id ON papers (id) USING BTREE;"),
-                     ("abstract", "CREATE INDEX ix_papers_txt ON papers (abstract) USING INVERTED;"),
-                     ("emb", f"CREATE INDEX ix_papers_emb ON papers (emb) USING IVF "
+    for col, ddl in (("id", f"CREATE INDEX ix_{T}_id ON {T} (id) USING BTREE;"),
+                     ("abstract", f"CREATE INDEX ix_{T}_txt ON {T} (abstract) USING INVERTED;"),
+                     ("emb", f"CREATE INDEX ix_{T}_emb ON {T} (emb) USING IVF "
                              f"LISTS {listas} METRIC COSINE;")):
         if col in ya:
             print(f"indice sobre {col}: ya existe")
@@ -142,8 +165,8 @@ def main():
     # Calentamiento: tras el COPY los indices invertido e IVF estan marcados
     # como invalidos y se reconstruyen en la primera consulta. Se paga aqui,
     # no en la primera pregunta del usuario.
-    rc.sql("SELECT id FROM papers WHERE abstract MATCH 'data' LIMIT 1;")
-    rc.sql(f"SELECT id FROM papers ORDER BY emb <=> [{','.join(['0.1'] * dim)}] LIMIT 1;")
+    rc.sql(f"SELECT id FROM {T} WHERE abstract MATCH 'data' LIMIT 1;")
+    rc.sql(f"SELECT id FROM {T} ORDER BY emb <=> [{','.join(['0.1'] * dim)}] LIMIT 1;")
     print("listo: ya puedes correr  python ai/rag_server.py")
 
 
