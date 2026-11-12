@@ -1,0 +1,178 @@
+
+==========================================================================
+  EXPERIMENTO 5 - Escalabilidad del modulo espacial (R-Tree)
+==========================================================================
+Puntos uniformes en 1000x1000 | pagina de 4096 B | buffer pool de 64 paginas
+Fan-out del nodo: 102 entradas por hoja, 113 por nodo interno
+
+### A.1 Construccion del indice
+
+| N | Carga (ms) | us/punto | Pag. datos | Pag. indice | Altura h |
+|---|---|---|---|---|---|
+| 1000 | 4 | 4.32 | 9 | 16 | 2 |
+| 5000 | 19 | 3.85 | 46 | 74 | 2 |
+| 10000 | 49 | 4.89 | 92 | 146 | 3 |
+| 50000 | 435 | 8.70 | 469 | 727 | 3 |
+| 100000 | 1122 | 11.22 | 941 | 1467 | 3 |
+| 250000 | 3558 | 14.23 | 2383 | 3643 | 3 |
+
+### A.2 Ventana del 1 % del area: R-Tree vs escaneo completo
+
+| N | Filas | R-Tree accesos | Scan accesos | Ganancia | R-Tree ms | Scan ms |
+|---|---|---|---|---|---|---|
+| 1000 | 10 | 14 | 1019 | 72.8x | 0.012 | 0.401 |
+| 5000 | 51 | 56 | 5097 | 91.0x | 0.034 | 1.228 |
+| 10000 | 102 | 110 | 10194 | 92.7x | 0.219 | 3.423 |
+| 50000 | 504 | 526 | 50973 | 96.9x | 1.967 | 16.420 |
+| 100000 | 994 | 1030 | 101935 | 99.0x | 5.233 | 34.745 |
+| 250000 | 2501 | 2574 | 254884 | 99.0x | 14.440 | 86.418 |
+
+### A.3 KNN con k = 10
+
+| N | R-Tree accesos | Scan accesos | Ganancia | R-Tree ms | Scan ms |
+|---|---|---|---|---|---|
+| 1000 | 14 | 1009 | 72.1x | 0.019 | 0.520 |
+| 5000 | 14 | 5046 | 360.4x | 0.032 | 2.403 |
+| 10000 | 16 | 10092 | 630.8x | 0.056 | 5.621 |
+| 50000 | 16 | 50469 | 3154.3x | 0.146 | 31.718 |
+| 100000 | 16 | 100941 | 6308.8x | 0.171 | 63.093 |
+| 250000 | 18 | 252383 | 14021.3x | 0.219 | 151.888 |
+
+### A.4 Verificacion: las dos rutas devuelven lo mismo
+
+| N | Ventana | KNN |
+|---|---|---|
+| 1000 | coinciden | coinciden |
+| 5000 | coinciden | coinciden |
+| 10000 | coinciden | coinciden |
+| 50000 | coinciden | coinciden |
+| 100000 | coinciden | coinciden |
+| 250000 | coinciden | coinciden |
+
+Las dos rutas devuelven exactamente las mismas filas en todos los tamanos,
+asi que la comparacion de costos es valida.
+
+==========================================================================
+  B. Selectividad de la ventana, con N = 100000
+==========================================================================
+
+### B.1 Costo por consulta segun el area que cubre la ventana
+
+| Area de la ventana | Filas | R-Tree accesos | Scan accesos | R-Tree ms | Scan ms | Ganancia |
+|---|---|---|---|---|---|---|
+| 0.01 % | 10 | 16 | 100951 | 0.123 | 32.285 | 263.0x |
+| 0.10 % | 99 | 110 | 101040 | 0.675 | 33.350 | 49.4x |
+| 1.00 % | 998 | 1033 | 101939 | 5.270 | 34.161 | 6.5x |
+| 5.00 % | 4966 | 5079 | 105907 | 24.116 | 37.414 | 1.6x |
+| 25.00 % | 24906 | 25345 | 125847 | 118.826 | 44.567 | 0.4x |
+
+### B.2 Punto de cruce con el escaneo completo
+
+| Metodo | Cruce (area de la ventana) |
+|---|---|
+| R-Tree (ventana) | 8.0 % |
+
+==========================================================================
+  C. Costo del KNN segun k, con N = 100000
+==========================================================================
+
+### C.1 R-Tree best-first vs escaneo con ordenacion parcial
+
+| k | R-Tree accesos | Scan accesos | Ganancia | R-Tree ms | Scan ms |
+|---|---|---|---|---|---|
+| 1 | 6 | 100941 | 16823.5x | 0.112 | 47.642 |
+| 10 | 16 | 100941 | 6308.8x | 0.206 | 51.667 |
+| 100 | 110 | 100941 | 917.6x | 0.753 | 45.876 |
+| 1000 | 1035 | 100941 | 97.5x | 6.277 | 47.782 |
+
+### C. k-NN y radio sobre coordenadas reales (haversine)
+
+| N | consulta | R-Tree accesos | Scan accesos | Ganancia | R-Tree ms | Scan ms | filas |
+|---|---|---|---|---|---|---|---|
+| 10000 | k-NN k=5 | 10 | 10092 | 1009.2x | 0.100 | 5.675 | 5.0 |
+| 10000 | k-NN k=20 | 26 | 10092 | 388.2x | 0.132 | 5.499 | 20.0 |
+| 10000 | k-NN k=50 | 58 | 10092 | 174.0x | 0.221 | 5.806 | 50.0 |
+| 10000 | radio 500 m | 11 | 10098 | 918.0x | 0.071 | 4.830 | 6.2 |
+| 10000 | radio 2000 m | 114 | 10196 | 89.4x | 0.306 | 5.236 | 104.3 |
+| 10000 | radio 5000 m | 662 | 10732 | 16.2x | 1.198 | 5.321 | 640.0 |
+| 50000 | k-NN k=5 | 10 | 50469 | 5046.9x | 0.210 | 32.557 | 5.0 |
+| 50000 | k-NN k=20 | 27 | 50469 | 1869.2x | 0.278 | 31.573 | 20.0 |
+| 50000 | k-NN k=50 | 59 | 50469 | 855.4x | 0.434 | 30.759 | 50.0 |
+| 50000 | radio 500 m | 40 | 50501 | 1262.5x | 0.267 | 24.764 | 32.1 |
+| 50000 | radio 2000 m | 563 | 51008 | 90.6x | 2.165 | 25.429 | 538.9 |
+| 50000 | radio 5000 m | 3373 | 53761 | 15.9x | 11.816 | 27.514 | 3292.2 |
+| 100000 | k-NN k=5 | 11 | 100941 | 9176.5x | 0.269 | 65.681 | 5.0 |
+| 100000 | k-NN k=20 | 28 | 100941 | 3605.0x | 0.369 | 64.964 | 20.0 |
+| 100000 | k-NN k=50 | 61 | 100941 | 1654.8x | 0.706 | 68.789 | 50.0 |
+| 100000 | radio 500 m | 77 | 101007 | 1311.8x | 0.603 | 52.595 | 66.2 |
+| 100000 | radio 2000 m | 1114 | 102015 | 91.6x | 5.943 | 55.437 | 1074.0 |
+| 100000 | radio 5000 m | 6726 | 107522 | 16.0x | 33.600 | 58.088 | 6581.0 |
+
+El costo del k-NN crece con k pero MUCHISIMO menos que con N: pasar de
+k=5 a k=50 multiplica por diez los vecinos pedidos y no multiplica por diez
+las paginas leidas, porque la poda por MINDIST sigue descartando casi todo
+el arbol. El radio se comporta como la ventana: cuanto mas grande, mas se
+parece a un escaneo.
+
+### D. Efecto de la dimension: cuando el escaneo le gana al arbol
+
+N = 10000 vectores uniformes en el cubo unitario, k = 10, 20 consultas.
+Las paginas del arbol y las del escaneo son las dos de 4096 B, asi que son comparables.
+
+| D | fan-out | nodos (pag.) | altura | arbol: pag/consulta | % del arbol | scan: pag. | arbol ms | scan ms | gana |
+|---|---|---|---|---|---|---|---|---|---|
+| 2 | 204 | 51 | 2 | 3.6 | 7.2 % | 30 | 0.018 | 0.032 | arbol |
+| 4 | 113 | 90 | 2 | 23.2 | 25.8 % | 49 | 0.164 | 0.068 | arbol |
+| 8 | 60 | 171 | 3 | 86.0 | 50.3 % | 88 | 0.319 | 0.066 | arbol |
+| 16 | 30 | 347 | 3 | 325.4 | 93.8 % | 167 | 0.900 | 0.092 | SCAN |
+| 32 | 15 | 716 | 4 | 716.0 | 100.0 % | 323 | 1.724 | 0.159 | SCAN |
+| 64 | 7 | 1669 | 5 | 1669.0 | 100.0 % | 635 | 3.864 | 0.335 | SCAN |
+| 128 | 3 | 5003 | 9 | 5002.0 | 100.0 % | 1260 | 11.744 | 1.051 | SCAN |
+
+Dos efectos se suman, y los dos empujan en la misma direccion.
+
+El primero es aritmetico y se ve en la columna del fan-out: una entrada de
+un nodo guarda 2*D coordenadas, asi que en D = 128 entran tres entradas por
+pagina y en D = 2 entran doscientas. El arbol se vuelve alto y flaco, y
+bajar por el cuesta mas lecturas aunque la poda funcionara perfecto.
+
+El segundo es geometrico y es el de verdad: al crecer D las cajas
+envolventes se solapan tanto que el MINDIST de casi todas es menor que la
+distancia al k-esimo vecino, y el best-first deja de podar. La columna
+'% del arbol' es la medida directa de eso: cuando se acerca al 100 %, el
+arbol esta visitandolo todo y ya no es un indice, es un escaneo con
+indirecciones.
+
+La ultima columna marca el cruce EN PAGINAS, que es la medida que no
+depende de la maquina. En milisegundos el cruce llega antes, y conviene
+decirlo: el escaneo es un bucle apretado y contiguo sobre un arreglo,
+mientras que bajar por el arbol son saltos de puntero y una cola de
+prioridad. O sea que el arbol pierde incluso un poco antes de lo que la
+cuenta de bloques sugiere.
+
+Pasado ese punto, un indice espacial EXACTO no puede ganarle a leer el
+archivo de corrido, y es exactamente la razon por la que la Parte 4 no
+extiende el R-Tree a 384 dimensiones sino que cambia de estrategia:
+renuncia a la exactitud y usa IVF.
+
+Lectura de los resultados.
+
+El KNN es donde el R-Tree gana por mas margen, y por una razon estructural:
+la busqueda best-first solo abre los nodos cuyo MINDIST es menor que la
+distancia al k-esimo vecino ya encontrado, asi que el costo depende de k y no
+de N. El escaneo, en cambio, tiene que calcular la distancia de las N filas
+aunque solo devuelva diez.
+
+La ventana se comporta como el rango del Experimento 3: el indice gana por
+ordenes de magnitud mientras la ventana es chica, y pierde terreno al crecer,
+por el mismo motivo de alla. El indice esta sobre un Heap File, o sea que NO
+ESTA AGRUPADO: las hojas del R-Tree entregan los RID de puntos vecinos en el
+plano, pero esos RID apuntan a paginas cualesquiera del heap, en el orden en
+que se insertaron. Con una ventana suficientemente grande, el motor termina
+pidiendo las mismas paginas una y otra vez y leer el archivo completo una sola
+vez sale mas barato.
+
+La consecuencia de diseno es la misma que en el caso unidimensional: el
+planificador deberia estimar cuantas filas va a devolver la ventana y elegir
+SeqScan pasado el umbral, en vez de usar el indice siempre que exista.
+

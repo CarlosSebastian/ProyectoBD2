@@ -422,6 +422,88 @@ void InvertedIndex::construir(const std::function<bool(RID&, std::string&)>& sig
         }
     };
 
+    // --- 2a. reduccion en cascada si hay demasiados bloques ---
+    //
+    // SPIMI acota la MEMORIA, que es su razon de ser. Pero la mezcla pedia un
+    // recurso que no estaba acotado: un descriptor de archivo por bloque,
+    // todos abiertos a la vez. Y los dos limites tiran en sentidos opuestos:
+    // cuanto menos presupuesto se da, mas bloques se generan. Con 128 KB sobre
+    // un corpus de 20 000 documentos salen mas de 500 bloques, y el sistema
+    // corta alrededor de ese numero de descriptores abiertos.
+    //
+    // La salida es la misma que usa cualquier ordenamiento externo: fijar el
+    // abanico y mezclar por PASADAS. Los bloques se agrupan de ABANICO en
+    // ABANICO, cada grupo se mezcla en un run intermedio, y se repite hasta
+    // que quedan pocos para una mezcla final. Cuesta alguna pasada mas de I/O
+    // y a cambio funciona con cualquier numero de bloques.
+    //
+    // Los grupos se forman con bloques CONSECUTIVOS y se mezclan en orden, y
+    // los runs se encadenan en ese mismo orden. Eso preserva la propiedad de
+    // la que depende todo lo demas: dentro de un termino, los postings siguen
+    // saliendo ordenados por doc_id sin tener que ordenarlos nunca.
+    const std::size_t ABANICO = 64;
+
+    auto mezclarGrupo = [](const std::vector<std::string>& entradas,
+                           const std::string& salida) {
+        std::vector<std::unique_ptr<Lector>> ls;
+        using Cab = std::pair<std::string, std::size_t>;
+        std::priority_queue<Cab, std::vector<Cab>, std::greater<Cab>> q;
+        for (std::size_t i = 0; i < entradas.size(); ++i) {
+            auto L = std::make_unique<Lector>();
+            L->f.open(entradas[i], std::ios::binary);
+            if (!L->f) throw DBException("No se pudo reabrir el bloque " + entradas[i]);
+            L->avanzar();
+            if (L->ok) q.push({L->termino, i});
+            ls.push_back(std::move(L));
+        }
+        std::ofstream f(salida, std::ios::binary | std::ios::trunc);
+        if (!f) throw DBException("No se pudo crear el run intermedio: " + salida);
+
+        std::vector<Posting> juntas;
+        while (!q.empty()) {
+            const std::string termino = q.top().first;
+            juntas.clear();
+            // El desempate de la cola es por indice de bloque, asi que los
+            // postings de un mismo termino se concatenan en orden de bloque.
+            while (!q.empty() && q.top().first == termino) {
+                const std::size_t b = q.top().second;
+                q.pop();
+                Lector& L = *ls[b];
+                juntas.insert(juntas.end(), L.ps.begin(), L.ps.end());
+                L.avanzar();
+                if (L.ok) q.push({L.termino, b});
+            }
+            const std::uint16_t largo = static_cast<std::uint16_t>(termino.size());
+            const std::uint32_t df_t  = static_cast<std::uint32_t>(juntas.size());
+            f.write(reinterpret_cast<const char*>(&largo), 2);
+            f.write(termino.data(), largo);
+            f.write(reinterpret_cast<const char*>(&df_t), 4);
+            f.write(reinterpret_cast<const char*>(juntas.data()),
+                    static_cast<std::streamsize>(juntas.size() * sizeof(Posting)));
+        }
+        f.close();
+        // Cerrar los lectores antes de borrar: en Windows no se puede borrar
+        // un archivo con un handle vivo.
+        ls.clear();
+        for (const std::string& e : entradas) std::remove(e.c_str());
+    };
+
+    for (int pasada = 0; rutas.size() > ABANICO; ++pasada) {
+        std::vector<std::string> siguiente;
+        for (std::size_t i = 0; i < rutas.size(); i += ABANICO) {
+            const std::size_t fin = std::min(i + ABANICO, rutas.size());
+            const std::vector<std::string> grupo(
+                rutas.begin() + static_cast<std::ptrdiff_t>(i),
+                rutas.begin() + static_cast<std::ptrdiff_t>(fin));
+            if (grupo.size() == 1) { siguiente.push_back(grupo[0]); continue; }
+            const std::string run = prefijo_temporal + "_run" + std::to_string(pasada) +
+                                    "_" + std::to_string(siguiente.size()) + ".tmp";
+            mezclarGrupo(grupo, run);
+            siguiente.push_back(run);
+        }
+        rutas.swap(siguiente);
+    }
+
     std::vector<std::unique_ptr<Lector>> lectores;
     using Cabeza = std::pair<std::string, std::size_t>;   // (termino, bloque)
     std::priority_queue<Cabeza, std::vector<Cabeza>, std::greater<Cabeza>> cola;

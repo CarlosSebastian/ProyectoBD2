@@ -234,10 +234,42 @@ RID Table::insert(const Tuple& t) {
     // registros, asi que hacerlo despues devolveria un RID ya invalido.
     if (seq_ && auto_reorg_ && seq_->necesitaReorganizacion()) reorganize();
 
-     // Restriccion de PRIMARY KEY: no se admite un segundo registro con la misma clave 
+    // Restriccion de PRIMARY KEY: no se admite un segundo registro con la
+    // misma clave. Comprobarlo es una busqueda puntual, y lo que cuesta esa
+    // busqueda depende de con que se pueda resolver:
+    //
+    //   con indice de clave sobre la columna   O(log n) en el B+, casi O(1)
+    //                                          en el hash
+    //   sin indice                             caro, y de dos maneras:
+    //      - en un HEAP es un escaneo completo, O(n) por fila
+    //      - en un SEQUENTIAL la busqueda binaria solo cubre el area
+    //        principal; las filas recien insertadas viven en la cadena de
+    //        desbordamiento y hay que recorrerla entera. Cuando esa cadena
+    //        crece --- que es justo lo que pasa cargando sin reorganizar ---
+    //        el costo es el mismo O(n) disfrazado
+    //
+    // El tercer caso convierte una carga masiva en O(n^2). Medido: insertar
+    // 500 000 filas en un Heap sin indice pasaba de 142 ms a no terminar en
+    // ocho horas. Por eso ahi la restriccion NO se hace cumplir.
+    //
+    // Un motor real evita la disyuntiva creando el indice junto con la clave:
+    // en Postgres o MySQL una PRIMARY KEY *es* un indice unico. Este motor
+    // prefiere no crear estructuras a espaldas del usuario, asi que la
+    // restriccion se hace cumplir solo cuando se puede hacer cumplir barato.
+    // La consecuencia esta dicha en el README: una tabla con PRIMARY KEY
+    // declarada y sin indice sobre esa columna admite duplicados hasta que se
+    // cree el indice. Es la misma regla para HEAP y para SEQUENTIAL: lo que
+    // habilita la restriccion es el indice, no el motor de almacenamiento.
     if (!info_.key_column.empty()) {
-        int pki = info_.schema.indexOf(info_.key_column);
-        if (pki >= 0 && !searchRIDsEq(info_.key_column, t.values[static_cast<std::size_t>(pki)]).empty()) {
+        const int pki = info_.schema.indexOf(info_.key_column);
+        // Solo cuentan los indices que responden una IGUALDAD por clave. Un
+        // R-Tree, un invertido o un IVF estan sobre otros tipos de columna y
+        // no sirven para esto.
+        const Indice* ixk = indicePara(info_.key_column);
+        const bool barato = ixk != nullptr && (ixk->bt_int || ixk->bt_str ||
+                                              ixk->hs_int || ixk->hs_str);
+        if (pki >= 0 && barato &&
+            !searchRIDsEq(info_.key_column, t.values[static_cast<std::size_t>(pki)]).empty()) {
             throw DBException("Violacion de PRIMARY KEY: ya existe un registro con " +
                               info_.key_column + " = " + t.values[static_cast<std::size_t>(pki)].str());
         }

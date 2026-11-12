@@ -1,0 +1,31 @@
+
+==========================================================================
+  EXPERIMENTO 6 (segunda mitad) - GIN de PostgreSQL sobre el mismo corpus
+==========================================================================
+
+PostgreSQL 16.2 on x86_64-pc-linux-gnu, compiled by gcc (GCC) 10.2.1 20210130 (Red Hat 10.2.1-11), 64-bit
+
+-- cargando el corpus --
+   20000 documentos
+-- construyendo el indice GIN --
+   2880 ms, 9680 kB en disco
+
+| operador | terminos | GIN: ms | GIN: bloques | SeqScan: ms | SeqScan: bloques | ms x | filas |
+|---|---|---|---|---|---|---|---|
+| AND | 1 | 0.6378 | 359 | 667.7525 | 4628 | 1047.0x | 242 |
+| AND | 3 | 0.0818 | 144 | 680.4689 | 4628 | 8318.7x | 0 |
+| AND | 5 | 0.1059 | 156 | 661.8930 | 4628 | 6250.2x | 0 |
+| AND NOT | 1 | 0.6225 | 363 | 661.2359 | 4628 | 1062.2x | 244 |
+| AND NOT | 3 | 0.7212 | 380 | 661.8397 | 4628 | 917.7x | 252 |
+| AND NOT | 5 | 0.8028 | 411 | 656.7374 | 4628 | 818.1x | 270 |
+| OR | 1 | 0.5750 | 330 | 655.4581 | 4628 | 1140.0x | 209 |
+| OR | 3 | 1.1845 | 713 | 662.1343 | 4628 | 559.0x | 660 |
+| OR | 5 | 1.6165 | 1032 | 668.0364 | 4628 | 413.2x | 1110 |
+
+Los milisegundos entre dos motores distintos solo dan una idea: PostgreSQL
+esta en C optimizado desde hace treinta anos y corre sobre su propio buffer
+pool. La columna que se puede defender en el informe es la de BLOQUES, que
+depende del diseno del indice y no del lenguaje: ahi es donde se ve si una
+lista de posteo comprimida con huecos y varint pide mas o menos paginas que
+un GIN, que guarda arboles de TIDs por lexema.
+

@@ -1,0 +1,4 @@
+extraccion_ms	71268.4
+codebook_ms	3697.4
+k	256
+imagenes	6899

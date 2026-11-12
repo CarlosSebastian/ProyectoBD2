@@ -5,6 +5,15 @@ build/
 # subcarpetas como data/test_sql_estrictos/.
 data/*
 !data/.gitkeep
+
+# Excepcion: los datos del Experimento 7. Son histogramas BoVW y vectores
+# densos derivados del dataset Natural Images, y se versionan a proposito para
+# que el experimento se pueda reproducir sin bajar 350 MB de imagenes de
+# Kaggle ni reejecutar 8 minutos de SIFT. Pesan 39 MB entre los dos.
+!data/bovw_palabras.csv
+!data/bovw_emb.csv
+!data/bovw_consultas.txt
+!data/bovw_tiempos.txt
 *.o
 *.exe
 .vscode/

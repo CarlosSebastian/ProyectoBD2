@@ -1,0 +1,89 @@
+
+==========================================================================
+  EXPERIMENTO 8 - Eficiencia contra calidad en busqueda aproximada (ANN)
+==========================================================================
+
+Vectores agrupados en nubes gaussianas, dimension 128, metrica coseno.
+Recall@10 medido contra fuerza bruta sobre el mismo indice, 50 consultas.
+
+### A. Construccion: como crece el indice con N
+
+| N | nlist | ms | escrituras | paginas | KB | iters | media/min/max por celda |
+|---|---|---|---|---|---|---|---|
+| 1000 | 32 | 46.4 | 409 | 134 | 536 | 12 | 31.2 / 17 / 46 |
+| 2500 | 50 | 141.7 | 1167 | 329 | 1316 | 12 | 50.0 / 22 / 101 |
+| 5000 | 71 | 293.6 | 2876 | 651 | 2604 | 12 | 70.4 / 23 / 185 |
+| 10000 | 100 | 629.6 | 6956 | 1295 | 5180 | 12 | 100.0 / 24 / 360 |
+| 20000 | 141 | 1333.5 | 15920 | 2579 | 10316 | 12 | 141.8 / 24 / 643 |
+
+Con nlist = raiz de N (el valor por defecto), el numero de vectores por
+celda crece tambien como raiz de N: es lo que mantiene acotado el costo de
+una consulta. El tamano del indice crece lineal con N, como tiene que ser:
+guarda los vectores dentro (IVF-Flat), no solo punteros.
+
+### B. Numero de celdas: nlist contra costo y calidad
+
+| nlist | inercia | paginas | media/min/max | nprobe def. | recall@10 | accesos/consulta | ms/consulta |
+|---|---|---|---|---|---|---|---|
+| 1 | 27871.3 | 2562 | 20000.0 / 20000 / 20000 | 1 | 1.0000 | 2720.0 | 12.218 |
+| 4 | 26524.9 | 2562 | 5000.0 / 4252 / 5415 | 2 | 0.6940 | 1381.9 | 6.107 |
+| 16 | 25107.5 | 2563 | 1250.0 / 860 / 1633 | 4 | 0.6600 | 705.2 | 3.073 |
+| 64 | 23185.5 | 2569 | 312.5 / 41 / 808 | 8 | 0.7500 | 417.4 | 1.616 |
+| 141 | 22751.5 | 2579 | 141.8 / 24 / 643 | 12 | 0.7460 | 395.0 | 1.356 |
+| 400 | 21853.2 | 2612 | 50.0 / 14 / 158 | 20 | 0.6740 | 577.9 | 1.269 |
+| 1000 | 20857.4 | 2689 | 20.0 / 5 / 71 | 32 | 0.6800 | 1154.8 | 1.495 |
+
+nlist = 1 es el caso degenerado: una sola celda con todo dentro, o sea
+fuerza bruta disfrazada de indice (recall 1 y el costo mas alto). Al subir
+nlist las celdas se encogen y la consulta se abarata, pero el recall con el
+nprobe por defecto BAJA, no sube: nprobe por defecto es raiz de nlist, asi
+que la FRACCION de celdas visitadas se encoge --- de la mitad con nlist=4 a
+la treintava parte con nlist=1000 --- y cada vez quedan fuera mas vecinos.
+Es la leccion practica del experimento: nlist y nprobe no se eligen por
+separado, y el valor por defecto es solo un punto de partida.
+La inercia (suma de distancias al centroide) solo baja: mide lo bien que el
+clustering describe los datos, no lo buena que es la busqueda.
+
+### C. La curva: recall@10 frente a nprobe
+
+N = 20000, nlist = 141, fuerza bruta: 12.204 ms y 2718.0 accesos a pagina por consulta.
+
+| nprobe | % celdas | recall@10 | accesos/consulta | bloques leidos | ms/consulta | aceleracion | % del I/O exacto |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.7 % | 0.3280 | 176.0 | 51.5 | 0.253 | 48.3x | 6.5 % |
+| 2 | 1.4 % | 0.4600 | 203.6 | 77.2 | 0.390 | 31.3x | 7.5 % |
+| 5 | 3.5 % | 0.6180 | 259.6 | 128.4 | 0.629 | 19.4x | 9.5 % |
+| 10 | 7.1 % | 0.7160 | 358.5 | 219.2 | 1.095 | 11.1x | 13.2 % |
+| 20 | 14.2 % | 0.8000 | 549.9 | 394.5 | 1.944 | 6.3x | 20.2 % |
+| 50 | 35.5 % | 0.9180 | 1159.5 | 954.7 | 4.785 | 2.6x | 42.7 % |
+| 141 | 100.0 % | 1.0000 | 3076.0 | 2717.2 | 13.377 | 0.9x | 113.2 % |
+
+Esta es la tabla que resume el modulo. El recall sube rapido al principio
+y se aplana: las primeras celdas son las que contienen a casi todos los
+vecinos verdaderos, y las siguientes aportan cada vez menos por el mismo
+precio. Con nprobe = nlist el recall es 1 por definicion, porque se visita
+todo: es fuerza bruta, y ahi el indice no aporta nada. De hecho sale algo
+PEOR que fuerza bruta --- mas del 100 % de su I/O y una aceleracion por
+debajo de 1 --- porque ademas de leer todas las celdas hay que comparar
+contra los nlist centroides y ordenarlos: trabajo que la fuerza bruta no
+hace. El punto util de la curva es donde el recall ya es alto y el I/O
+sigue siendo una fraccion pequena del exacto.
+
+### D. Dimension: por que 384 cambia el diseno
+
+| dim | bytes/entrada | entradas/pagina | paginas | recall@10 (nprobe def.) | ms/consulta |
+|---|---|---|---|---|---|
+| 8 | 44 | 93.1 | 57 | 0.9960 | 0.023 |
+| 32 | 140 | 29.3 | 176 | 0.9080 | 0.102 |
+| 128 | 524 | 7.8 | 651 | 0.6980 | 0.414 |
+| 384 | 1548 | 2.6 | 1919 | 0.3500 | 1.204 |
+| 768 | 3084 | 1.3 | 3821 | 0.3120 | 2.252 |
+
+En dimension 384 una entrada pesa 1548 bytes: entran DOS Y MEDIA en una
+pagina de 4 KB, y el indice acaba pesando mas que la tabla. Eso es lo que
+obliga a escribir las celdas contiguas: si los vectores estuvieran solo en
+el heap, recorrer una celda seria un salto aleatorio por candidato en vez
+de una lectura secuencial. Y es tambien la razon de fondo de todo el
+modulo: en dimension alta el R-Tree de la parte 2 no poda nada, y hay que
+cambiar exactitud por costo.
+

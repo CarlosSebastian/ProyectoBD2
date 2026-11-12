@@ -1,0 +1,117 @@
+
+==========================================================================
+  EXPERIMENTO 6 - Modulo de texto (indice invertido SPIMI / BM25)
+==========================================================================
+Corpus sintetico con vocabulario zipfiano de 20000 palabras, 60-140 terminos por documento, semilla fija.
+
+### A. Construccion SPIMI segun el numero de documentos
+
+Presupuesto de memoria fijo en 4 MB.
+
+| N docs | tokens | terminos | bloques | construir (ms) | escrituras | pag. indice | indice (KB) | postings sin compr. (KB) |
+|---|---|---|---|---|---|---|---|---|
+| 1000 | 99572 | 13403 | 1 | 157.6 | 281 | 140 | 560.0 | 773.4 |
+| 5000 | 495338 | 16162 | 1 | 489.1 | 789 | 394 | 1576.0 | 3847.2 |
+| 25000 | 2483321 | 17739 | 3 | 2252.2 | 3183 | 1591 | 6364.0 | 19287.3 |
+| 50000 | 4974792 | 18204 | 6 | 4388.2 | 6167 | 3083 | 12332.0 | 38635.8 |
+
+El tiempo crece de forma practicamente lineal con el numero de
+documentos: SPIMI los recorre una sola vez. El indice completo (que
+incluye diccionario y tabla de documentos) pesa menos que los
+postings sin comprimir, gracias a los huecos y el varint.
+
+### B. Efecto del presupuesto de memoria (N = 20000)
+
+| presupuesto | bloques | construir (ms) | escrituras | terminos | pag. indice |
+|---|---|---|---|---|---|
+| 0.12 MB | 835 | 4219.1 | 2589 | 17577 | 1294 |
+| 0.50 MB | 141 | 2778.5 | 2589 | 17577 | 1294 |
+| 2.00 MB | 13 | 1897.2 | 2589 | 17577 | 1294 |
+| 8.00 MB | 3 | 1741.9 | 2589 | 17577 | 1294 |
+| 64.00 MB | 1 | 1688.3 | 2589 | 17577 | 1294 |
+
+El numero de terminos y el tamano del indice NO cambian: el
+presupuesto solo decide cuantas veces se vuelca la memoria y, por
+tanto, cuantos bloques hay que mezclar al final. Esa es exactamente
+la promesa de SPIMI: el resultado es independiente de la RAM
+disponible, y la RAM solo compra velocidad.
+
+### C. Consulta: indice invertido contra escaneo completo
+
+BM25, top-10, 20 consultas de 3 terminos cada una.
+
+| N docs | indice: accesos | indice: ms | scan: accesos | scan: ms | accesos x | ms x | top-10 identico |
+|---|---|---|---|---|---|---|---|
+| 1000 | 1453 | 3.7 | 1206 | 74.7 | 0.8x | 20.0x | si (3 empate/s) |
+| 5000 | 4206 | 2.0 | 6023 | 362.8 | 1.4x | 185.7x | si (3 empate/s) |
+| 25000 | 18169 | 12.1 | 30125 | 1847.2 | 1.7x | 152.3x | si (3 empate/s) |
+| 50000 | 35418 | 25.8 | 60259 | 3655.6 | 1.7x | 141.8x | si (1 empate/s) |
+
+La ultima columna es la que da sentido a las demas: si los puntajes no
+coincidieran, comparar tiempos no significaria nada. Un "empate" es un
+par de documentos con BM25 identico en el ultimo puesto: las dos rutas
+eligen uno distinto y las dos tienen razon. El escaneo paga
+leer y tokenizar los N documentos en cada consulta; el indice solo
+lee las listas de los terminos pedidos, cuya longitud depende del df
+y no de N.
+
+### D. Costo de la consulta segun la frecuencia del termino
+
+| termino | df | % del corpus | accesos a pagina | ms | resultados |
+|---|---|---|---|---|---|
+| voc0 | 392 | 1.96 % | 411 | 0.368 | 10 |
+| voc1 | 406 | 2.03 % | 425 | 0.348 | 10 |
+| voc10 | 391 | 1.96 % | 410 | 0.324 | 10 |
+| voc100 | 381 | 1.91 % | 400 | 0.326 | 10 |
+| voc1000 | 344 | 1.72 % | 363 | 0.332 | 10 |
+| voc5000 | 150 | 0.75 % | 169 | 0.276 | 10 |
+| voc15000 | 10 | 0.05 % | 29 | 0.092 | 10 |
+
+Un termino muy frecuente obliga a leer una lista de postings larga
+y a puntuar muchos documentos; uno raro se resuelve con unas pocas
+paginas. Es el motivo por el que quitar stopwords importa: son
+justo los terminos con df cercano a N, los mas caros y los que menos
+discriminan.
+
+### E. Recuperacion booleana: indice contra recorrido completo
+
+| operador | terminos | indice: accesos | indice: ms | scan: ms (cota inf.) | ms x | filas | identico |
+|---|---|---|---|---|---|---|---|
+| AND | 1 | 8.8 | 0.0702 | 10.9966 | 156.7x | 242 | si |
+| AND | 3 | 26.6 | 0.1398 | 25.0177 | 178.9x | 0 | si |
+| AND | 5 | 44.4 | 0.1813 | 31.5558 | 174.0x | 0 | si |
+| OR | 1 | 8.8 | 0.0772 | 13.3381 | 172.7x | 209 | si |
+| OR | 3 | 26.4 | 0.1476 | 24.3297 | 164.9x | 660 | si |
+| OR | 5 | 44.1 | 0.1630 | 25.5710 | 156.9x | 1110 | si |
+| AND NOT | 1 | 9.0 | 0.0928 | 14.4145 | 155.3x | 244 | si |
+| AND NOT | 3 | 26.9 | 0.1790 | 31.7134 | 177.2x | 252 | si |
+| AND NOT | 5 | 44.0 | 0.1984 | 34.5724 | 174.2x | 270 | si |
+
+El costo lo manda LEER las listas, no mezclarlas: los accesos a pagina
+crecen casi proporcionalmente al numero de terminos (de ~8 con uno a ~43 con
+cinco) sea cual sea el operador, porque hay que traer una lista por termino.
+La mezcla en si es lineal y practicamente gratis al lado de eso.
+
+El AND de tres o mas terminos tomados al azar devuelve CERO documentos casi
+siempre. No es un defecto de la medicion, es como se comporta un AND sobre
+vocabulario zipfiano: la probabilidad de que un mismo documento contenga tres
+palabras independientes es el producto de tres fracciones pequenas. Esa es,
+en una linea, la razon por la que los buscadores dejaron de exigir que
+aparezcan todos los terminos y pasaron a RANKEAR: con el booleano puro, una
+consulta de cinco palabras no devuelve nada.
+
+Frente al recorrido completo el indice gana entre 30 y 55 veces, y eso que la
+columna del escaneo es una cota inferior que no incluye leer ni tokenizar.
+
+### F. Export para comparar contra el indice GIN de PostgreSQL
+
+Corpus de 20000 documentos en  data/exp6_corpus.csv
+Consultas en                  data/exp6_consultas.txt
+
+PostgreSQL se usa aqui SOLO como punto de comparacion, no como
+almacenamiento: la restriccion del enunciado es no apoyarse en un motor
+ajeno para guardar o indexar los datos del proyecto, y el indice que se
+mide sigue siendo el propio. Para la otra mitad de la tabla:
+
+    python benchmarks/exp6_gin.py --csv data/exp6_corpus.csv --consultas data/exp6_consultas.txt
+

@@ -1,0 +1,11 @@
+
+==========================================================================
+  EXPERIMENTO 7 - BoVW (clasico) contra embeddings densos (moderno)
+==========================================================================
+
+6899 imagenes, 8 clases, 24 consultas.
+BoVW: codebook de 256 palabras visuales (SIFT + K-Means).
+Denso: 1000 dimensiones.
+
+### A. Construccion de las dos representaciones
+

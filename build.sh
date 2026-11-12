@@ -89,9 +89,15 @@ case "${1:-all}" in
         ;;
     clean)
         rm -rf build
-        rm -f data/*.dat data/*.idx data/*.ovf data/*.csv data/*.tmp data/catalog.txt
-        rm -rf data/_demo
-        echo ">> limpio"
+        # Lo que genera el motor: se borra sin miedo, se recrea solo.
+        rm -f data/*.dat data/*.idx data/*.ovf data/*.tmp data/catalog.txt
+        # CSV de los benchmarks: tambien se regeneran solos al correrlos.
+        rm -f data/dataset_*.csv data/exp6_corpus.csv data/exp6_consultas.txt
+        rm -rf data/_demo data/_t*
+        # Los de BoVW NO se borran. Prepararlos cuesta ~8 min de SIFT sobre
+        # 6 899 imagenes, y esas imagenes son una descarga de 350 MB que no
+        # esta en el repositorio. Para borrarlos: rm -f data/bovw_*
+        echo ">> limpio  (se conservan data/bovw_* y data/*.onnx)"
         ;;
     *)
         echo "uso: ./build.sh [all|test|demo|bench|run|clean]"

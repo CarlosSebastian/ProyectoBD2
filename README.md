@@ -135,7 +135,26 @@ anteriores ya están aplicadas y las siguientes se ejecutan igualmente, cada una
 con su propio indicador de éxito.
 
 `PRIMARY KEY` impone unicidad: antes de insertar se hace una búsqueda puntual
-por la columna clave y la operación se rechaza si el valor ya existe.
+por la columna clave y la operación se rechaza si el valor ya existe. Esa
+comprobación se hace **solo cuando se puede resolver barato**, que son dos
+casos: hay un índice B+ o hash sobre la columna clave, o el motor es
+`SEQUENTIAL` y esa columna es la que ordena el archivo (búsqueda binaria sobre
+páginas, sin índice).
+
+En una tabla `HEAP` con `PRIMARY KEY` declarada y **sin índice sobre esa
+columna** la restricción no se hace cumplir, y entran duplicados. No es un
+descuido: sin índice la búsqueda es un escaneo completo, así que comprobarla
+costaría O(n) por fila y volvería cuadrática toda carga masiva. Está medido —
+insertar 500 000 filas pasaba de 142 ms a no terminar en ocho horas.
+
+Un motor real esquiva la disyuntiva creando el índice junto con la clave: en
+PostgreSQL o MySQL una `PRIMARY KEY` *es* un índice único. Este motor prefiere
+no crear estructuras que el usuario no pidió, así que crea el índice tú mismo
+si necesitas la garantía:
+
+```sql
+CREATE INDEX idx_emp_id ON empleados (id) USING BTREE;
+```
 
 ### Módulo espacial (R-Tree)
 

@@ -44,6 +44,25 @@ import sys
 import time
 
 K_PALABRAS = 256          # tamano del codebook
+
+# Maximo de keypoints SIFT por imagen.
+#
+# Sin tope, SIFT devuelve tantos descriptores como esquinas encuentre: en este
+# dataset una foto de flores llego a 25 475. Como cada descriptor se convierte
+# en una palabra del documento, esa imagen producia una fila de 117 KB, y un
+# registro tiene que caber en UNA pagina de 4 KB. El experimento reventaba con
+# "el registro no cabe en una pagina".
+#
+# 300 no es un numero arbitrario: la media sin tope era 302 descriptores por
+# imagen, asi que recorta los casos extremos sin tocar la imagen tipica. El
+# Laboratorio 11 usaba 150 por el mismo motivo. OpenCV se queda con los
+# keypoints de mayor contraste, que son los mas informativos.
+MAX_KEYPOINTS = 300
+
+# Tope duro de bytes del documento, por si aun asi alguna fila se pasa. El
+# motor admite 4060 bytes por registro y al lado del histograma van el id, el
+# nombre del archivo y la clase.
+MAX_BYTES_DOC = 3800
 MAX_DESC_KMEANS = 200000  # descriptores que se muestrean para entrenar
 DIM_EMB = 512             # ResNet-18 tras el pooling
 
@@ -109,7 +128,7 @@ def sift_de(rutas):
     """Descriptores SIFT por imagen. Las que no den ninguno se descartan."""
     import cv2
     import numpy as np
-    sift = cv2.SIFT_create()
+    sift = cv2.SIFT_create(nfeatures=MAX_KEYPOINTS)
     descs, buenas = [], []
     for i, (ruta, clase) in enumerate(rutas):
         img = cv2.imread(ruta, cv2.IMREAD_GRAYSCALE)
@@ -125,13 +144,68 @@ def sift_de(rutas):
     return buenas, descs
 
 
+def _tensor_de_caracteristicas(modelo):
+    """Expone el vector de CARACTERISTICAS del modelo y devuelve su nombre.
+
+    Los ResNet del ONNX Model Zoo publican una sola salida: la capa de
+    clasificacion de ImageNet, 1000 logits. Eso NO es lo que necesita el
+    experimento. Lo que se quiere es la representacion que la red aprendio de
+    la imagen, que es la ENTRADA de esa ultima capa: 512 dimensiones despues
+    del pooling global.
+
+    La diferencia no es cosmetica. Los 1000 logits son puntuaciones sobre
+    categorias de ImageNet, un espacio fijado por el dataset con el que se
+    entreno la red. El vector de 512 es la descripcion de la imagen antes de
+    proyectarla sobre esas categorias, y es el que se compara por coseno en
+    cualquier sistema de recuperacion visual. Ademas 1000 floats son 4004
+    bytes y un registro tiene que caber en una pagina de 4 KB: con el nombre
+    del archivo y la clase al lado, no entra.
+
+    El tensor se localiza sin depender de nombres concretos: se busca el
+    ultimo Gemm o MatMul del grafo --- la capa de clasificacion --- y se toma
+    su primera entrada. Se anade a las salidas del grafo y se devuelve el
+    modelo modificado en memoria, sin escribir ningun archivo.
+    """
+    try:
+        import onnx
+    except ImportError:
+        return None, None
+    m = onnx.load(modelo)
+    g = m.graph
+    clasificador = None
+    for n in reversed(g.node):
+        if n.op_type in ("Gemm", "MatMul"):
+            clasificador = n
+            break
+    if clasificador is None:
+        return None, None
+    nombre = clasificador.input[0]
+    if nombre not in {o.name for o in g.output}:
+        g.output.append(onnx.helper.make_empty_tensor_value_info(nombre))
+    return m.SerializeToString(), nombre
+
+
 def embeddings_onnx(rutas, modelo):
     """ResNet-18 por onnxruntime: la salida del pooling, 512 dimensiones."""
     import numpy as np
     import onnxruntime as ort
     from PIL import Image
 
-    ses = ort.InferenceSession(modelo, providers=["CPUExecutionProvider"])
+    grafo, tensor = _tensor_de_caracteristicas(modelo)
+    if grafo is None:
+        print("   AVISO: no se pudo exponer la capa de caracteristicas.")
+        print("          Se usara la salida del modelo tal cual, que en los")
+        print("          ResNet del zoo son los 1000 logits de ImageNet y NO")
+        print("          el vector de 512 que pide el experimento.")
+        print("          Instala el paquete 'onnx' y vuelve a correrlo:")
+        print("              pip install onnx")
+        ses = ort.InferenceSession(modelo, providers=["CPUExecutionProvider"])
+        pedir = None
+    else:
+        ses = ort.InferenceSession(grafo, providers=["CPUExecutionProvider"])
+        pedir = [tensor]
+        forma = [o.shape for o in ses.get_outputs() if o.name == tensor]
+        print("   caracteristicas desde '%s' %s" % (tensor, forma[0] if forma else ""))
     entrada = ses.get_inputs()[0].name
     media = np.array([0.485, 0.456, 0.406], dtype="float32").reshape(3, 1, 1)
     desv  = np.array([0.229, 0.224, 0.225], dtype="float32").reshape(3, 1, 1)
@@ -141,7 +215,7 @@ def embeddings_onnx(rutas, modelo):
         im = Image.open(ruta).convert("RGB").resize((224, 224))
         x = np.asarray(im, dtype="float32").transpose(2, 0, 1) / 255.0
         x = ((x - media) / desv)[None, :, :, :]
-        y = ses.run(None, {entrada: x})[0].reshape(-1).astype("float32")
+        y = ses.run(pedir, {entrada: x})[0].reshape(-1).astype("float32")
         n = float(np.linalg.norm(y))
         if n > 0:
             y = y / n
@@ -234,7 +308,13 @@ def documento_de(km, d):
     partes = []
     for w in sorted(cuenta):
         partes.extend(["w%d" % w] * cuenta[w])
-    return " ".join(partes)
+    doc = " ".join(partes)
+    # Red de seguridad: el tope de keypoints ya deberia bastar, pero una fila
+    # que no quepa en una pagina aborta el experimento entero al insertarla.
+    # Vale mas perder las ultimas repeticiones de un histograma que eso.
+    if len(doc) > MAX_BYTES_DOC:
+        doc = doc[:MAX_BYTES_DOC].rsplit(" ", 1)[0]
+    return doc
 
 
 def main():
