@@ -54,6 +54,19 @@
   .leaflet-container{background:#0f1115}
   #mapa-aviso{padding:12px;color:var(--muted);font-size:12px}
 
+  /* 6. Visor multimedia: aparece solo si el resultado trae nombres de imagen */
+  #panel-media{display:none}
+  #panel-media.visible{display:flex;max-height:min(340px,38vh)}
+  #media-grid{display:flex;flex-wrap:wrap;gap:10px;align-content:flex-start}
+  .miniatura{width:132px;border:1px solid var(--border);border-radius:8px;
+             overflow:hidden;background:var(--panel)}
+  .miniatura img{display:block;width:132px;height:100px;object-fit:cover;background:#0f1115}
+  .miniatura .pie{padding:5px 7px;font-size:11px;line-height:1.35}
+  .miniatura .pie b{display:block;font-weight:600}
+  .miniatura .pie span{color:var(--muted)}
+  .miniatura.rota img{display:none}
+  .miniatura.rota .pie{color:var(--muted)}
+
   .right{display:grid;grid-template-rows:auto 1fr;gap:12px;min-height:0}
   .bottom{display:grid;grid-template-columns:1fr 340px;gap:12px;min-height:0}
   @media (max-width:1100px){ .bottom{grid-template-columns:1fr} }
@@ -217,6 +230,16 @@
         <div id="mapa"></div>
       </div>
     </section>
+
+    <!-- PANEL 6: Visor multimedia (modulo de imagenes) -->
+    <section class="panel" id="panel-media">
+      <h2>6 · Imágenes
+        <span class="spacer" style="flex:1"></span>
+        <span style="font-weight:400;text-transform:none;letter-spacing:0"
+              id="media-info"></span>
+      </h2>
+      <div class="body" id="media-grid"></div>
+    </section>
   </div>
 </div>
 
@@ -246,6 +269,10 @@ const EJEMPLOS = [
   ["Similitud",    "SELECT id, nombre FROM items ORDER BY emb <=> [0.93,0.07,0.01,0.09] LIMIT 3;"],
   ["Similitud (más celdas)", "SELECT id, nombre FROM items ORDER BY emb <=> [0.93,0.07,0.01,0.09] LIMIT 3 PROBES 3;"],
   ["Umbral vectorial", "SELECT id, nombre FROM items WHERE emb <=> [0.93,0.07,0.01,0.09] <= 0.02 PROBES 3;"],
+  ["Imágenes: crear", "CREATE TABLE imagenes (id INT PRIMARY KEY, archivo CHAR(40), clase CHAR(16), palabras TEXT);\nCOPY imagenes FROM 'data/bovw_palabras.csv' HEADER;\nCREATE INDEX ix_img ON imagenes (palabras) USING INVERTED;"],
+  ["Imágenes: ver",   "SELECT id, archivo, clase FROM imagenes LIMIT 12;"],
+  ["Imágenes: parecidas", "SELECT id, archivo, clase FROM imagenes WHERE palabras MATCH 'w7 w7 w7 w7 w22 w38 w38 w91 w152' LIMIT 12;"],
+  ["Imágenes: de una clase", "SELECT id, archivo, clase FROM imagenes WHERE clase = 'cat' LIMIT 12;"],
   ["Polígonos",    "CREATE TABLE zonas (id INT PRIMARY KEY, nombre CHAR(24), area POLYGON);\nINSERT INTO zonas VALUES (1,'Centro',POLYGON((-77.05,-12.06),(-77.01,-12.06),(-77.01,-12.03),(-77.05,-12.03))),(2,'Sur',POLYGON((-77.05,-12.16),(-77.00,-12.16),(-77.00,-12.10),(-77.05,-12.10)));\nCREATE INDEX ix_area ON zonas (area) USING RTREE;\nSELECT * FROM zonas WHERE ST_CONTAINS(area, POINT(-77.0300,-12.0460));"],
 ];
 
@@ -313,6 +340,7 @@ async function ejecutar(){
     const resp = await r.json();
     ultimo = resp; pagina = 0;
     pintarMensaje(resp); pintarResultados(resp); pintarPlan(resp); pintarMapa(resp, sql);
+    pintarImagenes(resp);
     cargarTablas();
   }catch(e){
     $('#mensaje').innerHTML = `<div class="msg err">Error de red: ${escapar(e.message)}</div>`;
@@ -496,6 +524,61 @@ function columnaPunto(d){
     if(d.rows.every(f => parseGeom(f[c]))) return c;
   }
   return -1;
+}
+
+// ---------- Panel 6 ----------
+// Mismo criterio que el mapa: el visor aparece solo si el resultado lo pide.
+// Una columna "es de imagenes" si sus valores terminan en una extension de
+// imagen. No hay un tipo IMAGE en el motor y no hace falta: lo que se guarda
+// es el nombre del archivo, y el servidor sirve la carpeta donde viven.
+const EXT_IMAGEN = /\.(jpe?g|png|gif|webp|bmp)$/i;
+
+function columnaImagen(d){
+  if(!d.rows.length) return -1;
+  for(let c = 0; c < d.columns.length; c++){
+    // Basta con mirar la primera fila: una columna mezcla de rutas y otra cosa
+    // no es una columna de imagenes.
+    if(EXT_IMAGEN.test(String(d.rows[0][c] || '').trim())) return c;
+  }
+  return -1;
+}
+
+function pintarImagenes(resp){
+  const panel = $('#panel-media'), grid = $('#media-grid');
+  const d = ultimaVistaDe(resp);
+  const ci = (d && d.ok) ? columnaImagen(d) : -1;
+  if(ci < 0){ panel.classList.remove('visible'); grid.innerHTML = ''; return; }
+
+  // El dataset guarda el nombre del archivo y la clase por separado, y las
+  // imagenes viven en una carpeta por clase. Si existe esa columna se usa como
+  // subcarpeta; si no, el nombre se pide tal cual.
+  let cDir = -1;
+  for(let c = 0; c < d.columns.length; c++){
+    const n = d.columns[c].toLowerCase();
+    if(c !== ci && (n === 'clase' || n === 'carpeta' || n === 'dir')){ cDir = c; break; }
+  }
+
+  const desde = pagina * FILAS_POR_PAGINA;
+  const filas = d.rows.slice(desde, desde + FILAS_POR_PAGINA);
+  panel.classList.add('visible');
+  $('#media-info').textContent = filas.length + ' imagen(es)';
+
+  grid.innerHTML = filas.map(f => {
+    const archivo = String(f[ci]).trim();
+    const ruta = (cDir >= 0 && !archivo.includes('/'))
+               ? String(f[cDir]).trim() + '/' + archivo : archivo;
+    // La primera columna que no sea ni el archivo ni la carpeta hace de titulo:
+    // normalmente el id, que es con lo que se vuelve a consultar.
+    let titulo = '';
+    for(let c = 0; c < d.columns.length; c++)
+      if(c !== ci && c !== cDir){ titulo = d.columns[c] + ' ' + f[c]; break; }
+    return '<figure class="miniatura">' +
+             '<img loading="lazy" src="/media/' + encodeURI(ruta) + '" alt="' + escapar(archivo) + '"' +
+             ' onerror="this.closest(\'.miniatura\').classList.add(\'rota\')">' +
+             '<figcaption class="pie"><b>' + escapar(titulo) + '</b>' +
+             '<span>' + escapar(archivo) + '</span></figcaption>' +
+           '</figure>';
+  }).join('');
 }
 
 function pintarMapa(resp, sql){

@@ -64,6 +64,86 @@ PORT=9000 ./build.sh run     # y abrir http://localhost:9000
 
 `clean` borra los binarios **y el contenido de `data/`**, o sea las tablas que
 hayas creado. Para recompilar conservando los datos basta `./build.sh run`.
+Se conservan `data/bovw_*`, que son los datos del Experimento 7 y cuesta ocho
+minutos regenerarlos.
+
+---
+
+## Reproducir los experimentos
+
+Los ocho experimentos del enunciado se lanzan con **un solo comando**, desde la
+raíz del repositorio y sin preparar nada:
+
+```bash
+./benchmarks/run_experimentos.sh
+```
+
+No hace falta compilar antes: el script compila cada experimento contra las
+fuentes del motor justo antes de ejecutarlo. La salida completa queda en
+**`benchmarks/resultados.md`**.
+
+| | qué mide | tamaño |
+|---|---|---|
+| 1 | costo de inserción en las cinco organizaciones | 500 000 filas |
+| 2 | búsquedas puntuales de igualdad | 500 000 filas |
+| 3 | rangos con selectividad variable | 500 000 filas |
+| 4 | sensibilidad al tamaño de bloque — **recompila el motor 4 veces** | 1, 2, 4 y 8 KB |
+| 5 | R-Tree: ventana, k-NN, radio y barrido de dimensión | 250 000 puntos |
+| 6 | invertido: BM25 vs TF-IDF, booleanas vs fuerza bruta | 50 000 documentos |
+| 7 | BoVW contra embeddings densos, P@5 y P@10 | 6 899 imágenes |
+| 8 | IVF: recall contra latencia según `nprobe` | 20 000 vectores |
+
+Tarda entre 45 y 75 minutos. El tramo largo es el 4, que recompila el motor
+una vez por cada tamaño de página porque el fan-out de los índices se deriva
+de `PAGE_SIZE` en tiempo de compilación.
+
+El **Experimento 7 corre tal cual**: sus datos de entrada (`data/bovw_*.csv`,
+39 MB) se versionan a propósito, para no obligar a descargar 350 MB de
+imágenes de Kaggle ni a reejecutar la extracción de descriptores. Si se
+quisieran regenerar desde las imágenes originales, el procedimiento está en la
+cabecera de `benchmarks/bovw_preparar.py`.
+
+### La otra mitad del Experimento 6: contra PostgreSQL
+
+La comparación del índice invertido propio contra el **GIN de PostgreSQL** se
+lanza aparte, porque necesita un servidor. Los archivos que consume los acaba
+de escribir el Experimento 6.
+
+```bash
+python benchmarks/exp6_gin.py --csv data/exp6_corpus.csv \
+                              --consultas data/exp6_consultas.txt
+```
+
+Requiere `psql` en el PATH. Si no hay un PostgreSQL instalado, **no hace falta
+Docker ni permisos de administrador**: hay un paquete de pip que trae los
+binarios del servidor.
+
+```bash
+pip install pgserver
+python -c "import pgserver; s = pgserver.get_server('pgdata'); print(s.get_uri())"
+PATH="$(python -c 'import pgserver,os;print(os.path.join(os.path.dirname(pgserver.__file__),"pginstall","bin"))'):$PATH"
+pg_ctl -D pgdata -o "-p 5433" -l pg.log start
+python benchmarks/exp6_gin.py --csv data/exp6_corpus.csv \
+                              --consultas data/exp6_consultas.txt \
+                              --host 127.0.0.1 --port 5433
+```
+
+PostgreSQL se usa **solo como punto de comparación**. Los datos del proyecto
+los sigue guardando e indexando el motor propio; aquí se carga una copia del
+mismo corpus para poder decir, con números, qué tan lejos queda un índice
+invertido escrito desde cero de uno de producción.
+
+### Si los tiempos salen muy altos en Windows
+
+Los contadores de I/O son reproducibles entre máquinas; los milisegundos no.
+En Windows, el antivirus intercepta cada escritura sobre el directorio de
+datos, y un experimento que hace decenas de millones de lecturas paga ese
+peaje otras tantas veces. Excluir la carpeta del proyecto reduce los tiempos a
+la mitad, medido:
+
+```powershell
+Add-MpPreference -ExclusionPath "<ruta del repositorio>"
+```
 
 ---
 

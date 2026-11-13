@@ -425,6 +425,47 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
     Table* t = abrir(st.table);
     t->buildIndex();
 
+    // ---- Duplicados en la clave primaria ----
+    //
+    // Mientras no hay indice sobre la columna clave, el motor NO hace cumplir
+    // la restriccion de PRIMARY KEY: comprobarla seria un escaneo completo por
+    // fila y volveria cuadratica cualquier carga masiva (ver Table::insert).
+    // Asi que una tabla puede llegar hasta aqui con claves repetidas.
+    //
+    // Este es el momento exacto en que detectarlas sale casi gratis: el indice
+    // acaba de construirse, asi que preguntarle por una clave cuesta O(log n)
+    // en vez de O(n). Es la unica oportunidad de avisar sin pagar de mas.
+    //
+    // Se AVISA pero no se rechaza, y la razon esta tres parrafos mas arriba en
+    // esta misma funcion: deshacer a estas alturas exigiria sacar el indice del
+    // catalogo y borrar el .idx ya escrito, y si ese rollback fallara a medias
+    // la tabla quedaria con un indice imposible y sin forma de arreglarlo,
+    // porque no hay DROP INDEX. Un indice B+ o hash no unico aloja los
+    // duplicados sin corromperse; lo que no puede pasar es que nadie lo sepa.
+    std::string aviso_dup;
+    if (!ti.key_column.empty() && ti.key_column == st.index_column &&
+        (st.index_kind == IndexKind::BPLUS || st.index_kind == IndexKind::HASH)) {
+        const int cpk = ti.schema.indexOf(st.index_column);
+        long long repetidas = 0;
+        std::string ejemplo;
+        for (const RID& rid : t->scanRIDs()) {
+            Tuple fila;
+            if (!t->getByRID(rid, fila)) continue;
+            const Value& clave = fila.at(static_cast<std::size_t>(cpk));
+            if (t->searchRIDsEq(st.index_column, clave).size() > 1) {
+                ++repetidas;
+                if (ejemplo.empty()) ejemplo = clave.str();
+            }
+        }
+        if (repetidas > 0)
+            aviso_dup = "  AVISO: la columna es PRIMARY KEY y tiene " +
+                        std::to_string(repetidas) + " fila(s) con clave repetida (por ejemplo " +
+                        st.index_column + " = " + ejemplo + "). Entraron mientras no habia "
+                        "indice, que es cuando la restriccion no se puede hacer cumplir barato. "
+                        "El indice las admite, pero una busqueda puntual por esa clave devolvera "
+                        "mas de una fila. Desde ahora los duplicados nuevos si se rechazan.";
+    }
+
     r.metodo  = "DDL";
     r.message = "Indice '" + st.index_name + "' creado sobre " + st.table + "(" + st.index_column +
                 ") usando " + indexKindName(st.index_kind) +
@@ -450,6 +491,7 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
                          ", " + std::to_string(iv->numPages()) + " paginas de indice.";
         }
     }
+    r.message += aviso_dup;
     r.exec_ms = msDesde(t0);
     r.plan.push_back(PlanStep{"CREATE INDEX", r.exec_ms, indexKindName(st.index_kind)});
     return r;

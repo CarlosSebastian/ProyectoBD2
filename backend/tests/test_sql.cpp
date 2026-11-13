@@ -296,6 +296,56 @@ int main() {
     }
 
     // ---------------------------------------------------------------------
+    {
+        SECTION("PRIMARY KEY: se hace cumplir solo cuando hay indice de clave");
+        const std::string DIR = "data/_tsqlpk";
+        std::filesystem::remove_all(DIR);
+        std::filesystem::create_directories(DIR);
+        Database db(DIR);
+        db.execute("CREATE TABLE p (id INT PRIMARY KEY, nombre CHAR(20))");
+
+        // Sin indice la restriccion NO se comprueba: hacerlo seria un escaneo
+        // completo por fila, y eso vuelve cuadratica cualquier carga masiva.
+        // Esta de aqui es la contrapartida de esa decision, y conviene tenerla
+        // fijada: si algun dia se vuelve a comprobar sin indice, este CHECK
+        // avisa antes de que alguien lo descubra con una carga de ocho horas.
+        CHECK(db.execute("INSERT INTO p VALUES (1,'Ada')").ok, "primera fila");
+        CHECK(db.execute("INSERT INTO p VALUES (1,'Otra')").ok,
+              "sin indice, un duplicado entra");
+        CHECK(db.execute("INSERT INTO p VALUES (2,'Grace')").ok, "otra clave");
+        CHECK(db.execute("INSERT INTO p VALUES (2,'Tercera')").ok,
+              "y su duplicado tambien");
+        CHECK(db.execute("INSERT INTO p VALUES (3,'Unica')").ok, "una sin repetir");
+
+        // Al crear el indice es cuando detectarlos sale barato, porque ya se
+        // esta recorriendo la tabla entera para poblarlo.
+        QueryResult ix = db.execute("CREATE INDEX ixp ON p (id) USING BTREE");
+        CHECK(ix.ok, "el indice se crea igualmente: un B+ no unico los aloja");
+        CHECK(ix.message.find("AVISO") != std::string::npos,
+              "pero avisa de que hay claves repetidas");
+        CHECK(ix.message.find("4 fila(s)") != std::string::npos,
+              "y cuenta las cuatro filas implicadas, no las dos claves");
+
+        // Con el indice puesto, la garantia vuelve.
+        QueryResult dup = db.execute("INSERT INTO p VALUES (1,'Cuarta')");
+        CHECK(!dup.ok, "con indice, el duplicado se rechaza");
+        CHECK(dup.error.find("PRIMARY KEY") != std::string::npos,
+              "y el error dice por que");
+        CHECK(db.execute("INSERT INTO p VALUES (9,'Nueva')").ok,
+              "una clave libre sigue entrando");
+
+        // Y una tabla sin duplicados no debe disparar el aviso: si lo hiciera,
+        // la condicion estaria mal escrita y nadie se fiaria del mensaje.
+        db.execute("CREATE TABLE q (id INT PRIMARY KEY, v CHAR(8))");
+        db.execute("INSERT INTO q VALUES (1,'a')");
+        db.execute("INSERT INTO q VALUES (2,'b')");
+        QueryResult ixq = db.execute("CREATE INDEX ixq ON q (id) USING BTREE");
+        CHECK(ixq.ok, "indice sobre una clave limpia");
+        CHECK(ixq.message.find("AVISO") == std::string::npos,
+              "sin duplicados no hay aviso");
+    }
+
+    // ---------------------------------------------------------------------
     //  REGRESION: un .idx que quedo de un indice ANTERIOR, de otro tipo.
     //  CREATE INDEX no truncaba el archivo, asi que el constructor del B+ veia
     //  un archivo no vacio, reutilizaba la META de un hash y el descenso
