@@ -103,6 +103,11 @@ imágenes de Kaggle ni a reejecutar la extracción de descriptores. Si se
 quisieran regenerar desde las imágenes originales, el procedimiento está en la
 cabecera de `benchmarks/bovw_preparar.py`.
 
+Del dataset de imágenes en sí (186 MB) se versionan **solo 36 archivos**: los
+que devuelven los cuatro botones de demostración del visor multimedia, para que
+el panel 6 funcione en un clon recién hecho. El resto de `data/natural_images/`
+se descarga de Kaggle solo si se quiere regenerar el BoVW desde cero.
+
 ### La otra mitad del Experimento 6: contra PostgreSQL
 
 La comparación del índice invertido propio contra el **GIN de PostgreSQL** se
@@ -554,6 +559,17 @@ que más tarda.
 ```bash
 python ai/rag_server.py
 ```
+
+**6. Medir el tiempo de respuesta extremo a extremo** (opcional, con el
+servidor RAG levantado):
+
+```bash
+python benchmarks/exp9_rag.py
+```
+
+Lanza 12 preguntas en los tres modos y desglosa a dónde se va la latencia:
+reescritura, embedding, **motor** y generación, más las lecturas de disco que
+pide el motor en cada pregunta. Escribe `benchmarks/exp9.txt`.
 
 **5. Abrir http://localhost:8000.** Los tres indicadores de arriba tienen que
 estar en verde: `motor ✓`, `ollama ✓` y `N papers`. Escribe una pregunta (por

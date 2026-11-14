@@ -41,3 +41,48 @@ ai/cache/*
 !ai/cache/.gitkeep
 __pycache__/
 graphify-out/
+
+# Muestra minima del dataset de imagenes: SOLO las que usan los cuatro
+# botones de demostracion del visor multimedia. El dataset completo
+# (natural_images, 8 clases, 6 899 archivos) son 186 MB y no se versiona;
+# sin estas, quien clone el repo ve el panel 6 con los recuadros vacios.
+!data/natural_images/
+data/natural_images/*
+!data/natural_images/*/
+data/natural_images/*/*
+!data/natural_images/airplane/airplane_0000.jpg
+!data/natural_images/airplane/airplane_0001.jpg
+!data/natural_images/airplane/airplane_0002.jpg
+!data/natural_images/airplane/airplane_0003.jpg
+!data/natural_images/airplane/airplane_0004.jpg
+!data/natural_images/airplane/airplane_0005.jpg
+!data/natural_images/airplane/airplane_0006.jpg
+!data/natural_images/airplane/airplane_0007.jpg
+!data/natural_images/airplane/airplane_0008.jpg
+!data/natural_images/airplane/airplane_0009.jpg
+!data/natural_images/airplane/airplane_0145.jpg
+!data/natural_images/car/car_0001.jpg
+!data/natural_images/car/car_0276.jpg
+!data/natural_images/cat/cat_0000.jpg
+!data/natural_images/cat/cat_0001.jpg
+!data/natural_images/cat/cat_0002.jpg
+!data/natural_images/cat/cat_0003.jpg
+!data/natural_images/cat/cat_0004.jpg
+!data/natural_images/cat/cat_0005.jpg
+!data/natural_images/cat/cat_0006.jpg
+!data/natural_images/cat/cat_0007.jpg
+!data/natural_images/cat/cat_0008.jpg
+!data/natural_images/cat/cat_0009.jpg
+!data/natural_images/cat/cat_0037.jpg
+!data/natural_images/cat/cat_0141.jpg
+!data/natural_images/dog/dog_0580.jpg
+!data/natural_images/flower/flower_0169.jpg
+!data/natural_images/flower/flower_0198.jpg
+!data/natural_images/motorbike/motorbike_0071.jpg
+!data/natural_images/motorbike/motorbike_0135.jpg
+!data/natural_images/motorbike/motorbike_0377.jpg
+!data/natural_images/motorbike/motorbike_0403.jpg
+!data/natural_images/motorbike/motorbike_0570.jpg
+!data/natural_images/motorbike/motorbike_0702.jpg
+!data/natural_images/motorbike/motorbike_0770.jpg
+!data/natural_images/person/person_0362.jpg
