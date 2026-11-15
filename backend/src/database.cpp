@@ -409,7 +409,11 @@ QueryResult Database::ejecutarCreateIndex(const Statement& st) {
     IndexInfo ix;
     ix.column = st.index_column;
     ix.kind   = st.index_kind;
-    ix.file   = st.table + "_" + st.index_column + ".idx";
+    // INVERTED e IVF son dos archivos (ver archivoSecundario en catalog.hpp);
+    // el catalogo guarda el principal: .dic (diccionario) o .cen (centroides).
+    ix.file   = st.table + "_" + st.index_column +
+                (st.index_kind == IndexKind::INVERTED ? ".dic"
+               : st.index_kind == IndexKind::IVF      ? ".cen" : ".idx");
     if (st.index_kind == IndexKind::INVERTED) {
         ix.idioma  = texto::nombreIdioma(texto::idiomaDesdeNombre(st.index_idioma));
         ix.scoring = st.index_scoring;

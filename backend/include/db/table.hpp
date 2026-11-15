@@ -199,7 +199,10 @@ public:
     long long heapReads()  const { return store_disk_->readCount(); }
     long long indexReads() const {
         long long n = 0;
-        for (const Indice& ix : indices_) n += ix.disk->readCount();
+        for (const Indice& ix : indices_) {
+            n += ix.disk->readCount();
+            if (ix.disk2) n += ix.disk2->readCount();
+        }
         return n;
     }
     void resetStats();
@@ -219,6 +222,9 @@ private:
 
         std::unique_ptr<DiskManager> disk;
         std::unique_ptr<BufferPool>  bp;
+        // Segundo archivo, solo INVERTED (.inv, postings) e IVF (.lst, listas).
+        std::unique_ptr<DiskManager> disk2;
+        std::unique_ptr<BufferPool>  bp2;
 
         std::unique_ptr<BPlusTree<std::int64_t>>      bt_int;
         std::unique_ptr<BPlusTree<Key32>>             bt_str;

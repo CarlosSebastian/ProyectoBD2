@@ -23,16 +23,27 @@
 //  La curva recall contra latencia que sale de mover nprobe es exactamente lo
 //  que el enunciado pide medir.
 //
-//  EL ARCHIVO
+//  LOS DOS ARCHIVOS
+//  Como pide el enunciado: un Archivo Directorio de Centroides y un Archivo
+//  de Listas Invertidas Paginadas.
+//
+//  <tabla>_<col>.cen  --- DIRECTORIO DE CENTROIDES
 //     pagina 0            META: dimension, nlist, metrica, MAGIC y zonas
 //     [p_cent, p_dir)     CENTROIDES: nlist * dim floats, plano
-//     [p_dir,  p_ent)     DIRECTORIO: por celda, donde empieza su lista y
-//                         cuantos vectores tiene
-//     [p_ent,  p_fin)     ENTRADAS: por vector, RID + norma + las dim
-//                         componentes. Los vectores se guardan DENTRO del
-//                         indice (variante IVF-Flat) para que recorrer una
-//                         celda sea lectura secuencial; tenerlos solo en el
-//                         heap obligaria a un salto aleatorio por candidato.
+//     [p_dir,  p_fin)     DIRECTORIO: por celda, el offset donde empieza su
+//                         lista dentro del .lst y cuantos vectores tiene
+//
+//  <tabla>_<col>.lst  --- LISTAS INVERTIDAS PAGINADAS
+//     [0, p_fin_lst)      ENTRADAS: por vector, RID + norma + las dim
+//                         componentes, agrupadas por celda y contiguas.
+//                         Los vectores se guardan DENTRO del indice
+//                         (variante IVF-Flat) para que recorrer una celda sea
+//                         lectura secuencial; tenerlos solo en el heap
+//                         obligaria a un salto aleatorio por candidato.
+//
+//  Una consulta lee los centroides del .cen, elige los nprobe mas cercanos,
+//  toma su (offset, cuantos) del directorio y hace seek(offset) en el .lst
+//  para recorrer SOLO esas celdas.
 //
 //  POR QUE EL VECTOR MANDA EN EL DISENO
 //  Con dim = 384 cada entrada pesa 1548 bytes: en una pagina de 4 KB entran
@@ -89,10 +100,14 @@ public:
     using Fuente = std::function<void(const std::function<void(const RID&,
                                                                const std::vector<float>&)>&)>;
 
-    static constexpr std::int32_t MAGIC     = 0x49564658;   // "IVFX"
+    // "IVFD": formato en dos archivos. Distinta de la del formato viejo de un
+    // solo .idx ("IVFX"), para que un indice viejo se reconstruya en vez de
+    // buscar sus listas en un .lst que no existe.
+    static constexpr std::int32_t MAGIC     = 0x49564644;   // "IVFD"
     static constexpr int          OFF_MAGIC = 16;
 
-    explicit IVFIndex(BufferPool* bp);
+    // 'cen' es el pool del archivo .cen y 'lst' el del .lst.
+    IVFIndex(BufferPool* cen, BufferPool* lst);
 
     // listas <= 0 pide el valor por defecto: raiz de N, que es la regla
     // practica habitual (deja del orden de raiz de N vectores por celda).
@@ -111,7 +126,8 @@ public:
     int           listas()      const { return nlist_; }
     std::uint32_t size()        const { return num_vec_; }
     Metrica       metrica()     const { return metrica_; }
-    int           numPages()    const { return bp_->disk()->numPages(); }
+    int           numPages()    const { return bp_->disk()->numPages() +
+                                                   bp_lst_->disk()->numPages(); }
     double        inercia()     const { return inercia_; }
     int           iteraciones() const { return iters_; }
     int           nprobePorDefecto() const;
@@ -126,8 +142,10 @@ private:
     void leerMeta();
     void escribirMeta();
     void crearVacio();
-    void leerRango(page_id_t zona, std::uint64_t off, std::uint32_t n, char* dest) const;
-    void escribirRango(page_id_t zona, std::uint64_t off, std::uint32_t n, const char* src);
+    void leerRango(BufferPool* bp, page_id_t zona, std::uint64_t off,
+                   std::uint32_t n, char* dest) const;
+    void escribirRango(BufferPool* bp, page_id_t zona, std::uint64_t off,
+                       std::uint32_t n, const char* src);
     // Recorre 'cuantas' entradas consecutivas desde un byte dado, leyendolas
     // por bloques para no volver a pedir la misma pagina en cada entrada.
     void leerRangoEntradas(std::uint64_t desde_byte, std::uint32_t cuantas,
@@ -135,7 +153,8 @@ private:
 
     int bytesPorEntrada() const { return 8 + 4 + dim_ * 4; }
 
-    BufferPool*   bp_;
+    BufferPool*   bp_;       // .cen: meta + centroides + directorio
+    BufferPool*   bp_lst_;   // .lst: listas paginadas
     std::int32_t  num_vec_ = 0;
     std::int32_t  dim_     = 0;
     std::int32_t  nlist_   = 0;
@@ -143,7 +162,8 @@ private:
     double        inercia_ = 0.0;
     std::int32_t  iters_   = 0;
 
-    page_id_t p_cent_ = 1, p_dir_ = 1, p_ent_ = 1, p_fin_ = 1;
+    page_id_t p_cent_ = 1, p_dir_ = 1, p_ent_ = 0, p_fin_ = 1;   // p_ent_ en el .lst
+    page_id_t p_fin_lst_ = 0;                                     // paginas del .lst
 };
 
 }  // namespace db

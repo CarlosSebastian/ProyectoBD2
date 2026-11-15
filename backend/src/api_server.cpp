@@ -148,7 +148,7 @@ int main(int argc, char** argv) {
     srv.set_mount_point("/", www_dir);
 
     // Imagenes del modulo multimedia. Se monta la SUBCARPETA concreta y no
-    // data/ entero: ahi viven tambien los .dat y los .idx del motor, y no hay
+    // data/ entero: ahi viven tambien los .dat y los indices del motor, y no hay
     // ninguna razon para servirlos por HTTP. Si la carpeta no existe,
     // set_mount_point devuelve false y el visor simplemente no muestra nada.
     srv.set_mount_point("/media", data_dir + "/natural_images");

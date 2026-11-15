@@ -34,6 +34,10 @@ make PAGE=8192 bench               # Experimento 4: variar el tamaño de bloque
 ./build/dump_page data/<tabla>.dat 0            # cabecera + directorio de slots
 ./build/dump_page data/<tabla>.dat --resumen    # una línea por página
 ./build/dump_page data/<tabla>_<columna>.idx 1  # nodo del B+ o bucket del hash
+./build/dump_page data/<tabla>_<columna>.dic 0  # invertido: META + diccionario
+./build/dump_page data/<tabla>_<columna>.inv 0  # invertido: listas de posteo, con sus terminos
+./build/dump_page data/<tabla>_<columna>.cen 0  # IVF: META + centroides + directorio
+./build/dump_page data/<tabla>_<columna>.lst 0  # IVF: listas paginadas, vector por vector
 ./build/dump_page data/<tabla>.dat 0 --hex      # los 4096 bytes completos
 ```
 
@@ -89,7 +93,7 @@ fuentes del motor justo antes de ejecutarlo. La salida completa queda en
 | 3 | rangos con selectividad variable | 500 000 filas |
 | 4 | sensibilidad al tamaño de bloque — **recompila el motor 4 veces** | 1, 2, 4 y 8 KB |
 | 5 | R-Tree: ventana, k-NN, radio y barrido de dimensión | 250 000 puntos |
-| 6 | invertido: BM25 vs TF-IDF, booleanas vs fuerza bruta | 50 000 documentos |
+| 6 | invertido: booleanas y ranking Top-K TF-IDF/coseno contra escaneo completo y contra GIN | 50 000 documentos |
 | 7 | BoVW contra embeddings densos, P@5 y P@10 | 6 899 imágenes |
 | 8 | IVF: recall contra latencia según `nprobe` | 20 000 vectores |
 
@@ -178,7 +182,7 @@ benchmarks/
   gen_dataset.cpp        generador del dataset sintético
   exp1..exp4_*.cpp       relacional: inserción, puntual, rangos, tamaño de página
   exp5_espacial.cpp      R-Tree: ventana, KNN, radio y barrido de dimensión
-  exp6_texto.cpp         invertido: BM25 vs TF-IDF, booleanas vs fuerza bruta
+  exp6_texto.cpp         invertido: booleanas y Top-K TF-IDF/coseno vs escaneo
   exp6_gin.py            el mismo corpus contra el GIN de PostgreSQL
   exp7_bovw.cpp          BoVW (SIFT -> palabras visuales) vs vector denso
   exp8_ann.cpp           IVF: recall y costo en función de nprobe
@@ -402,6 +406,12 @@ el corpus nunca pasa entero por memoria, se vuelcan bloques ordenados a disco
 y se mezclan en una sola pasada. Las listas de posteo van comprimidas por
 huecos y varint.
 
+El índice ocupa **dos archivos**: `<tabla>_<columna>.dic` (diccionario: por
+término, df, largo de la lista y offset a sus postings; más la tabla de
+documentos con sus normas) y `<tabla>_<columna>.inv` (las listas de posteo,
+seguidas). Una búsqueda localiza el término en el `.dic` y hace `seek(offset)`
+en el `.inv`.
+
 ```sql
 CREATE TABLE papers (id INT PRIMARY KEY, titulo CHAR(80), resumen TEXT);
 CREATE INDEX ix_texto ON papers (resumen) USING INVERTED;
@@ -458,6 +468,11 @@ centroides, el directorio y **los vectores dentro del propio índice** (de ahí
 lo de *Flat*). Una consulta mide su distancia a los centroides y baja solo a
 las celdas más cercanas.
 
+También ocupa **dos archivos**: `<tabla>_<columna>.cen` (centroides y
+directorio ⟨celda, centroide, página de inicio⟩) y `<tabla>_<columna>.lst`
+(las listas invertidas paginadas, con ⟨RID, vector⟩). Sin `LISTS`, el número de
+celdas es C = ⌊√N⌋.
+
 ```sql
 CREATE TABLE items (id INT PRIMARY KEY, nombre CHAR(20), emb VECTOR(4));
 CREATE INDEX ix_emb ON items (emb) USING IVF LISTS 3 METRIC COSINE;
@@ -495,7 +510,7 @@ porque calcule mal sino porque no miró el resto del espacio.
 ## Aplicación de IA: RAG sobre papers de arXiv
 
 Responde preguntas sobre literatura científica. **Toda la recuperación la hace
-el motor**: una consulta `MATCH` (BM25 sobre el índice invertido) y otra
+el motor**: una consulta `MATCH` (TF-IDF con coseno sobre el índice invertido) y otra
 `ORDER BY emb <=> [...]` (IVF, coseno), fusionadas con Reciprocal Rank Fusion.
 Fuera del motor solo van los modelos de IA, que corren en Ollama. El código es
 Python con biblioteca estándar: **no hay `pip install`**.
@@ -560,6 +575,11 @@ que más tarda.
 python ai/rag_server.py
 ```
 
+**5. Abrir http://localhost:8000.** Los tres indicadores de arriba tienen que
+estar en verde: `motor ✓`, `ollama ✓` y `N papers`. Escribe una pregunta (por
+ejemplo *¿Qué se ha investigado sobre generación de recetas con IA?*); la
+primera respuesta tarda unos segundos porque Ollama carga el modelo.
+
 **6. Medir el tiempo de respuesta extremo a extremo** (opcional, con el
 servidor RAG levantado):
 
@@ -571,17 +591,12 @@ Lanza 12 preguntas en los tres modos y desglosa a dónde se va la latencia:
 reescritura, embedding, **motor** y generación, más las lecturas de disco que
 pide el motor en cada pregunta. Escribe `benchmarks/exp9.txt`.
 
-**5. Abrir http://localhost:8000.** Los tres indicadores de arriba tienen que
-estar en verde: `motor ✓`, `ollama ✓` y `N papers`. Escribe una pregunta (por
-ejemplo *¿Qué se ha investigado sobre generación de recetas con IA?*); la
-primera respuesta tarda unos segundos porque Ollama carga el modelo.
-
 ### Qué muestra la página
 
 Cada respuesta trae el texto generado (con citas `[id]` que llevan al paper),
-los papers recuperados con su rango BM25 y vectorial, el SQL ejecutado, y las
+los papers recuperados con su rango léxico (TF-IDF) y vectorial, el SQL ejecutado, y las
 **lecturas de disco, accesos a página y latencia de cada consulta al motor**.
-El selector permite comparar *solo BM25*, *solo vectorial* e *híbrida*. El
+El selector permite comparar *solo léxica (TF-IDF)*, *solo vectorial* e *híbrida*. El
 corpus está en inglés y `all-minilm` es monolingüe, así que el LLM reescribe la
 pregunta como consulta en inglés antes de buscar (casilla desactivable).
 

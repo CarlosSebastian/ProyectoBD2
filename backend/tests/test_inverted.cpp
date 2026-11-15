@@ -203,10 +203,12 @@ int main() {
         for (std::size_t presupuesto : {std::size_t(32), std::size_t(256),
                                         std::size_t(1024), std::size_t(1u << 20)}) {
             const std::string f = ruta("ti_" + std::to_string(presupuesto) + ".idx");
-            resetFile(f);
+            resetFile(f); resetFile(f + ".inv");
             DiskManager dm(f);
             BufferPool bp(&dm, 16);
-            InvertedIndex ix(&bp);
+            DiskManager dm2(f + ".inv");
+            BufferPool bp2(&dm2, 16);
+            InvertedIndex ix(&bp, &bp2);
             construir(ix, docs, texto::Idioma::EN, ruta("spimi" + std::to_string(presupuesto)),
                       presupuesto);
             bloques_vistos.push_back(ix.bloquesSPIMI());
@@ -245,10 +247,12 @@ int main() {
         const double avgdl = suma / N;
 
         const std::string f = ruta("ti_bm25.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".inv");
         DiskManager dm(f);
         BufferPool bp(&dm, 16);
-        InvertedIndex ix(&bp);
+        DiskManager dm2(f + ".inv");
+        BufferPool bp2(&dm2, 16);
+        InvertedIndex ix(&bp, &bp2);
         construir(ix, docs, texto::Idioma::EN, ruta("spimi_bm25"), 128);
 
         const char* consultas[] = {"inverted index", "document frequency", "single pass over",
@@ -300,10 +304,12 @@ int main() {
     {
         const std::vector<std::string> docs = corpusChico();
         const std::string f = ruta("ti_tfidf.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".inv");
         DiskManager dm(f);
         BufferPool bp(&dm, 16);
-        InvertedIndex ix(&bp);
+        DiskManager dm2(f + ".inv");
+        BufferPool bp2(&dm2, 16);
+        InvertedIndex ix(&bp, &bp2);
         construir(ix, docs, texto::Idioma::EN, ruta("spimi_tfidf"), 128);
 
         for (const std::string& d : docs) {
@@ -351,10 +357,12 @@ int main() {
         const double avgdl = suma / N;
 
         const std::string f = ruta("ti_grande.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".inv");
         DiskManager dm(f);
         BufferPool bp(&dm, 32);
-        InvertedIndex ix(&bp);
+        DiskManager dm2(f + ".inv");
+        BufferPool bp2(&dm2, 32);
+        InvertedIndex ix(&bp, &bp2);
         construir(ix, docs, texto::Idioma::EN, ruta("spimi_grande"), 16 * 1024);
         CHECK(ix.bloquesSPIMI() > 1, "el corpus grande no cabe en un bloque");
         CHECK_EQ(ix.numTerminos(), static_cast<std::uint32_t>(ref.size()), "vocabulario completo");
@@ -413,10 +421,12 @@ int main() {
         std::vector<InvertedIndex::Resultado> antes;
         std::uint32_t nt = 0;
         {
-            resetFile(f);
+            resetFile(f); resetFile(f + ".inv");
             DiskManager dm(f);
             BufferPool bp(&dm, 8);
-            InvertedIndex ix(&bp);
+            DiskManager dm2(f + ".inv");
+            BufferPool bp2(&dm2, 8);
+            InvertedIndex ix(&bp, &bp2);
             construir(ix, docs, texto::Idioma::EN, ruta("spimi_persist"), 64);
             antes = ix.buscar("inverted index documents", -1);
             nt = ix.numTerminos();
@@ -424,7 +434,9 @@ int main() {
         {
             DiskManager dm(f);
             BufferPool bp(&dm, 8);
-            InvertedIndex ix(&bp);   // se abre leyendo la META del disco
+            DiskManager dm2(f + ".inv");
+            BufferPool bp2(&dm2, 8);
+            InvertedIndex ix(&bp, &bp2);   // se abre leyendo la META del disco
             CHECK_EQ(ix.numDocs(), static_cast<std::uint32_t>(docs.size()), "num_docs tras reabrir");
             CHECK_EQ(ix.numTerminos(), nt, "num_terminos tras reabrir");
             CHECK_EQ(ix.idioma() == texto::Idioma::EN, true, "el idioma sobrevive");
@@ -446,10 +458,12 @@ int main() {
             "el ranking bm25 pondera la frecuencia de termino y la longitud del documento",
         };
         const std::string f = ruta("ti_es.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".inv");
         DiskManager dm(f);
         BufferPool bp(&dm, 8);
-        InvertedIndex ix(&bp);
+        DiskManager dm2(f + ".inv");
+        BufferPool bp2(&dm2, 8);
+        InvertedIndex ix(&bp, &bp2);
         construir(ix, docs, texto::Idioma::ES, ruta("spimi_es"), 128);
         CHECK_EQ(ix.idioma() == texto::Idioma::ES, true, "el indice guarda ES");
         const auto res = ix.buscar("indices invertidos", 5);
@@ -464,10 +478,12 @@ int main() {
     SECTION("casos de borde");
     {
         const std::string f = ruta("ti_borde.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".inv");
         DiskManager dm(f);
         BufferPool bp(&dm, 8);
-        InvertedIndex ix(&bp);
+        DiskManager dm2(f + ".inv");
+        BufferPool bp2(&dm2, 8);
+        InvertedIndex ix(&bp, &bp2);
 
         // Indice recien creado, sin construir.
         CHECK_EQ(ix.numDocs(), static_cast<std::uint32_t>(0), "indice vacio");
@@ -503,7 +519,7 @@ int main() {
     SECTION("un .idx de otro tipo no se interpreta como indice invertido");
     {
         const std::string f = ruta("ti_ajeno.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".inv");
         {   // se fabrica una pagina 0 con una firma que no es la nuestra
             DiskManager dm(f);
             BufferPool bp(&dm, 4);
@@ -515,8 +531,10 @@ int main() {
         }
         DiskManager dm(f);
         BufferPool bp(&dm, 4);
+        DiskManager dm2(f + ".inv");
+        BufferPool bp2(&dm2, 4);
         bool lanzo = false;
-        try { InvertedIndex ix(&bp); (void)ix; }
+        try { InvertedIndex ix(&bp, &bp2); (void)ix; }
         catch (const DBException&) { lanzo = true; }
         CHECK(lanzo, "abrir un R-Tree como indice invertido tiene que fallar");
     }
@@ -534,10 +552,12 @@ int main() {
             docs.push_back(s);
         }
         const std::string f = ruta("ti_compresion.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".inv");
         DiskManager dm(f);
         BufferPool bp(&dm, 32);
-        InvertedIndex ix(&bp);
+        DiskManager dm2(f + ".inv");
+        BufferPool bp2(&dm2, 32);
+        InvertedIndex ix(&bp, &bp2);
         construir(ix, docs, texto::Idioma::EN, ruta("spimi_comp"), 64 * 1024);
 
         // Cuanto ocuparian los postings sin comprimir: 8 bytes por par.
@@ -569,10 +589,12 @@ int main() {
         const auto ref = referencia(docs, texto::Idioma::EN, &largos);
 
         const std::string f = ruta("ti_bool.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".inv");
         DiskManager dm(f);
         BufferPool bp(&dm, 32);
-        InvertedIndex ix(&bp);
+        DiskManager dm2(f + ".inv");
+        BufferPool bp2(&dm2, 32);
+        InvertedIndex ix(&bp, &bp2);
         construir(ix, docs, texto::Idioma::EN, ruta("spimi_bool"), 4096);
 
         auto docsDe = [&](const std::string& palabra) {
@@ -708,10 +730,12 @@ int main() {
         }
 
         const std::string f = ruta("ti_bool_big.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".inv");
         DiskManager dm(f);
         BufferPool bp(&dm, 16);
-        InvertedIndex ix(&bp);
+        DiskManager dm2(f + ".inv");
+        BufferPool bp2(&dm2, 16);
+        InvertedIndex ix(&bp, &bp2);
         construir(ix, docs, texto::Idioma::EN, ruta("spimi_boolbig"), 2048);
 
         // Fuerza bruta: se recorre documento por documento aplicando la
@@ -764,10 +788,12 @@ int main() {
     {
         const std::vector<std::string> docs = corpusChico();
         const std::string f = ruta("ti_bool_rank.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".inv");
         DiskManager dm(f);
         BufferPool bp(&dm, 32);
-        InvertedIndex ix(&bp);
+        DiskManager dm2(f + ".inv");
+        BufferPool bp2(&dm2, 32);
+        InvertedIndex ix(&bp, &bp2);
         construir(ix, docs, texto::Idioma::EN, ruta("spimi_boolrank"), 4096);
 
         const std::string expr = "document AND NOT inverted";

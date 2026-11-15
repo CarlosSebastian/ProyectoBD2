@@ -77,8 +77,8 @@
         <div class="barra">
           <label>Búsqueda
             <select id="modo">
-              <option value="hibrido">Híbrida (BM25 + vectorial)</option>
-              <option value="bm25">Solo BM25</option>
+              <option value="hibrido">Híbrida (TF-IDF + vectorial)</option>
+              <option value="bm25">Solo léxica (TF-IDF coseno)</option>
               <option value="vectorial">Solo vectorial</option>
             </select>
           </label>
@@ -148,7 +148,7 @@ function pintarFuentes(fs) {
       <div class="meta">${esc(d.cat)} · ${d.anio} ·
         <a href="https://arxiv.org/abs/${esc(d.arxiv_id)}" target="_blank" rel="noopener">${esc(d.arxiv_id)}</a>
         · RRF ${d.rrf.toFixed(4)}
-        · BM25 ${d.rank_bm25 ? '#' + d.rank_bm25 + ' (' + d.bm25.toFixed(2) + ')' : '—'}
+        · TF-IDF ${d.rank_bm25 ? '#' + d.rank_bm25 + ' (' + d.bm25.toFixed(2) + ')' : '—'}
         · vector ${d.rank_vec ? '#' + d.rank_vec + ' (d=' + d.distancia.toFixed(3) + ')' : '—'}</div>
       <p>${esc(d.abstract)}</p>
     </div>`).join('');
@@ -164,7 +164,7 @@ function pintarMetricas(ms_) {
            <td class="n">${m.disk_reads}</td>
            <td class="n">${m.page_accesses}</td><td class="n">${ms(m.total_ms)}</td></tr>`;
   $('#metricas').innerHTML = `<table>
-    <tr><th>Consulta</th><th>Filas</th><th title="Bloques leídos del archivo del índice (.idx)">Lect. índice</th>
+    <tr><th>Consulta</th><th>Filas</th><th title="Bloques leídos de los archivos del índice">Lect. índice</th>
         <th title="Bloques leídos del archivo de datos (.dat)">Lect. tabla</th><th>I/O reads</th>
         <th>Accesos pág.</th><th>Tiempo</th></tr>
     ${ms_.map(fila).join('')}</table>` +

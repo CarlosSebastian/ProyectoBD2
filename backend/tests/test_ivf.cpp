@@ -122,10 +122,12 @@ int main() {
         const Corpus c = generar(2000, 32, 25, 11);
         for (IVFIndex::Metrica met : {IVFIndex::Metrica::COSENO, IVFIndex::Metrica::L2}) {
             const std::string f = ruta("ivf_exacto.idx");
-            resetFile(f);
+            resetFile(f); resetFile(f + ".lst");
             DiskManager dm(f);
             BufferPool bp(&dm, 64);
-            IVFIndex ix(&bp);
+            DiskManager dm2(f + ".lst");
+            BufferPool bp2(&dm2, 64);
+            IVFIndex ix(&bp, &bp2);
             ix.construir(fuenteDe(c.v), c.dim, 0, met);
 
             std::mt19937 rng(5);
@@ -170,10 +172,12 @@ int main() {
     {
         const Corpus c = generar(4000, 48, 30, 77);
         const std::string f = ruta("ivf_recall.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".lst");
         DiskManager dm(f);
         BufferPool bp(&dm, 64);
-        IVFIndex ix(&bp);
+        DiskManager dm2(f + ".lst");
+        BufferPool bp2(&dm2, 64);
+        IVFIndex ix(&bp, &bp2);
         ix.construir(fuenteDe(c.v), c.dim, 60, IVFIndex::Metrica::COSENO);
         CHECK_EQ(ix.listas(), 60, "se respetan las celdas pedidas");
 
@@ -212,10 +216,12 @@ int main() {
     {
         const Corpus c = generar(1500, 16, 12, 909);
         const std::string f = ruta("ivf_reparto.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".lst");
         DiskManager dm(f);
         BufferPool bp(&dm, 32);
-        IVFIndex ix(&bp);
+        DiskManager dm2(f + ".lst");
+        BufferPool bp2(&dm2, 32);
+        IVFIndex ix(&bp, &bp2);
         ix.construir(fuenteDe(c.v), c.dim, 20, IVFIndex::Metrica::L2);
 
         const std::vector<std::uint32_t> tam = ix.tamanosDeListas();
@@ -254,8 +260,9 @@ int main() {
         const std::vector<float> q = {2.0f, 0.0f, 0.0f};
 
         const std::string f1 = ruta("ivf_cos.idx");
-        resetFile(f1);
-        DiskManager d1(f1); BufferPool b1(&d1, 8); IVFIndex cosi(&b1);
+        resetFile(f1); resetFile(f1 + ".lst");
+        DiskManager d1(f1); BufferPool b1(&d1, 8);
+        DiskManager d1b(f1 + ".lst"); BufferPool b1b(&d1b, 8); IVFIndex cosi(&b1, &b1b);
         cosi.construir(fuenteDe(v), 3, 2, IVFIndex::Metrica::COSENO);
         const auto rc = cosi.buscar(q, 2, cosi.listas());
         CHECK_EQ(rc.size(), static_cast<std::size_t>(2), "dos resultados");
@@ -263,8 +270,9 @@ int main() {
               "con coseno, los dos alineados estan a distancia 0");
 
         const std::string f2 = ruta("ivf_l2.idx");
-        resetFile(f2);
-        DiskManager d2(f2); BufferPool b2(&d2, 8); IVFIndex eucl(&b2);
+        resetFile(f2); resetFile(f2 + ".lst");
+        DiskManager d2(f2); BufferPool b2(&d2, 8);
+        DiskManager d2b(f2 + ".lst"); BufferPool b2b(&d2b, 8); IVFIndex eucl(&b2, &b2b);
         eucl.construir(fuenteDe(v), 3, 2, IVFIndex::Metrica::L2);
         const auto rl = eucl.buscar(q, 3, eucl.listas());
         CHECK_EQ(rl[0].rid.page_id, 0, "con L2 gana el de modulo parecido");
@@ -284,10 +292,12 @@ int main() {
         int nl = 0;
         double inercia = 0.0;
         {
-            resetFile(f);
+            resetFile(f); resetFile(f + ".lst");
             DiskManager dm(f);
             BufferPool bp(&dm, 16);
-            IVFIndex ix(&bp);
+            DiskManager dm2(f + ".lst");
+            BufferPool bp2(&dm2, 16);
+            IVFIndex ix(&bp, &bp2);
             ix.construir(fuenteDe(c.v), c.dim, 15, IVFIndex::Metrica::COSENO);
             antes   = ix.buscar(q, 10, 5);
             nl      = ix.listas();
@@ -296,7 +306,9 @@ int main() {
         {
             DiskManager dm(f);
             BufferPool bp(&dm, 16);
-            IVFIndex ix(&bp);                 // se abre leyendo la META
+            DiskManager dm2(f + ".lst");
+            BufferPool bp2(&dm2, 16);
+            IVFIndex ix(&bp, &bp2);                 // se abre leyendo la META
             CHECK_EQ(ix.size(), static_cast<std::uint32_t>(c.v.size()), "num_vectores tras reabrir");
             CHECK_EQ(ix.dimension(), c.dim, "dimension tras reabrir");
             CHECK_EQ(ix.listas(), nl, "celdas tras reabrir");
@@ -319,10 +331,12 @@ int main() {
         std::vector<std::vector<std::uint32_t>> repartos;
         for (int intento = 0; intento < 2; ++intento) {
             const std::string f = ruta("ivf_det" + std::to_string(intento) + ".idx");
-            resetFile(f);
+            resetFile(f); resetFile(f + ".lst");
             DiskManager dm(f);
             BufferPool bp(&dm, 16);
-            IVFIndex ix(&bp);
+            DiskManager dm2(f + ".lst");
+            BufferPool bp2(&dm2, 16);
+            IVFIndex ix(&bp, &bp2);
             ix.construir(fuenteDe(c.v), c.dim, 12, IVFIndex::Metrica::COSENO, 2026);
             inercias.push_back(ix.inercia());
             repartos.push_back(ix.tamanosDeListas());
@@ -336,10 +350,12 @@ int main() {
     SECTION("casos de borde");
     {
         const std::string f = ruta("ivf_borde.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".lst");
         DiskManager dm(f);
         BufferPool bp(&dm, 8);
-        IVFIndex ix(&bp);
+        DiskManager dm2(f + ".lst");
+        BufferPool bp2(&dm2, 8);
+        IVFIndex ix(&bp, &bp2);
 
         // Indice recien creado.
         CHECK_EQ(ix.size(), static_cast<std::uint32_t>(0), "indice vacio");
@@ -383,7 +399,7 @@ int main() {
     SECTION("un .idx de otro tipo no se interpreta como indice IVF");
     {
         const std::string f = ruta("ivf_ajeno.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".lst");
         {
             DiskManager dm(f);
             BufferPool bp(&dm, 4);
@@ -395,8 +411,10 @@ int main() {
         }
         DiskManager dm(f);
         BufferPool bp(&dm, 4);
+        DiskManager dm2(f + ".lst");
+        BufferPool bp2(&dm2, 4);
         bool lanzo = false;
-        try { IVFIndex ix(&bp); (void)ix; } catch (const DBException&) { lanzo = true; }
+        try { IVFIndex ix(&bp, &bp2); (void)ix; } catch (const DBException&) { lanzo = true; }
         CHECK(lanzo, "abrir un indice invertido como IVF tiene que fallar");
     }
 
@@ -408,10 +426,12 @@ int main() {
         // esa promesa se rompe: por eso se mide el desequilibrio.
         const Corpus c = generar(10000, 32, 50, 2026);
         const std::string f = ruta("ivf_reparto2.idx");
-        resetFile(f);
+        resetFile(f); resetFile(f + ".lst");
         DiskManager dm(f);
         BufferPool bp(&dm, 64);
-        IVFIndex ix(&bp);
+        DiskManager dm2(f + ".lst");
+        BufferPool bp2(&dm2, 64);
+        IVFIndex ix(&bp, &bp2);
         ix.construir(fuenteDe(c.v), c.dim, 100, IVFIndex::Metrica::COSENO);
 
         const std::vector<std::uint32_t> tam = ix.tamanosDeListas();

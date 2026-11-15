@@ -18,23 +18,32 @@
 //  Nunca se ordena nada mas grande que el presupuesto, y cada documento se lee
 //  una vez. Esa es toda la gracia del algoritmo.
 //
-//  EL ARCHIVO
-//  Un solo .idx paginado, con cuatro zonas escritas en este orden:
+//  LOS DOS ARCHIVOS
+//  Como pide el enunciado, el indice vive en DOS archivos binarios paginados:
 //
+//  <tabla>_<col>.dic  --- el DICCIONARIO (vocab.dic del enunciado)
 //     pagina 0            META: contadores, idioma, MAGIC y donde empieza cada zona
-//     [1, fin_post)       POSTINGS: un unico flujo de bytes, sin cabeceras de
-//                         pagina. Cada lista son pares (doc_id, tf) en orden
-//                         creciente de doc_id, codificados como HUECOS entre
-//                         doc_id consecutivos y en VARINT de 7 bits. El hueco
-//                         entre documentos vecinos es un numero pequeno, y un
-//                         numero pequeno ocupa un byte: el indice se reduce a
-//                         un tercio frente a guardar enteros de 32 bits.
-//     [fin_post, fin_dic) DICCIONARIO: los terminos ORDENADOS, con su df y la
-//                         direccion de su lista. Al estar ordenados se busca
-//                         por biseccion de paginas: log2(P) lecturas.
+//     [1, fin_dic)        DICCIONARIO: los terminos ORDENADOS, con su df, el
+//                         largo en bytes de su lista y el OFFSET de la lista
+//                         dentro del .inv. Al estar ordenados se busca por
+//                         biseccion de paginas: log2(P) lecturas.
 //     [fin_dic, fin_doc)  TABLA DE DOCUMENTOS: indexada por doc_id, guarda el
 //                         RID de la fila real, el largo |d| del documento en
-//                         terminos y su norma TF-IDF.
+//                         terminos y su norma TF-IDF precalculada.
+//
+//  <tabla>_<col>.inv  --- las LISTAS DE POSTEO (postings.inv del enunciado)
+//     [0, fin_post)       un unico flujo de bytes, sin cabeceras de pagina.
+//                         Cada lista son pares (doc_id, tf) en orden creciente
+//                         de doc_id, codificados como HUECOS entre doc_id
+//                         consecutivos y en VARINT de 7 bits. El hueco entre
+//                         documentos vecinos es un numero pequeno, y un numero
+//                         pequeno ocupa un byte: el indice se reduce a un
+//                         tercio frente a guardar enteros de 32 bits.
+//
+//  Una consulta busca el termino en el .dic, obtiene (offset, bytes) y hace
+//  seek(offset) en el .inv para leer SOLO esa lista. Partirlo en dos no cambia
+//  cuantas paginas se leen; cambia que el vocabulario, que se consulta en cada
+//  busqueda, no comparte archivo con las listas, que son la parte grande.
 //
 //  POR QUE HACE FALTA |d|
 //  BM25 penaliza a los documentos largos: un documento de mil palabras tiene
@@ -95,10 +104,15 @@ public:
     static constexpr double K1 = 1.2;
     static constexpr double B  = 0.75;
 
-    static constexpr std::int32_t MAGIC      = 0x494E5658;  // "INVX"
+    // "INVD": diccionario del formato en dos archivos. Es distinta de la del
+    // formato viejo de un solo .idx ("INVX") a proposito: si se abre un indice
+    // viejo, la firma no coincide, la tabla lo descarta y lo reconstruye, en
+    // vez de buscar los postings en un .inv que no existe.
+    static constexpr std::int32_t MAGIC      = 0x494E5644;  // "INVD"
     static constexpr int          OFF_MAGIC  = 16;
 
-    explicit InvertedIndex(BufferPool* bp);
+    // 'dic' es el pool del archivo .dic y 'post' el del .inv.
+    InvertedIndex(BufferPool* dic, BufferPool* post);
 
     // ---- construccion ----
     // 'siguiente' entrega un documento por llamada y devuelve false cuando se
@@ -143,7 +157,8 @@ public:
     std::uint64_t totalTokens() const { return total_tokens_; }
     double        avgdl()       const { return avgdl_; }
     texto::Idioma idioma()      const { return idioma_; }
-    int           numPages()    const { return bp_->disk()->numPages(); }
+    int           numPages()    const { return bp_->disk()->numPages() +
+                                                   bp_post_->disk()->numPages(); }
     int           bloquesSPIMI() const { return bloques_; }
 
     // Frecuencia de documento de un termino YA analizado (para tests y para
@@ -181,7 +196,8 @@ private:
     std::vector<Posting> leerPostings(const EntradaDicc& e) const;
     bool leerDoc(std::uint32_t doc_id, RID* rid, std::uint32_t* largo, float* norma) const;
 
-    BufferPool* bp_;
+    BufferPool* bp_;        // .dic: meta + diccionario + tabla de documentos
+    BufferPool* bp_post_;   // .inv: listas de posteo
 
     std::uint32_t num_docs_     = 0;
     std::uint32_t num_terminos_ = 0;
@@ -190,8 +206,9 @@ private:
     texto::Idioma idioma_       = texto::Idioma::EN;
     int           bloques_      = 0;
 
-    page_id_t pag_post_ = 1;   // primera pagina de cada zona
-    page_id_t pag_dicc_ = 1;
+    page_id_t pag_post_ = 0;   // primera pagina de cada zona (pag_post_ en el .inv,
+    page_id_t pag_dicc_ = 1;   //   las demas en el .dic)
+    page_id_t pag_fin_post_ = 0;   // paginas del .inv
     page_id_t pag_docs_ = 1;
     page_id_t pag_fin_  = 1;
 };

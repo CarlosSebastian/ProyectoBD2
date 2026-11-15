@@ -26,6 +26,7 @@ constexpr int M_PAG_DOCS  = 32;   // int32
 constexpr int M_PAG_FIN   = 36;   // int32
 constexpr int M_AVGDL     = 40;   // double
 constexpr int M_BLOQUES   = 48;   // int32
+constexpr int M_PAG_FPOST = 52;   // int32: paginas del archivo .inv
 
 // Una entrada de la tabla de documentos: RID + |d| + norma TF-IDF.
 constexpr int DOC_BYTES = 16;
@@ -160,7 +161,7 @@ private:
 // ---------------------------------------------------------------------------
 //  Apertura y cabecera
 // ---------------------------------------------------------------------------
-InvertedIndex::InvertedIndex(BufferPool* bp) : bp_(bp) {
+InvertedIndex::InvertedIndex(BufferPool* dic, BufferPool* post) : bp_(dic), bp_post_(post) {
     if (bp_->disk()->numPages() == 0) crearVacio();
     else                              leerMeta();
 }
@@ -171,12 +172,14 @@ void InvertedIndex::crearVacio() {
     if (pid != 0) throw DBException("El indice invertido tiene que empezar en la pagina 0");
     std::memset(p, 0, PAGE_SIZE);
     writeAt<std::int32_t>(p, M_MAGIC, MAGIC);
-    writeAt<std::int32_t>(p, M_PAG_POST, 1);
+    writeAt<std::int32_t>(p, M_PAG_POST, 0);
     writeAt<std::int32_t>(p, M_PAG_DICC, 1);
     writeAt<std::int32_t>(p, M_PAG_DOCS, 1);
     writeAt<std::int32_t>(p, M_PAG_FIN, 1);
     bp_->unpinPage(pid, true);
-    pag_post_ = pag_dicc_ = pag_docs_ = pag_fin_ = 1;
+    pag_post_ = 0;
+    pag_dicc_ = pag_docs_ = pag_fin_ = 1;
+    pag_fin_post_ = 0;
 }
 
 void InvertedIndex::leerMeta() {
@@ -196,6 +199,7 @@ void InvertedIndex::leerMeta() {
     pag_fin_      = readAt<std::int32_t>(p, M_PAG_FIN);
     avgdl_        = readAt<double>(p, M_AVGDL);
     bloques_      = readAt<std::int32_t>(p, M_BLOQUES);
+    pag_fin_post_ = readAt<std::int32_t>(p, M_PAG_FPOST);
     bp_->unpinPage(0, false);
 }
 
@@ -212,6 +216,7 @@ void InvertedIndex::escribirMeta() {
     writeAt<std::int32_t>(p, M_PAG_FIN,   pag_fin_);
     writeAt<double>      (p, M_AVGDL,     avgdl_);
     writeAt<std::int32_t>(p, M_BLOQUES,   bloques_);
+    writeAt<std::int32_t>(p, M_PAG_FPOST, pag_fin_post_);
     bp_->unpinPage(0, true);
 }
 
@@ -224,9 +229,9 @@ void InvertedIndex::leerRango(page_id_t zona, std::uint64_t offset,
         const page_id_t pid = zona + static_cast<page_id_t>(offset / PAGE_SIZE);
         const int o = static_cast<int>(offset % PAGE_SIZE);
         const std::uint32_t m = std::min<std::uint32_t>(n, static_cast<std::uint32_t>(PAGE_SIZE - o));
-        char* p = bp_->fetchPage(pid);
+        char* p = bp_post_->fetchPage(pid);
         std::memcpy(dest, p + o, m);
-        bp_->unpinPage(pid, false);
+        bp_post_->unpinPage(pid, false);
         dest += m; offset += m; n -= m;
     }
 }
@@ -324,9 +329,12 @@ void InvertedIndex::construir(const std::function<bool(RID&, std::string&)>& sig
                               texto::Idioma idi,
                               const std::string& prefijo_temporal,
                               std::size_t presupuesto_bytes) {
-    // --- 0. borrar lo anterior y dejar solo la pagina META ---
+    // --- 0. borrar lo anterior: el .dic queda solo con la pagina META y el
+    //        .inv vacio ---
     bp_->invalidateAll();
     bp_->disk()->truncate();
+    bp_post_->invalidateAll();
+    bp_post_->disk()->truncate();
     idioma_       = idi;
     num_docs_     = 0;
     num_terminos_ = 0;
@@ -520,7 +528,7 @@ void InvertedIndex::construir(const std::function<bool(RID&, std::string&)>& sig
     const std::string ruta_dicc = prefijo_temporal + "_dic.tmp";
 
     {
-        EscritorZona postings(bp_);
+        EscritorZona postings(bp_post_);   // archivo .inv, desde la pagina 0
         pag_post_ = postings.inicio();
 
         std::ofstream fd(ruta_dicc, std::ios::binary | std::ios::trunc);
@@ -586,7 +594,7 @@ void InvertedIndex::construir(const std::function<bool(RID&, std::string&)>& sig
             }
         }
         fd.close();
-        pag_dicc_ = postings.fin();
+        pag_fin_post_ = postings.fin();
     }
 
     // --- 3. el diccionario, del temporal a paginas con cabecera ---
@@ -630,6 +638,7 @@ void InvertedIndex::construir(const std::function<bool(RID&, std::string&)>& sig
 
     escribirMeta();
     bp_->flushAll();
+    bp_post_->flushAll();
 
     // Los lectores de la mezcla siguen con su ifstream abierto sobre cada
     // bloque. En Windows std::remove falla sobre un archivo con un handle

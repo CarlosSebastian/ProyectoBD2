@@ -10,7 +10,7 @@ Flujo de POST /ask  {"pregunta": "...", "modo": "hibrido|bm25|vectorial", "k": 5
      son monolingues: una pregunta en espanol no encontraria casi nada
   2. el embedding de la consulta se calcula con Ollama
   3. DOS consultas SQL al motor:
-       BM25      ... WHERE abstract MATCH '...' LIMIT n         (indice invertido)
+       lexica    ... WHERE abstract MATCH '...' LIMIT n         (indice invertido, TF-IDF + coseno)
        vectorial ... ORDER BY emb <=> [...] LIMIT n PROBES p    (IVF, coseno)
   4. los dos rankings se fusionan con Reciprocal Rank Fusion (RRF)
   5. los k mejores papers van al LLM como contexto, que responde citando [id]
@@ -84,8 +84,8 @@ def buscar_bm25(consulta: str):
     try:
         r = rc.sql(s)
     except RuntimeError as e:         # p. ej. una consulta de puras stopwords
-        return [], {"consulta": "BM25", "sql": s, "error": str(e)}
-    return rc.filas(r), metricas("BM25 (indice invertido)", s, r)
+        return [], {"consulta": "Lexica TF-IDF", "sql": s, "error": str(e)}
+    return rc.filas(r), metricas("Lexica TF-IDF coseno (indice invertido)", s, r)
 
 
 def buscar_vectorial(vec: list):

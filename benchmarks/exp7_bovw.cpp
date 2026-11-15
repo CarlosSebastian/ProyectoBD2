@@ -108,7 +108,7 @@ TableInfo infoPalabras(const std::string& n) {
     IndexInfo ix;
     ix.column  = "palabras";
     ix.kind    = IndexKind::INVERTED;
-    ix.file    = n + ".idx";
+    ix.file    = n + ".dic";          // + n.inv con los postings
     ix.idioma  = "EN";
     ix.scoring = "TFIDF_COSINE";
     ti.indexes.push_back(ix);
@@ -126,7 +126,7 @@ TableInfo infoEmb(const std::string& n, int dim) {
     IndexInfo ix;
     ix.column  = "emb";
     ix.kind    = IndexKind::IVF;
-    ix.file    = n + ".idx";
+    ix.file    = n + ".cen";          // + n.lst con las listas
     ix.listas  = 0;                 // 0 => raiz de N
     ix.metrica = "COSINE";
     ti.indexes.push_back(ix);

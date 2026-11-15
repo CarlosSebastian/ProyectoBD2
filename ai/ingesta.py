@@ -12,7 +12,7 @@ Que hace:
      guarda en ai/cache/ para no recalcularlos si vuelves a correr la ingesta
   2. escribe ai/cache/papers.csv y lo carga con COPY (carga masiva del motor)
   3. crea los tres indices que usa el RAG:
-       B+ sobre id, INVERTED sobre abstract (BM25), IVF sobre emb (coseno)
+       B+ sobre id, INVERTED sobre abstract (TF-IDF coseno), IVF sobre emb (coseno)
 
 Es repetible: si la tabla ya existe vacia sus filas y recarga. Los indices
 INVERTED e IVF no admiten altas incrementales; el motor los reconstruye solo,
@@ -150,9 +150,10 @@ def main():
     # 3. indices ------------------------------------------------------------
     ya = {i["column"] for t in rc.tablas() if t["name"] == T for i in t["indexes"]}
     n = len(papers)
-    listas = a.lists or max(1, min(n, round(math.sqrt(n))))
+    listas = a.lists or max(1, min(n, int(math.sqrt(n))))   # C = floor(sqrt(N)), como el enunciado
     for col, ddl in (("id", f"CREATE INDEX ix_{T}_id ON {T} (id) USING BTREE;"),
-                     ("abstract", f"CREATE INDEX ix_{T}_txt ON {T} (abstract) USING INVERTED;"),
+                     ("abstract", f"CREATE INDEX ix_{T}_txt ON {T} (abstract) USING INVERTED "
+                                  f"WITH (scoring = 'TFIDF_COSINE');"),
                      ("emb", f"CREATE INDEX ix_{T}_emb ON {T} (emb) USING IVF "
                              f"LISTS {listas} METRIC COSINE;")):
         if col in ya:

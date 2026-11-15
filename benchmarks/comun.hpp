@@ -128,6 +128,9 @@ inline void limpiar(const std::string& dir, const std::string& nombre) {
     db::resetFile(dir + "/" + nombre + ".dat");
     db::resetFile(dir + "/" + nombre + ".ovf");
     db::resetFile(dir + "/" + nombre + ".idx");
+    // Indices de dos archivos: invertido (.dic + .inv) e IVF (.cen + .lst).
+    for (const char* ext : {".dic", ".inv", ".cen", ".lst"})
+        db::resetFile(dir + "/" + nombre + ext);
 }
 
 // ---------------------------------------------------------------------------

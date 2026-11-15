@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <sstream>
 #include <string>
 
 #include "db/database.hpp"
@@ -343,6 +344,88 @@ int main() {
         CHECK(ixq.ok, "indice sobre una clave limpia");
         CHECK(ixq.message.find("AVISO") == std::string::npos,
               "sin duplicados no hay aviso");
+    }
+
+    // ---------------------------------------------------------------------
+    //  El enunciado pide el invertido en DOS archivos (vocab.dic +
+    //  postings.inv) y el IVF en un directorio de centroides + un archivo de
+    //  listas paginadas. Se comprueba que es asi en disco, que sobrevive a
+    //  reabrir la base, y que un indice del formato viejo de un solo .idx se
+    //  reconstruye solo en vez de romper la tabla.
+    // ---------------------------------------------------------------------
+    {
+        SECTION("INVERTED e IVF ocupan dos archivos cada uno");
+        namespace fs = std::filesystem;
+        const std::string DIR = "data/_tsqldos";
+        fs::remove_all(DIR);
+        fs::create_directories(DIR);
+        std::vector<std::string> antes;
+        {
+            Database db(DIR);
+            db.execute("CREATE TABLE d (id INT PRIMARY KEY, cuerpo TEXT)");
+            db.execute("INSERT INTO d VALUES (1,'inverted index over postings lists'),"
+                       "(2,'b plus tree for range queries'),"
+                       "(3,'inverted files and dictionary lookups'),"
+                       "(4,'vectors and nearest neighbours')");
+            CHECK(db.execute("CREATE INDEX ixd ON d (cuerpo) USING INVERTED").ok, "crear INVERTED");
+            db.execute("CREATE TABLE v (id INT PRIMARY KEY, emb VECTOR(3))");
+            db.execute("INSERT INTO v VALUES (1,[1,0,0]),(2,[0.9,0.1,0]),(3,[0,1,0]),(4,[0,0,1])");
+            CHECK(db.execute("CREATE INDEX ixv ON v (emb) USING IVF LISTS 2 METRIC COSINE").ok,
+                  "crear IVF");
+            QueryResult r = db.execute("SELECT id FROM d WHERE cuerpo MATCH 'inverted'");
+            CHECK(r.ok, "MATCH antes de reabrir");
+            for (const auto& f : r.rows) antes.push_back(f[0]);
+        }
+        CHECK(fs::exists(DIR + "/d_cuerpo.dic"), "existe el diccionario .dic");
+        CHECK(fs::exists(DIR + "/d_cuerpo.inv"), "existe el archivo de postings .inv");
+        CHECK(!fs::exists(DIR + "/d_cuerpo.idx"), "ya no hay un .idx unico");
+        CHECK(fs::file_size(DIR + "/d_cuerpo.inv") >= static_cast<std::uintmax_t>(PAGE_SIZE),
+              "los postings estan en el .inv");
+        CHECK(fs::exists(DIR + "/v_emb.cen"), "existe el directorio de centroides .cen");
+        CHECK(fs::exists(DIR + "/v_emb.lst"), "existe el archivo de listas .lst");
+        CHECK(fs::file_size(DIR + "/v_emb.lst") >= static_cast<std::uintmax_t>(PAGE_SIZE),
+              "las listas estan en el .lst");
+        CHECK_EQ(antes.size(), static_cast<std::size_t>(2), "MATCH 'inverted' da 2 documentos");
+        {
+            Database db(DIR);   // reabrir: los dos archivos se vuelven a enlazar
+            QueryResult r = db.execute("SELECT id FROM d WHERE cuerpo MATCH 'inverted'");
+            std::vector<std::string> despues;
+            for (const auto& f : r.rows) despues.push_back(f[0]);
+            CHECK(despues == antes, "tras reabrir, el MATCH devuelve lo mismo");
+            QueryResult k = db.execute("SELECT id FROM v ORDER BY emb <=> [1,0,0] LIMIT 2");
+            CHECK(k.ok && k.rows.size() == 2 && k.rows[0][0] == "1", "k-NN por IVF tras reabrir");
+        }
+
+        // Formato viejo: el catalogo apunta a un .idx con la firma de antes.
+        // Se fabrica a partir del .dic: renombrarlo y ponerle la MAGIC vieja.
+        fs::rename(DIR + "/d_cuerpo.dic", DIR + "/d_cuerpo.idx");
+        fs::remove(DIR + "/d_cuerpo.inv");
+        {
+            std::fstream f(DIR + "/d_cuerpo.idx", std::ios::in | std::ios::out | std::ios::binary);
+            const std::int32_t vieja = 0x494E5658;   // "INVX", el formato de un solo archivo
+            f.seekp(16);
+            f.write(reinterpret_cast<const char*>(&vieja), 4);
+        }
+        {
+            std::ifstream in(DIR + "/catalog.txt");
+            std::stringstream ss; ss << in.rdbuf();
+            std::string cat = ss.str();
+            const std::size_t pos = cat.find("d_cuerpo.dic");
+            CHECK(pos != std::string::npos, "el catalogo guarda el .dic");
+            if (pos != std::string::npos) cat.replace(pos, 12, "d_cuerpo.idx");
+            std::ofstream out(DIR + "/catalog.txt", std::ios::trunc);
+            out << cat;
+        }
+        {
+            Database db(DIR);
+            QueryResult r = db.execute("SELECT id FROM d WHERE cuerpo MATCH 'inverted'");
+            std::vector<std::string> viejo;
+            for (const auto& f : r.rows) viejo.push_back(f[0]);
+            CHECK(r.ok && viejo == antes,
+                  "un indice del formato viejo se reconstruye y responde igual");
+        }
+        CHECK(fs::exists(DIR + "/d_cuerpo.inv"),
+              "al reconstruir, el .inv se deriva del nombre que guarda el catalogo");
     }
 
     // ---------------------------------------------------------------------

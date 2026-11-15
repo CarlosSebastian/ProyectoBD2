@@ -97,6 +97,11 @@ Table::Table(const std::string& data_dir, const TableInfo& info, int pool_size)
 
         ix.disk = std::make_unique<DiskManager>(joinPath(data_dir, meta.file));
         ix.bp   = std::make_unique<BufferPool>(ix.disk.get(), pool_size);
+        const std::string segundo = archivoSecundario(meta.file, meta.kind);
+        if (!segundo.empty()) {
+            ix.disk2 = std::make_unique<DiskManager>(joinPath(data_dir, segundo));
+            ix.bp2   = std::make_unique<BufferPool>(ix.disk2.get(), pool_size);
+        }
 
         bool hay_que_repoblar = false;
         try {
@@ -122,10 +127,10 @@ void Table::abrirIndice(Indice& ix) {
             ix.rt = std::make_unique<RTree>(ix.bp.get());
             break;
         case IndexKind::INVERTED:
-            ix.inv = std::make_unique<InvertedIndex>(ix.bp.get());
+            ix.inv = std::make_unique<InvertedIndex>(ix.bp.get(), ix.bp2.get());
             break;
         case IndexKind::IVF:
-            ix.ivf = std::make_unique<IVFIndex>(ix.bp.get());
+            ix.ivf = std::make_unique<IVFIndex>(ix.bp.get(), ix.bp2.get());
             break;
         case IndexKind::BPLUS:
             if (kt == Type::INT) ix.bt_int = std::make_unique<BPlusTree<std::int64_t>>(ix.bp.get());
@@ -152,7 +157,10 @@ bool Table::claveSecuencial(const std::string& col) const {
 }
 long long Table::lecturasTotales() const {
     long long n = store_disk_->readCount() + (ovf_disk_ ? ovf_disk_->readCount() : 0);
-    for (const Indice& ix : indices_) n += ix.disk->readCount();
+    for (const Indice& ix : indices_) {
+        n += ix.disk->readCount();
+        if (ix.disk2) n += ix.disk2->readCount();
+    }
     return n;
 }
 
@@ -291,7 +299,7 @@ bool Table::getByRID(const RID& rid, Tuple& out) const {
 void Table::flush() {
     if (store_bp_) store_bp_->flushAll();
     if (ovf_bp_)   ovf_bp_->flushAll();
-    for (Indice& ix : indices_) ix.bp->flushAll();
+    for (Indice& ix : indices_) { ix.bp->flushAll(); if (ix.bp2) ix.bp2->flushAll(); }
 }
 
 bool Table::removeByRID(const RID& rid) {
@@ -760,6 +768,7 @@ void Table::recrearIndiceVacio() {
     for (Indice& ix : indices_) {
         ix.bp->invalidateAll();
         ix.disk->truncate();
+        if (ix.bp2) { ix.bp2->invalidateAll(); ix.disk2->truncate(); }
         ix.soltarEstructuras();
         abrirIndice(ix);
     }
@@ -1087,7 +1096,10 @@ bool Table::reorganize(double fill_factor) {
 
 int Table::indexPages() const {
     int n = 0;
-    for (const Indice& ix : indices_) n += ix.disk->numPages();
+    for (const Indice& ix : indices_) {
+        n += ix.disk->numPages();
+        if (ix.disk2) n += ix.disk2->numPages();
+    }
     return n;
 }
 
@@ -1114,7 +1126,10 @@ void Table::resetStats() {
     store_bp_->resetStats();
     if (ovf_disk_) ovf_disk_->resetStats();
     if (ovf_bp_)   ovf_bp_->resetStats();
-    for (Indice& ix : indices_) { ix.disk->resetStats(); ix.bp->resetStats(); }
+    for (Indice& ix : indices_) {
+        ix.disk->resetStats(); ix.bp->resetStats();
+        if (ix.disk2) { ix.disk2->resetStats(); ix.bp2->resetStats(); }
+    }
 }
 
 }  // namespace db

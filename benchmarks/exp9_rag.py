@@ -18,7 +18,7 @@ las recoge y las tabula:
 
   reescritura -> el LLM convierte la pregunta a una consulta corta en ingles
   embedding   -> all-minilm vectoriza esa consulta (384 dimensiones)
-  motor       -> las consultas SQL: BM25 sobre el indice invertido y/o
+  motor       -> las consultas SQL: TF-IDF coseno sobre el indice invertido y/o
                  k-NN aproximado sobre el IVF. Es la parte de este proyecto
   generacion  -> el LLM redacta la respuesta con los papers como contexto
 

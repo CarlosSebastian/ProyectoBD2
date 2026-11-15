@@ -78,18 +78,24 @@ std::vector<float> generarVectores(int N, int dim, int grupos, unsigned semilla)
 // indice directo y no una Table para que lo que se mide sea el indice y no el
 // heap: el objetivo del experimento es el compromiso recall/latencia.
 struct Montaje {
-    std::unique_ptr<DiskManager> disk;
+    std::unique_ptr<DiskManager> disk;    // .cen: centroides + directorio
     std::unique_ptr<BufferPool>  bp;
+    std::unique_ptr<DiskManager> disk2;   // .lst: listas paginadas
+    std::unique_ptr<BufferPool>  bp2;
     std::unique_ptr<IVFIndex>    ivf;
 };
 
 Montaje montar(const std::string& dir, const std::string& nombre) {
     Montaje m;
-    const std::string ruta = dir + "/" + nombre + ".idx";
+    const std::string ruta  = dir + "/" + nombre + ".cen";
+    const std::string ruta2 = dir + "/" + nombre + ".lst";
     resetFile(ruta);
-    m.disk = std::make_unique<DiskManager>(ruta);
-    m.bp   = std::make_unique<BufferPool>(m.disk.get(), 64);
-    m.ivf  = std::make_unique<IVFIndex>(m.bp.get());
+    resetFile(ruta2);
+    m.disk  = std::make_unique<DiskManager>(ruta);
+    m.bp    = std::make_unique<BufferPool>(m.disk.get(), 64);
+    m.disk2 = std::make_unique<DiskManager>(ruta2);
+    m.bp2   = std::make_unique<BufferPool>(m.disk2.get(), 64);
+    m.ivf   = std::make_unique<IVFIndex>(m.bp.get(), m.bp2.get());
     return m;
 }
 

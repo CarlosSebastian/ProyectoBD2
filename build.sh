@@ -91,6 +91,8 @@ case "${1:-all}" in
         rm -rf build
         # Lo que genera el motor: se borra sin miedo, se recrea solo.
         rm -f data/*.dat data/*.idx data/*.ovf data/*.tmp data/catalog.txt
+        # Indices de dos archivos: invertido (.dic + .inv) e IVF (.cen + .lst).
+        rm -f data/*.dic data/*.inv data/*.cen data/*.lst
         # CSV de los benchmarks: tambien se regeneran solos al correrlos.
         rm -f data/dataset_*.csv data/exp6_corpus.csv data/exp6_consultas.txt
         rm -rf data/_demo data/_t*

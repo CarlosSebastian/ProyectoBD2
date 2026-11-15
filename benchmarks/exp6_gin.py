@@ -10,7 +10,8 @@ indexando el motor propio; aqui se carga una copia del mismo corpus en
 PostgreSQL para poder decir, con numeros, que tan lejos queda un indice
 invertido escrito desde cero de uno de produccion.
 
-Que mide, para consultas booleanas de 1, 3 y 5 terminos:
+Que mide, para consultas booleanas de 1, 3 y 5 terminos y para ranking
+Top-10 de 1, 3 y 5 terminos (lineas TOPK del archivo de consultas):
   - tiempo de ejecucion, con EXPLAIN (ANALYZE, BUFFERS)
   - bloques leidos, que es lo unico comparable de verdad entre dos motores
     distintos: los milisegundos dependen del lenguaje y del hardware, los
@@ -69,28 +70,88 @@ def a_tsquery(expr):
     return re.sub(r"\s+", " ", e).strip()
 
 
-def medir(expr, args, usar_indice):
-    """Devuelve (ms, bloques, filas) de una consulta booleana."""
-    tsq = a_tsquery(expr)
-    cfg = "" if usar_indice else "SET LOCAL enable_indexscan = off; " \
-                                 "SET LOCAL enable_bitmapscan = off; "
-    sql = ("BEGIN; " + cfg +
-           "EXPLAIN (ANALYZE, BUFFERS, TIMING ON) "
-           "SELECT id FROM %s WHERE to_tsvector('english', cuerpo) @@ to_tsquery('english', %s); "
-           "COMMIT;" % (TABLA, "$q$" + tsq + "$q$"))
-    salida = psql(sql, args)
-    ms = bloques = filas = 0.0
+def leer_explain(salida):
+    """(ms, bloques, bloques_indice, filas) de EXPLAIN (ANALYZE, BUFFERS).
+
+    'bloques' sale SOLO de la primera linea 'Buffers:', que es la del nodo raiz
+    del plan. En EXPLAIN los Buffers de cada nodo son INCLUSIVOS: el padre ya
+    cuenta los de sus hijos. Sumar todas las lineas, como hacia la primera
+    version de este script, contaba los bloques de las hojas una vez por cada
+    nodo que tienen encima, y ademas sumaba los 'Buffers' de la seccion
+    'Planning:', que son lecturas del catalogo del sistema y no del indice ni
+    de la tabla. Eso inflaba el numero del GIN.
+
+    'bloques_indice' son los del nodo que lee el GIN (Bitmap Index Scan), sin
+    la tabla. Es la cifra comparable con los accesos del indice propio en las
+    booleanas, que devuelven doc_id sin tocar la tabla. 'bloques' incluye
+    ademas las paginas del heap que PostgreSQL visita para devolver el id de
+    cada fila y re-comprobar la condicion.
+    """
+    def buffers_de(linea):
+        hit = re.search(r"shared hit=(\d+)", linea)
+        read = re.search(r"read=(\d+)", linea)
+        if not hit and not read:
+            return None
+        return (int(hit.group(1)) if hit else 0) + (int(read.group(1)) if read else 0)
+
+    ms = bloques = indice = filas = 0.0
+    visto_raiz = False
+    en_nodo_indice = False
     for linea in salida.splitlines():
-        m = re.search(r"Execution Time: ([\d.]+) ms", linea)
-        if m:
-            ms = float(m.group(1))
-        m = re.search(r"shared hit=(\d+)(?: read=(\d+))?", linea)
-        if m:
-            bloques += int(m.group(1)) + int(m.group(2) or 0)
+        if linea.strip().startswith("Planning"):
+            break                                   # lo que sigue es la planificacion
+        if re.search(r"(Bitmap Index Scan|Index Scan|Index Only Scan)", linea):
+            en_nodo_indice = True
+        elif "->" in linea:
+            en_nodo_indice = False
+        if "Buffers:" in linea:
+            b = buffers_de(linea)
+            if b is not None:
+                if not visto_raiz:
+                    bloques = b
+                    visto_raiz = True
+                if en_nodo_indice:
+                    indice += b                     # nodos hermanos: se suman
+                    en_nodo_indice = False
         m = re.search(r"actual time=[\d.]+\.\.[\d.]+ rows=(\d+)", linea)
         if m and filas == 0.0:
             filas = float(m.group(1))
-    return ms, bloques, filas
+    m = re.search(r"Execution Time: ([\d.]+) ms", salida)
+    if m:
+        ms = float(m.group(1))
+    return ms, bloques, indice, filas
+
+
+def sin_indice(usar_indice):
+    return "" if usar_indice else "SET LOCAL enable_indexscan = off; " \
+                                  "SET LOCAL enable_bitmapscan = off; "
+
+
+def medir(expr, args, usar_indice):
+    """Devuelve (ms, bloques, bloques_indice, filas) de una consulta booleana."""
+    tsq = a_tsquery(expr)
+    sql = ("BEGIN; " + sin_indice(usar_indice) +
+           "EXPLAIN (ANALYZE, BUFFERS, TIMING ON) "
+           "SELECT id FROM %s WHERE to_tsvector('english', cuerpo) @@ to_tsquery('english', %s); "
+           "COMMIT;" % (TABLA, "$q$" + tsq + "$q$"))
+    return leer_explain(psql(sql, args))
+
+
+def medir_topk(terminos, args, usar_indice):
+    """Ranking Top-10: los terminos unidos con OR, ordenados por ts_rank.
+
+    Es el equivalente en PostgreSQL de un MATCH rankeado: entra cualquier
+    documento que tenga alguno de los terminos y se devuelven los 10 de mayor
+    puntaje. ts_rank no es la misma formula que TF-IDF con coseno, asi que los
+    dos top-10 no tienen por que coincidir; lo que se compara es el COSTO.
+    """
+    q = "to_tsquery('english', $q$%s$q$)" % " | ".join(terminos.split())
+    sql = ("BEGIN; " + sin_indice(usar_indice) +
+           "EXPLAIN (ANALYZE, BUFFERS, TIMING ON) "
+           "SELECT id FROM %s WHERE to_tsvector('english', cuerpo) @@ %s "
+           "ORDER BY ts_rank(to_tsvector('english', cuerpo), %s) DESC LIMIT 10; "
+           "COMMIT;" % (TABLA, q, q))
+    return leer_explain(psql(sql, args))
 
 
 def main():
@@ -122,9 +183,6 @@ def main():
     print("   %s documentos" % n)
 
     print("-- construyendo el indice GIN --")
-    t = psql("""\\timing off
-        SELECT 1;""", a)
-    import time
     t0 = time.time()
     psql("CREATE INDEX ix_gin ON %s USING GIN (to_tsvector('english', cuerpo));" % TABLA, a)
     ms_build = (time.time() - t0) * 1000.0
@@ -134,37 +192,69 @@ def main():
 
     # agrupar las consultas por (operador, numero de terminos)
     grupos = {}
+    topk = {}
     with open(a.consultas, encoding="utf-8") as f:
         for linea in f:
             partes = linea.rstrip("\n").split("\t")
             if len(partes) != 3:
                 continue
             op, nt, expr = partes
-            grupos.setdefault((op, int(nt)), []).append(expr)
+            if op == "TOPK":
+                topk.setdefault(int(nt), []).append(expr)
+            else:
+                grupos.setdefault((op, int(nt)), []).append(expr)
 
-    print("\n| operador | terminos | GIN: ms | GIN: bloques | SeqScan: ms | SeqScan: bloques | ms x | filas |")
-    print("|---|---|---|---|---|---|---|---|")
+    print("\n### Recuperacion booleana\n")
+    print("| operador | terminos | GIN: ms | GIN: bloques del indice | GIN: bloques totales "
+          "| SeqScan: ms | SeqScan: bloques | ms x | filas |")
+    print("|---|---|---|---|---|---|---|---|---|")
     for (op, nt) in sorted(grupos, key=lambda k: (k[0], k[1])):
         exprs = grupos[(op, nt)]
-        gi_ms = gi_bl = sc_ms = sc_bl = filas = 0.0
+        gi_ms = gi_bl = gi_ix = sc_ms = sc_bl = filas = 0.0
         for e in exprs:
             medir(e, a, True)                      # calentamiento
-            m1, b1, f1 = medir(e, a, True)
-            m2, b2, _ = medir(e, a, False)
-            gi_ms += m1; gi_bl += b1
+            m1, b1, i1, f1 = medir(e, a, True)
+            m2, b2, _, _ = medir(e, a, False)
+            gi_ms += m1; gi_bl += b1; gi_ix += i1
             sc_ms += m2; sc_bl += b2
             filas += f1
         k = float(len(exprs))
-        print("| %s | %d | %.4f | %.0f | %.4f | %.0f | %.1fx | %.0f |"
-              % (op, nt, gi_ms / k, gi_bl / k, sc_ms / k, sc_bl / k,
+        print("| %s | %d | %.4f | %.1f | %.1f | %.4f | %.0f | %.1fx | %.0f |"
+              % (op, nt, gi_ms / k, gi_ix / k, gi_bl / k, sc_ms / k, sc_bl / k,
                  (sc_ms / gi_ms) if gi_ms else 0.0, filas / k))
+
+    if topk:
+        print("\n### Ranking Top-10 (terminos unidos con OR, ordenados por ts_rank)\n")
+        print("| terminos | GIN: ms | GIN: bloques del indice | GIN: bloques totales "
+              "| SeqScan: ms | SeqScan: bloques | ms x | filas |")
+        print("|---|---|---|---|---|---|---|---|")
+        for nt in sorted(topk):
+            exprs = topk[nt]
+            gi_ms = gi_bl = gi_ix = sc_ms = sc_bl = filas = 0.0
+            for e in exprs:
+                medir_topk(e, a, True)                 # calentamiento
+                m1, b1, i1, f1 = medir_topk(e, a, True)
+                m2, b2, _, _ = medir_topk(e, a, False)
+                gi_ms += m1; gi_bl += b1; gi_ix += i1
+                sc_ms += m2; sc_bl += b2
+                filas += f1
+            k = float(len(exprs))
+            print("| %d | %.4f | %.1f | %.1f | %.4f | %.0f | %.1fx | %.0f |"
+                  % (nt, gi_ms / k, gi_ix / k, gi_bl / k, sc_ms / k, sc_bl / k,
+                     (sc_ms / gi_ms) if gi_ms else 0.0, filas / k))
+        print("\nUn ranking por GIN no es barato: el indice encuentra los documentos que\n"
+              "contienen algun termino, pero ts_rank necesita el tsvector de cada uno, y\n"
+              "como la tabla guarda el texto y no el tsvector, PostgreSQL vuelve al heap y\n"
+              "lo recalcula fila por fila. El indice propio tiene la norma de cada\n"
+              "documento precalculada en su tabla de documentos.\n")
 
     print("\nLos milisegundos entre dos motores distintos solo dan una idea: PostgreSQL\n"
           "esta en C optimizado desde hace treinta anos y corre sobre su propio buffer\n"
           "pool. La columna que se puede defender en el informe es la de BLOQUES, que\n"
-          "depende del diseno del indice y no del lenguaje: ahi es donde se ve si una\n"
-          "lista de posteo comprimida con huecos y varint pide mas o menos paginas que\n"
-          "un GIN, que guarda arboles de TIDs por lexema.\n")
+          "depende del diseno del indice y no del lenguaje. Para comparar con el\n"
+          "indice propio en las booleanas vale la de 'bloques del indice': las dos\n"
+          "cuentan solo paginas del indice. La de 'bloques totales' suma las del\n"
+          "heap, que PostgreSQL visita para devolver el id de cada fila.\n")
     psql("DROP TABLE IF EXISTS %s;" % TABLA, a)
 
 

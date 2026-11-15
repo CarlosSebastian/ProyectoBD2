@@ -22,6 +22,7 @@ constexpr int M_P_ENT   = 28;   // int32
 constexpr int M_P_FIN   = 32;   // int32
 constexpr int M_ITERS   = 36;   // int32
 constexpr int M_INERCIA = 40;   // double
+constexpr int M_P_FLST  = 48;   // int32: paginas del archivo .lst
 
 constexpr int DIR_BYTES = 16;   // int64 offset + int32 count + relleno
 
@@ -82,7 +83,7 @@ IVFIndex::Metrica IVFIndex::metricaDesdeNombre(const std::string& s) {
 }
 
 // ---------------------------------------------------------------------------
-IVFIndex::IVFIndex(BufferPool* bp) : bp_(bp) {
+IVFIndex::IVFIndex(BufferPool* cen, BufferPool* lst) : bp_(cen), bp_lst_(lst) {
     if (bp_->disk()->numPages() == 0) crearVacio();
     else                              leerMeta();
 }
@@ -95,10 +96,12 @@ void IVFIndex::crearVacio() {
     writeAt<std::int32_t>(p, M_MAGIC, MAGIC);
     writeAt<std::int32_t>(p, M_P_CENT, 1);
     writeAt<std::int32_t>(p, M_P_DIR, 1);
-    writeAt<std::int32_t>(p, M_P_ENT, 1);
+    writeAt<std::int32_t>(p, M_P_ENT, 0);
     writeAt<std::int32_t>(p, M_P_FIN, 1);
     bp_->unpinPage(pid, true);
-    p_cent_ = p_dir_ = p_ent_ = p_fin_ = 1;
+    p_cent_ = p_dir_ = p_fin_ = 1;
+    p_ent_ = 0;
+    p_fin_lst_ = 0;
 }
 
 void IVFIndex::leerMeta() {
@@ -117,6 +120,7 @@ void IVFIndex::leerMeta() {
     p_fin_   = readAt<std::int32_t>(p, M_P_FIN);
     iters_   = readAt<std::int32_t>(p, M_ITERS);
     inercia_ = readAt<double>(p, M_INERCIA);
+    p_fin_lst_ = readAt<std::int32_t>(p, M_P_FLST);
     bp_->unpinPage(0, false);
 }
 
@@ -133,32 +137,35 @@ void IVFIndex::escribirMeta() {
     writeAt<std::int32_t>(p, M_P_FIN, p_fin_);
     writeAt<std::int32_t>(p, M_ITERS, iters_);
     writeAt<double>(p, M_INERCIA, inercia_);
+    writeAt<std::int32_t>(p, M_P_FLST, p_fin_lst_);
     bp_->unpinPage(0, true);
 }
 
 // ---------------------------------------------------------------------------
 //  Zonas planas: un arreglo de bytes repartido en paginas consecutivas.
 // ---------------------------------------------------------------------------
-void IVFIndex::leerRango(page_id_t zona, std::uint64_t off, std::uint32_t n, char* dest) const {
+void IVFIndex::leerRango(BufferPool* bp, page_id_t zona, std::uint64_t off,
+                         std::uint32_t n, char* dest) const {
     while (n > 0) {
         const page_id_t pid = zona + static_cast<page_id_t>(off / PAGE_SIZE);
         const int o = static_cast<int>(off % PAGE_SIZE);
         const std::uint32_t m = std::min<std::uint32_t>(n, static_cast<std::uint32_t>(PAGE_SIZE - o));
-        char* p = bp_->fetchPage(pid);
+        char* p = bp->fetchPage(pid);
         std::memcpy(dest, p + o, m);
-        bp_->unpinPage(pid, false);
+        bp->unpinPage(pid, false);
         dest += m; off += m; n -= m;
     }
 }
 
-void IVFIndex::escribirRango(page_id_t zona, std::uint64_t off, std::uint32_t n, const char* src) {
+void IVFIndex::escribirRango(BufferPool* bp, page_id_t zona, std::uint64_t off,
+                             std::uint32_t n, const char* src) {
     while (n > 0) {
         const page_id_t pid = zona + static_cast<page_id_t>(off / PAGE_SIZE);
         const int o = static_cast<int>(off % PAGE_SIZE);
         const std::uint32_t m = std::min<std::uint32_t>(n, static_cast<std::uint32_t>(PAGE_SIZE - o));
-        char* p = bp_->fetchPage(pid);
+        char* p = bp->fetchPage(pid);
         std::memcpy(p + o, src, m);
-        bp_->unpinPage(pid, true);
+        bp->unpinPage(pid, true);
         src += m; off += m; n -= m;
     }
 }
@@ -166,7 +173,7 @@ void IVFIndex::escribirRango(page_id_t zona, std::uint64_t off, std::uint32_t n,
 std::vector<float> IVFIndex::centroide(int i) const {
     std::vector<float> c(static_cast<std::size_t>(dim_));
     if (i < 0 || i >= nlist_) return c;
-    leerRango(p_cent_, static_cast<std::uint64_t>(i) * dim_ * 4,
+    leerRango(bp_, p_cent_, static_cast<std::uint64_t>(i) * dim_ * 4,
               static_cast<std::uint32_t>(dim_) * 4, reinterpret_cast<char*>(c.data()));
     return c;
 }
@@ -176,7 +183,7 @@ std::vector<std::uint32_t> IVFIndex::tamanosDeListas() const {
     out.reserve(static_cast<std::size_t>(nlist_));
     for (int i = 0; i < nlist_; ++i) {
         char buf[DIR_BYTES];
-        leerRango(p_dir_, static_cast<std::uint64_t>(i) * DIR_BYTES, DIR_BYTES, buf);
+        leerRango(bp_, p_dir_, static_cast<std::uint64_t>(i) * DIR_BYTES, DIR_BYTES, buf);
         out.push_back(readAt<std::uint32_t>(buf, 8));
     }
     return out;
@@ -214,6 +221,8 @@ void IVFIndex::construir(const Fuente& recorrer, int dimension, int listas,
 
     bp_->invalidateAll();
     bp_->disk()->truncate();
+    bp_lst_->invalidateAll();
+    bp_lst_->disk()->truncate();
     dim_     = dimension;
     metrica_ = m;
     num_vec_ = 0;
@@ -271,10 +280,11 @@ void IVFIndex::construir(const Fuente& recorrer, int dimension, int listas,
     }
 
     num_vec_ = static_cast<std::int32_t>(N);
-    if (N == 0) { escribirMeta(); bp_->flushAll(); return; }
+    if (N == 0) { escribirMeta(); bp_->flushAll(); bp_lst_->flushAll(); return; }
 
+    // Sin LISTS explicito: C = floor(sqrt(N)) celdas, la regla del enunciado.
     nlist_ = listas > 0 ? listas
-                        : std::max(1, static_cast<int>(std::lround(std::sqrt(static_cast<double>(N)))));
+                        : std::max(1, static_cast<int>(std::floor(std::sqrt(static_cast<double>(N)))));
     nlist_ = std::max(1, std::min<int>(nlist_, static_cast<int>(N)));
     // Mas de 40 muestras por celda no cambia los centroides de forma util.
     const std::size_t deseadas = MUESTRAS_POR_LISTA * static_cast<std::size_t>(nlist_);
@@ -399,24 +409,25 @@ void IVFIndex::construir(const Fuente& recorrer, int dimension, int listas,
     }
 
     // ---------------- reservar las tres zonas ----------------
-    auto reservar = [&](std::uint64_t bytes) {
-        const page_id_t inicio = static_cast<page_id_t>(bp_->disk()->numPages());
+    auto reservar = [&](BufferPool* bp, std::uint64_t bytes) {
+        const page_id_t inicio = static_cast<page_id_t>(bp->disk()->numPages());
         const std::uint64_t paginas = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
         for (std::uint64_t i = 0; i < paginas; ++i) {
             page_id_t pid;
-            char* p = bp_->newPage(&pid);
+            char* p = bp->newPage(&pid);
             std::memset(p, 0, PAGE_SIZE);
-            bp_->unpinPage(pid, true);
+            bp->unpinPage(pid, true);
         }
         return inicio;
     };
 
     const int b = bytesPorEntrada();
-    p_cent_ = reservar(static_cast<std::uint64_t>(nlist_) * d * 4);
-    escribirRango(p_cent_, 0, static_cast<std::uint32_t>(nlist_ * static_cast<int>(d) * 4),
+    // Centroides y directorio en el .cen; las listas paginadas en el .lst.
+    p_cent_ = reservar(bp_, static_cast<std::uint64_t>(nlist_) * d * 4);
+    escribirRango(bp_, p_cent_, 0, static_cast<std::uint32_t>(nlist_ * static_cast<int>(d) * 4),
                   reinterpret_cast<const char*>(cent.data()));
 
-    p_dir_ = reservar(static_cast<std::uint64_t>(nlist_) * DIR_BYTES);
+    p_dir_ = reservar(bp_, static_cast<std::uint64_t>(nlist_) * DIR_BYTES);
     std::vector<std::uint64_t> inicio_celda(static_cast<std::size_t>(nlist_), 0);
     {
         std::uint64_t acum = 0;
@@ -426,13 +437,13 @@ void IVFIndex::construir(const Fuente& recorrer, int dimension, int listas,
             std::memset(buf, 0, DIR_BYTES);
             writeAt<std::uint64_t>(buf, 0, acum);
             writeAt<std::uint32_t>(buf, 8, por_celda[static_cast<std::size_t>(c)]);
-            escribirRango(p_dir_, static_cast<std::uint64_t>(c) * DIR_BYTES, DIR_BYTES, buf);
+            escribirRango(bp_, p_dir_, static_cast<std::uint64_t>(c) * DIR_BYTES, DIR_BYTES, buf);
             acum += static_cast<std::uint64_t>(por_celda[static_cast<std::size_t>(c)]) *
                     static_cast<std::uint64_t>(b);
         }
     }
 
-    p_ent_ = reservar(static_cast<std::uint64_t>(N) * static_cast<std::uint64_t>(b));
+    p_ent_ = reservar(bp_lst_, static_cast<std::uint64_t>(N) * static_cast<std::uint64_t>(b));
 
     // ---------------- pasada C: colocar cada vector en su celda ----------------
     {
@@ -445,14 +456,16 @@ void IVFIndex::construir(const Fuente& recorrer, int dimension, int listas,
             writeAt<std::int32_t>(buf.data(), 4, rid.slot);
             writeAt<float>(buf.data(), 8, static_cast<float>(norma2(v.data(), dim_)));
             std::memcpy(buf.data() + 12, v.data(), d * 4);
-            escribirRango(p_ent_, cursor[c], static_cast<std::uint32_t>(b), buf.data());
+            escribirRango(bp_lst_, p_ent_, cursor[c], static_cast<std::uint32_t>(b), buf.data());
             cursor[c] += static_cast<std::uint64_t>(b);
         });
     }
 
-    p_fin_ = static_cast<page_id_t>(bp_->disk()->numPages());
+    p_fin_     = static_cast<page_id_t>(bp_->disk()->numPages());
+    p_fin_lst_ = static_cast<page_id_t>(bp_lst_->disk()->numPages());
     escribirMeta();
     bp_->flushAll();
+    bp_lst_->flushAll();
 }
 
 // ===========================================================================
@@ -482,7 +495,7 @@ void IVFIndex::leerRangoEntradas(std::uint64_t desde_byte, std::uint32_t cuantas
     std::uint32_t hechas = 0;
     while (hechas < cuantas) {
         const std::uint32_t n = std::min(por_bloque, cuantas - hechas);
-        leerRango(p_ent_, desde_byte + static_cast<std::uint64_t>(hechas) * b,
+        leerRango(bp_lst_, p_ent_, desde_byte + static_cast<std::uint64_t>(hechas) * b,
                   n * static_cast<std::uint32_t>(b), buf.data());
         for (std::uint32_t i = 0; i < n; ++i) {
             const char* e = buf.data() + static_cast<std::size_t>(i) * static_cast<std::size_t>(b);
@@ -516,7 +529,7 @@ IVFIndex::buscar(const std::vector<float>& consulta, int k, int nprobe) const {
     {
         std::vector<float> cent(static_cast<std::size_t>(dim_));
         for (int c = 0; c < nlist_; ++c) {
-            leerRango(p_cent_, static_cast<std::uint64_t>(c) * dim_ * 4,
+            leerRango(bp_, p_cent_, static_cast<std::uint64_t>(c) * dim_ * 4,
                       static_cast<std::uint32_t>(dim_) * 4, reinterpret_cast<char*>(cent.data()));
             cercania.push_back({distL2(qn.data(), cent.data(), dim_), c});
         }
@@ -532,7 +545,7 @@ IVFIndex::buscar(const std::vector<float>& consulta, int k, int nprobe) const {
     for (std::size_t p = 0; p < np; ++p) {
         const int c = cercania[p].second;
         char dir[DIR_BYTES];
-        leerRango(p_dir_, static_cast<std::uint64_t>(c) * DIR_BYTES, DIR_BYTES, dir);
+        leerRango(bp_, p_dir_, static_cast<std::uint64_t>(c) * DIR_BYTES, DIR_BYTES, dir);
         const std::uint64_t off = readAt<std::uint64_t>(dir, 0);
         const std::uint32_t n   = readAt<std::uint32_t>(dir, 8);
 

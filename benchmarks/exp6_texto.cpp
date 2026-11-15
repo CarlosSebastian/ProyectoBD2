@@ -18,6 +18,9 @@
 //       que comparar: los dos conjuntos tienen que ser IDENTICOS.
 //    F. Exporta el corpus y las consultas para poder medir lo mismo contra el
 //       indice GIN de PostgreSQL (ver benchmarks/exp6_gin.py).
+//    G. Ranking Top-K con TF-IDF y similitud de coseno (CosineScore), con
+//       consultas de 1, 3 y 5 terminos, contra un Full Text Scan que no tiene
+//       ninguna estructura auxiliar. Tambien se exportan para el GIN.
 //
 //  El corpus es sintetico pero con vocabulario ZIPFIANO, que es lo que de
 //  verdad importa: en lenguaje natural unas pocas palabras aparecen en casi
@@ -27,11 +30,13 @@
 //
 //     ./build/exp6_texto [dir] [N_max] [consultas]
 // ============================================================================
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <map>
 #include <set>
 #include <tuple>
+#include <unordered_map>
 
 #include "comun.hpp"
 #include "db/inverted.hpp"
@@ -84,7 +89,7 @@ TableInfo infoTexto(const std::string& nombre, bool con_indice) {
         IndexInfo ix;
         ix.column = "cuerpo";
         ix.kind   = IndexKind::INVERTED;
-        ix.file   = nombre + ".idx";
+        ix.file   = nombre + ".dic";   // + nombre.inv con los postings
         ix.idioma = "EN";
         ti.indexes.push_back(ix);
     }
@@ -180,6 +185,81 @@ std::vector<TopK> bruta(Table& t, const std::vector<std::vector<std::string>>& c
     return salida;
 }
 
+// ---------------------------------------------------------------------------
+//  Full Text Scan con TF-IDF y coseno, SIN ninguna estructura auxiliar.
+//
+//  El coseno divide por la norma de cada documento, y esa norma depende del df
+//  de TODOS sus terminos, no solo de los de la consulta. Sin indice no hay
+//  otra forma de obtenerla que recorrer el corpus entero, tokenizarlo, contar
+//  el df de cada termino y despues puntuar. Es exactamente el trabajo que el
+//  indice hizo UNA vez al construirse y dejo guardado en su tabla de
+//  documentos; aqui se paga en cada consulta, que es lo que hace un escaneo.
+//
+//  Reproduce la formula del motor al pie de la letra --- incluida la norma en
+//  float de 32 bits, que es como la guarda el indice --- para que los dos
+//  top-10 se puedan comparar puntaje a puntaje.
+// ---------------------------------------------------------------------------
+// (puntaje, posicion en el recorrido del heap, id de la fila)
+std::vector<Puntuado> cosenoScan(Table& t, const std::vector<std::string>& consulta, int k,
+                                 texto::Idioma idi) {
+    struct Doc { std::uint32_t id; std::unordered_map<std::string, std::uint32_t> tf; };
+    std::vector<Doc> docs;
+    std::unordered_map<std::string, std::uint32_t> df;
+    for (const Tuple& fila : t.scan()) {
+        Doc d;
+        d.id = static_cast<std::uint32_t>(fila.at(0).i);
+        for (const std::string& w : texto::tokenizar(fila.at(1).s, idi)) ++d.tf[w];
+        for (const auto& kv : d.tf) ++df[kv.first];
+        docs.push_back(std::move(d));
+    }
+    const double N = static_cast<double>(docs.size());
+    auto idf = [&](const std::string& w) {
+        auto it = df.find(w);
+        return it == df.end() ? 0.0 : std::log10(N / static_cast<double>(it->second));
+    };
+
+    std::map<std::string, std::uint32_t> tf_q;
+    for (const std::string& w : consulta) ++tf_q[w];
+    std::map<std::string, double> wq;
+    double norma_q = 0.0;
+    for (const auto& kv : tf_q) {
+        if (!df.count(kv.first)) continue;
+        const double w = (1.0 + std::log10(static_cast<double>(kv.second))) * idf(kv.first);
+        wq[kv.first] = w;
+        norma_q += w * w;
+    }
+    norma_q = std::sqrt(norma_q);
+    if (norma_q <= 0.0) norma_q = 1.0;
+
+    std::vector<Puntuado> out;
+    for (std::size_t i = 0; i < docs.size(); ++i) {
+        double punto = 0.0;
+        bool toca = false;
+        for (const auto& kv : wq) {
+            auto it = docs[i].tf.find(kv.first);
+            if (it == docs[i].tf.end()) continue;
+            toca = true;
+            punto += (1.0 + std::log10(static_cast<double>(it->second))) * idf(kv.first) * kv.second;
+        }
+        if (!toca) continue;
+        double n2 = 0.0;   // la norma del documento: TODOS sus terminos
+        for (const auto& kv : docs[i].tf) {
+            const double w = (1.0 + std::log10(static_cast<double>(kv.second))) * idf(kv.first);
+            n2 += w * w;
+        }
+        const float nd = n2 > 0.0 ? static_cast<float>(std::sqrt(n2)) : 1.0f;
+        double score = punto / (static_cast<double>(nd) * norma_q);
+        if (score > 1.0) score = 1.0;
+        if (score > 0.0) out.push_back({score, static_cast<std::uint32_t>(i), docs[i].id});
+    }
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        if (std::get<0>(a) != std::get<0>(b)) return std::get<0>(a) > std::get<0>(b);
+        return std::get<1>(a) < std::get<1>(b);
+    });
+    if (static_cast<int>(out.size()) > k) out.resize(static_cast<std::size_t>(k));
+    return out;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -187,7 +267,7 @@ int main(int argc, char** argv) {
     const int N_MAX       = argc > 2 ? std::atoi(argv[2]) : 50000;
     const int N_CONSULTAS = argc > 3 ? std::atoi(argv[3]) : 20;
 
-    titulo("EXPERIMENTO 6 - Modulo de texto (indice invertido SPIMI / BM25)");
+    titulo("EXPERIMENTO 6 - Modulo de texto (indice invertido SPIMI / BM25 / TF-IDF coseno)");
     std::cout << "Corpus sintetico con vocabulario zipfiano de " << VOCABULARIO
               << " palabras, 60-140 terminos por documento, semilla fija.\n";
 
@@ -541,6 +621,91 @@ int main(int argc, char** argv) {
                      "mide sigue siendo el propio. Para la otra mitad de la tabla:\n\n"
                      "    python benchmarks/exp6_gin.py --csv " << ruta_csv
                   << " --consultas " << ruta_qry << "\n";
+
+        // ------------------------------------------------------------------
+        std::cout << "\n### G. Ranking Top-K con TF-IDF y similitud de coseno: indice contra "
+                     "Full Text Scan\n\n";
+        const int SCAN_Q = std::min(N_CONSULTAS, 5);
+        std::cout << "N = " << N << ", top-10 con CosineScore. Por el indice, " << N_CONSULTAS
+                  << " consultas por fila;\nel escaneo, " << SCAN_Q
+                  << " por fila (cada una recorre y tokeniza el corpus entero).\n"
+                     "Valores POR CONSULTA.\n\n";
+        fila({"terminos", "indice: accesos", "indice: lecturas", "indice: ms",
+              "scan: accesos", "scan: lecturas", "scan: ms", "ms x", "top-10 identico"});
+        separador(9);
+
+        std::ofstream fq(ruta_qry, std::ios::app);     // las mismas, para el GIN
+        std::mt19937 rg(777);
+        for (int nt : {1, 3, 5}) {
+            std::vector<std::string> textos;
+            for (int q = 0; q < N_CONSULTAS; ++q) {
+                std::string s;
+                for (int j = 0; j < nt; ++j) {
+                    if (j) s += " ";
+                    s += "voc" + std::to_string(palabraZipf(rg));
+                }
+                textos.push_back(s);
+                fq << "TOPK\t" << nt << "\t" << s << "\n";
+            }
+
+            // --- por el indice ---
+            std::vector<std::vector<std::uint32_t>> ids_ix;
+            std::vector<std::vector<double>>        sc_ix;
+            double ac_ix = 0, le_ix = 0, ms_ix = 0;
+            for (const std::string& q : textos) {
+                std::vector<double> ps;
+                Cronometro c;
+                const std::vector<Tuple> filas = t.searchMatch("cuerpo", q, 10, true, &ps);
+                const Medicion m = c.parar();
+                ac_ix += static_cast<double>(m.accesos);
+                le_ix += static_cast<double>(m.lecturas);
+                ms_ix += m.ms;
+                std::vector<std::uint32_t> ids;
+                for (const Tuple& f : filas) ids.push_back(static_cast<std::uint32_t>(f.at(0).i));
+                ids_ix.push_back(ids);
+                sc_ix.push_back(ps);
+            }
+
+            // --- por escaneo, y la comparacion ---
+            double ac_sc = 0, le_sc = 0, ms_sc = 0;
+            bool mismos = true;
+            long long empates = 0;
+            for (int q = 0; q < SCAN_Q; ++q) {
+                Cronometro c;
+                const std::vector<Puntuado> ref =
+                    cosenoScan(t, texto::tokenizar(textos[static_cast<std::size_t>(q)],
+                                                   texto::Idioma::EN), 10, texto::Idioma::EN);
+                const Medicion m = c.parar();
+                ac_sc += static_cast<double>(m.accesos);
+                le_sc += static_cast<double>(m.lecturas);
+                ms_sc += m.ms;
+                const std::size_t qi = static_cast<std::size_t>(q);
+                if (ref.size() != ids_ix[qi].size()) { mismos = false; continue; }
+                for (std::size_t j = 0; j < ref.size(); ++j) {
+                    const double a = sc_ix[qi][j], b = std::get<0>(ref[j]);
+                    if (std::fabs(a - b) > 1e-6 * std::max(1.0, std::fabs(b))) { mismos = false; break; }
+                    if (ids_ix[qi][j] != std::get<2>(ref[j])) ++empates;
+                }
+            }
+            const double ki = static_cast<double>(N_CONSULTAS), ks = static_cast<double>(SCAN_Q);
+            const double mi = ms_ix / ki, msc = ms_sc / ks;
+            fila({std::to_string(nt),
+                  num(ac_ix / ki, 1), num(le_ix / ki, 1), num(mi, 3),
+                  num(ac_sc / ks, 1), num(le_sc / ks, 1), num(msc, 1),
+                  mi > 0 ? num(msc / mi, 0) + "x" : "-",
+                  !mismos ? "NO" : empates == 0 ? "si"
+                                 : "si (" + std::to_string(empates) + " empate/s)"});
+        }
+        std::cout << "\nEl indice solo lee el diccionario y las listas de los terminos pedidos,\n"
+                     "y toma la norma de cada documento ya calculada de su tabla de documentos.\n"
+                     "El escaneo no tiene nada de eso: para dividir por la norma necesita el df\n"
+                     "de TODOS los terminos de cada documento, asi que recorre y tokeniza el\n"
+                     "corpus entero en cada consulta. Por eso su costo apenas cambia con el\n"
+                     "numero de terminos, mientras que el del indice crece con el: una lista mas\n"
+                     "por termino. La ultima columna compara los dos top-10 puntaje a puntaje;\n"
+                     "un empate es un par de documentos con el mismo coseno en el ultimo puesto.\n"
+                     "Estas consultas se anadieron al archivo de " << ruta_qry << "\n"
+                     "como TOPK, para medir el mismo ranking contra el GIN.\n";
     }
 
     std::cout << "\n";

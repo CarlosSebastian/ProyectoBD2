@@ -47,6 +47,23 @@ struct IndexInfo {
     std::string metrica = "COSINE";
 };
 
+// Los indices INVERTED e IVF ocupan DOS archivos, como pide el enunciado; el
+// catalogo guarda el nombre del principal y el segundo se deriva cambiando la
+// extension:
+//     INVERTED   papers_abstract.dic  (diccionario)   + papers_abstract.inv  (postings)
+//     IVF        items_emb.cen        (centroides)    + items_emb.lst        (listas)
+// Devuelve "" para los indices de un solo archivo (B+, hash, R-Tree).
+inline std::string archivoSecundario(const std::string& principal, IndexKind k) {
+    const char* ext = k == IndexKind::INVERTED ? ".inv"
+                    : k == IndexKind::IVF      ? ".lst" : nullptr;
+    if (!ext) return "";
+    const std::size_t punto = principal.find_last_of('.');
+    const std::size_t barra = principal.find_last_of("/\\");
+    const bool tiene_ext = punto != std::string::npos &&
+                           (barra == std::string::npos || punto > barra);
+    return (tiene_ext ? principal.substr(0, punto) : principal) + ext;
+}
+
 struct TableInfo {
     std::string            name;
     Schema                 schema;

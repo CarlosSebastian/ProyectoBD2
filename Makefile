@@ -11,7 +11,7 @@
 #      make bench        -> comparacion experimental de indices
 #      make demo         -> demostracion end-to-end por consola
 #      make dump_page    -> inspector de los binarios (para el video)
-#      make clean        -> borra binarios y datos generados
+#      make clean        -> borra binarios y datos generados (conserva data/bovw_*)
 #
 #  El tamano de pagina es configurable (Experimento 4 del enunciado):
 #      make PAGE=8192 bench
@@ -88,4 +88,7 @@ demo: dirs $(BUILD)/demo
 
 clean:
 	rm -rf $(BUILD)
-	rm -f data/*.dat data/*.idx data/*.ovf data/*.csv data/*.tmp data/catalog.txt
+	rm -f data/*.dat data/*.idx data/*.ovf data/*.tmp data/catalog.txt
+	rm -f data/*.dic data/*.inv data/*.cen data/*.lst
+	rm -f data/dataset_*.csv data/exp6_corpus.csv data/exp6_consultas.txt
+	rm -rf data/_demo data/_t*

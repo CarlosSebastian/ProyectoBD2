@@ -8,24 +8,47 @@ PostgreSQL 16.2 on x86_64-pc-linux-gnu, compiled by gcc (GCC) 10.2.1 20210130 (R
 -- cargando el corpus --
    20000 documentos
 -- construyendo el indice GIN --
-   2880 ms, 9680 kB en disco
+   2465 ms, 9680 kB en disco
 
-| operador | terminos | GIN: ms | GIN: bloques | SeqScan: ms | SeqScan: bloques | ms x | filas |
+### Recuperacion booleana
+
+| operador | terminos | GIN: ms | GIN: bloques del indice | GIN: bloques totales | SeqScan: ms | SeqScan: bloques | ms x | filas |
+|---|---|---|---|---|---|---|---|---|
+| AND | 1 | 0.6937 | 4.0 | 231.2 | 674.9312 | 2252 | 973.0x | 242 |
+| AND | 3 | 0.0785 | 10.0 | 10.0 | 661.2347 | 2252 | 8423.4x | 0 |
+| AND | 5 | 0.1178 | 16.0 | 16.0 | 666.1174 | 2252 | 5654.6x | 0 |
+| AND NOT | 1 | 0.6396 | 4.0 | 234.7 | 664.7559 | 2252 | 1039.3x | 244 |
+| AND NOT | 3 | 0.7072 | 10.0 | 246.3 | 669.6332 | 2252 | 946.9x | 252 |
+| AND NOT | 5 | 0.8086 | 16.0 | 270.8 | 663.4123 | 2252 | 820.4x | 270 |
+| OR | 1 | 0.6389 | 4.0 | 202.3 | 670.5450 | 2252 | 1049.6x | 209 |
+| OR | 3 | 1.2812 | 10.0 | 578.9 | 672.1580 | 2252 | 524.6x | 660 |
+| OR | 5 | 1.7802 | 16.0 | 892.0 | 668.2347 | 2252 | 375.4x | 1110 |
+
+### Ranking Top-10 (terminos unidos con OR, ordenados por ts_rank)
+
+| terminos | GIN: ms | GIN: bloques del indice | GIN: bloques totales | SeqScan: ms | SeqScan: bloques | ms x | filas |
 |---|---|---|---|---|---|---|---|
-| AND | 1 | 0.6378 | 359 | 667.7525 | 4628 | 1047.0x | 242 |
-| AND | 3 | 0.0818 | 144 | 680.4689 | 4628 | 8318.7x | 0 |
-| AND | 5 | 0.1059 | 156 | 661.8930 | 4628 | 6250.2x | 0 |
-| AND NOT | 1 | 0.6225 | 363 | 661.2359 | 4628 | 1062.2x | 244 |
-| AND NOT | 3 | 0.7212 | 380 | 661.8397 | 4628 | 917.7x | 252 |
-| AND NOT | 5 | 0.8028 | 411 | 656.7374 | 4628 | 818.1x | 270 |
-| OR | 1 | 0.5750 | 330 | 655.4581 | 4628 | 1140.0x | 209 |
-| OR | 3 | 1.1845 | 713 | 662.1343 | 4628 | 559.0x | 660 |
-| OR | 5 | 1.6165 | 1032 | 668.0364 | 4628 | 413.2x | 1110 |
+| 1 | 19.8590 | 4.0 | 257.2 | 683.4721 | 2289 | 34.4x | 10 |
+| 3 | 43.8961 | 10.0 | 532.1 | 699.3149 | 2289 | 15.9x | 10 |
+| 5 | 80.2403 | 16.0 | 870.1 | 711.5294 | 2289 | 8.9x | 10 |
+
+Un ranking por GIN no es barato: el indice encuentra los documentos que
+contienen algun termino, pero ts_rank necesita el tsvector de cada uno, y
+como la tabla guarda el texto y no el tsvector, PostgreSQL vuelve al heap y
+lo recalcula fila por fila. El indice propio tiene la norma de cada
+documento precalculada en su tabla de documentos.
+
 
 Los milisegundos entre dos motores distintos solo dan una idea: PostgreSQL
 esta en C optimizado desde hace treinta anos y corre sobre su propio buffer
 pool. La columna que se puede defender en el informe es la de BLOQUES, que
-depende del diseno del indice y no del lenguaje: ahi es donde se ve si una
-lista de posteo comprimida con huecos y varint pide mas o menos paginas que
-un GIN, que guarda arboles de TIDs por lexema.
+depende del diseno del indice y no del lenguaje. Para comparar con el
+indice propio en las booleanas vale la de 'bloques del indice': las dos
+cuentan solo paginas del indice. La de 'bloques totales' suma las del
+heap, que PostgreSQL visita para devolver el id de cada fila.
 
+
+Nota de metodo: la primera version de este script sumaba TODAS las lineas
+'Buffers:' del plan. Como en EXPLAIN los Buffers de cada nodo ya incluyen los
+de sus hijos, y ademas se sumaban los de la planificacion (catalogo), los
+bloques del GIN salian inflados. Estos numeros son los corregidos.
