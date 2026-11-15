@@ -1,6 +1,7 @@
 # Resultados experimentales
 
 Generado por `benchmarks/run_experimentos.sh` el 2026-11-12 10:38.
+Experimentos 6, 7 y 8 vueltos a correr el 2026-11-15 (indices invertido e IVF en dos archivos).
 Dataset: 500000 filas sinteticas, claves barajadas con semilla fija.
 
 
@@ -359,7 +360,7 @@ SeqScan pasado el umbral, en vez de usar el indice siempre que exista.
 
 
 ==========================================================================
-  EXPERIMENTO 6 - Modulo de texto (indice invertido SPIMI / BM25)
+  EXPERIMENTO 6 - Modulo de texto (indice invertido SPIMI / BM25 / TF-IDF coseno)
 ==========================================================================
 Corpus sintetico con vocabulario zipfiano de 20000 palabras, 60-140 terminos por documento, semilla fija.
 
@@ -369,10 +370,10 @@ Presupuesto de memoria fijo en 4 MB.
 
 | N docs | tokens | terminos | bloques | construir (ms) | escrituras | pag. indice | indice (KB) | postings sin compr. (KB) |
 |---|---|---|---|---|---|---|---|---|
-| 1000 | 99572 | 13403 | 1 | 106.4 | 281 | 140 | 560.0 | 773.4 |
-| 5000 | 495338 | 16162 | 1 | 436.7 | 789 | 394 | 1576.0 | 3847.2 |
-| 25000 | 2483321 | 17739 | 3 | 2106.8 | 3183 | 1591 | 6364.0 | 19287.3 |
-| 50000 | 4974792 | 18204 | 6 | 7687.5 | 6167 | 3083 | 12332.0 | 38635.8 |
+| 1000 | 99572 | 13403 | 1 | 101.2 | 281 | 140 | 560.0 | 773.4 |
+| 5000 | 495338 | 16162 | 1 | 449.8 | 789 | 394 | 1576.0 | 3847.2 |
+| 25000 | 2483321 | 17739 | 3 | 2193.0 | 3183 | 1591 | 6364.0 | 19287.3 |
+| 50000 | 4974792 | 18204 | 6 | 4416.7 | 6167 | 3083 | 12332.0 | 38635.8 |
 
 El tiempo crece de forma practicamente lineal con el numero de
 documentos: SPIMI los recorre una sola vez. El indice completo (que
@@ -383,11 +384,11 @@ postings sin comprimir, gracias a los huecos y el varint.
 
 | presupuesto | bloques | construir (ms) | escrituras | terminos | pag. indice |
 |---|---|---|---|---|---|
-| 0.12 MB | 835 | 6762.9 | 2589 | 17577 | 1294 |
-| 0.50 MB | 141 | 4796.2 | 2589 | 17577 | 1294 |
-| 2.00 MB | 13 | 3372.2 | 2589 | 17577 | 1294 |
-| 8.00 MB | 3 | 3084.6 | 2589 | 17577 | 1294 |
-| 64.00 MB | 1 | 2934.8 | 2589 | 17577 | 1294 |
+| 0.12 MB | 835 | 3751.9 | 2589 | 17577 | 1294 |
+| 0.50 MB | 141 | 2774.3 | 2589 | 17577 | 1294 |
+| 2.00 MB | 13 | 1913.3 | 2589 | 17577 | 1294 |
+| 8.00 MB | 3 | 1799.7 | 2589 | 17577 | 1294 |
+| 64.00 MB | 1 | 1707.9 | 2589 | 17577 | 1294 |
 
 El numero de terminos y el tamano del indice NO cambian: el
 presupuesto solo decide cuantas veces se vuelca la memoria y, por
@@ -401,10 +402,10 @@ BM25, top-10, 20 consultas de 3 terminos cada una.
 
 | N docs | indice: accesos | indice: ms | scan: accesos | scan: ms | accesos x | ms x | top-10 identico |
 |---|---|---|---|---|---|---|---|
-| 1000 | 1453 | 4.5 | 1206 | 117.7 | 0.8x | 26.0x | si (3 empate/s) |
-| 5000 | 4206 | 2.4 | 6023 | 582.3 | 1.4x | 241.7x | si (3 empate/s) |
-| 25000 | 18169 | 25.6 | 30125 | 3183.4 | 1.7x | 124.2x | si (3 empate/s) |
-| 50000 | 35418 | 47.0 | 60259 | 6251.9 | 1.7x | 133.1x | si (1 empate/s) |
+| 1000 | 1453 | 1.1 | 1206 | 72.5 | 0.8x | 64.4x | si (3 empate/s) |
+| 5000 | 4206 | 2.0 | 6023 | 371.2 | 1.4x | 183.5x | si (3 empate/s) |
+| 25000 | 18169 | 9.5 | 30125 | 1888.9 | 1.7x | 199.3x | si (3 empate/s) |
+| 50000 | 35418 | 16.6 | 60259 | 3723.7 | 1.7x | 224.3x | si (1 empate/s) |
 
 La ultima columna es la que da sentido a las demas: si los puntajes no
 coincidieran, comparar tiempos no significaria nada. Un "empate" es un
@@ -418,13 +419,13 @@ y no de N.
 
 | termino | df | % del corpus | accesos a pagina | ms | resultados |
 |---|---|---|---|---|---|
-| voc0 | 392 | 1.96 % | 411 | 0.960 | 10 |
-| voc1 | 406 | 2.03 % | 425 | 0.762 | 10 |
-| voc10 | 391 | 1.96 % | 410 | 0.759 | 10 |
-| voc100 | 381 | 1.91 % | 400 | 0.736 | 10 |
-| voc1000 | 344 | 1.72 % | 363 | 0.720 | 10 |
-| voc5000 | 150 | 0.75 % | 169 | 0.638 | 10 |
-| voc15000 | 10 | 0.05 % | 29 | 0.193 | 10 |
+| voc0 | 392 | 1.96 % | 411 | 0.370 | 10 |
+| voc1 | 406 | 2.03 % | 425 | 0.354 | 10 |
+| voc10 | 391 | 1.96 % | 410 | 0.321 | 10 |
+| voc100 | 381 | 1.91 % | 400 | 0.312 | 10 |
+| voc1000 | 344 | 1.72 % | 363 | 0.365 | 10 |
+| voc5000 | 150 | 0.75 % | 169 | 0.270 | 10 |
+| voc15000 | 10 | 0.05 % | 29 | 0.089 | 10 |
 
 Un termino muy frecuente obliga a leer una lista de postings larga
 y a puntuar muchos documentos; uno raro se resuelve con unas pocas
@@ -436,18 +437,18 @@ discriminan.
 
 | operador | terminos | indice: accesos | indice: ms | scan: ms (cota inf.) | ms x | filas | identico |
 |---|---|---|---|---|---|---|---|
-| AND | 1 | 8.8 | 0.1907 | 24.5853 | 128.9x | 242 | si |
-| AND | 3 | 26.6 | 0.3345 | 45.3611 | 135.6x | 0 | si |
-| AND | 5 | 44.4 | 0.4178 | 58.3909 | 139.7x | 0 | si |
-| OR | 1 | 8.8 | 0.1749 | 28.3150 | 161.9x | 209 | si |
-| OR | 3 | 26.4 | 0.2990 | 47.7222 | 159.6x | 660 | si |
-| OR | 5 | 44.1 | 0.4084 | 56.2577 | 137.7x | 1110 | si |
-| AND NOT | 1 | 9.0 | 0.2016 | 27.7912 | 137.9x | 244 | si |
-| AND NOT | 3 | 26.9 | 0.2873 | 46.9328 | 163.3x | 252 | si |
-| AND NOT | 5 | 44.0 | 0.3764 | 58.1508 | 154.5x | 270 | si |
+| AND | 1 | 8.8 | 0.1170 | 15.0970 | 129.0x | 242 | si |
+| AND | 3 | 26.6 | 0.0980 | 17.3357 | 177.0x | 0 | si |
+| AND | 5 | 44.4 | 0.1593 | 28.5811 | 179.4x | 0 | si |
+| OR | 1 | 8.8 | 0.0849 | 14.0635 | 165.6x | 209 | si |
+| OR | 3 | 26.4 | 0.1431 | 27.4370 | 191.7x | 660 | si |
+| OR | 5 | 44.1 | 0.1679 | 31.0552 | 185.0x | 1110 | si |
+| AND NOT | 1 | 9.0 | 0.0939 | 15.9850 | 170.2x | 244 | si |
+| AND NOT | 3 | 26.9 | 0.1323 | 27.4074 | 207.2x | 252 | si |
+| AND NOT | 5 | 44.0 | 0.2023 | 37.2559 | 184.2x | 270 | si |
 
 El costo lo manda LEER las listas, no mezclarlas: los accesos a pagina
-crecen casi proporcionalmente al numero de terminos (de ~8 con uno a ~43 con
+crecen casi proporcionalmente al numero de terminos (de ~9 con uno a ~44 con
 cinco) sea cual sea el operador, porque hay que traer una lista por termino.
 La mezcla en si es lineal y practicamente gratis al lado de eso.
 
@@ -459,7 +460,7 @@ en una linea, la razon por la que los buscadores dejaron de exigir que
 aparezcan todos los terminos y pasaron a RANKEAR: con el booleano puro, una
 consulta de cinco palabras no devuelve nada.
 
-Frente al recorrido completo el indice gana entre 30 y 55 veces, y eso que la
+Frente al recorrido completo el indice gana entre 129 y 207 veces, y eso que la
 columna del escaneo es una cota inferior que no incluye leer ni tokenizar.
 
 ### F. Export para comparar contra el indice GIN de PostgreSQL
@@ -474,6 +475,29 @@ mide sigue siendo el propio. Para la otra mitad de la tabla:
 
     python benchmarks/exp6_gin.py --csv data/exp6_corpus.csv --consultas data/exp6_consultas.txt
 
+### G. Ranking Top-K con TF-IDF y similitud de coseno: indice contra Full Text Scan
+
+N = 20000, top-10 con CosineScore. Por el indice, 20 consultas por fila;
+el escaneo, 5 por fila (cada una recorre y tokeniza el corpus entero).
+Valores POR CONSULTA.
+
+| terminos | indice: accesos | indice: lecturas | indice: ms | scan: accesos | scan: lecturas | scan: ms | ms x | top-10 identico |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 285.6 | 89.0 | 0.344 | 24102.0 | 8204.0 | 1723.6 | 5015x | si |
+| 3 | 631.5 | 105.8 | 0.463 | 24102.0 | 8204.0 | 1736.3 | 3748x | si |
+| 5 | 1135.6 | 115.7 | 0.509 | 24102.0 | 8204.0 | 1748.2 | 3433x | si |
+
+El indice solo lee el diccionario y las listas de los terminos pedidos,
+y toma la norma de cada documento ya calculada de su tabla de documentos.
+El escaneo no tiene nada de eso: para dividir por la norma necesita el df
+de TODOS los terminos de cada documento, asi que recorre y tokeniza el
+corpus entero en cada consulta. Por eso su costo apenas cambia con el
+numero de terminos, mientras que el del indice crece con el: una lista mas
+por termino. La ultima columna compara los dos top-10 puntaje a puntaje;
+un empate es un par de documentos con el mismo coseno en el ultimo puesto.
+Estas consultas se anadieron al archivo de data/exp6_consultas.txt
+como TOPK, para medir el mismo ranking contra el GIN.
+
 
 ==========================================================================
   EXPERIMENTO 7 - BoVW (clasico) contra embeddings densos (moderno)
@@ -487,10 +511,10 @@ Denso: 512 dimensiones.
 
 | representacion | extraccion (ms) | codebook/-- (ms) | indexar (ms) | pag. datos | pag. indice | detalle |
 |---|---|---|---|---|---|---|
-| BoVW + invertido | 71268 | 3697 | 1248 | 1435 | 343 | 246 palabras visuales usadas |
-| Denso + IVF | (red) | -- | 3174 | 6899 | 3514 | 83 celdas |
+| BoVW + invertido | 71268 | 3697 | 721 | 1435 | 343 | 246 palabras visuales usadas |
+| Denso + IVF | (red) | -- | 1744 | 6899 | 3514 | 83 celdas |
 
-Insertar las 6899 filas en las dos tablas: 304 ms.
+Insertar las 6899 filas en las dos tablas: 204 ms.
 El BoVW paga su costo ANTES de la consulta: extraer los descriptores y
 entrenar el codebook es lo caro, y hay que rehacerlo si cambia la
 coleccion. El denso paga una pasada de red por imagen y ya.
@@ -499,8 +523,8 @@ coleccion. El denso paga una pasada de red por imagen y ya.
 
 | representacion | indice | P@5 | P@10 | ms/consulta | accesos/consulta | se encuentra a si misma |
 |---|---|---|---|---|---|---|
-| BoVW (SIFT + K-Means) | invertido TF-IDF | 0.4250 | 0.4292 | 19.050 | 7427.8 | 24/24 |
-| Embeddings densos | IVF coseno | 1.0000 | 0.9917 | 7.564 | 755.7 | 24/24 |
+| BoVW (SIFT + K-Means) | invertido TF-IDF | 0.4250 | 0.4292 | 10.672 | 7427.8 | 24/24 |
+| Embeddings densos | IVF coseno | 1.0000 | 0.9917 | 3.046 | 755.7 | 24/24 |
 
 La ultima columna es una comprobacion de cordura, no un resultado: la imagen
 de consulta esta dentro de la coleccion, asi que tiene que salir primera en
@@ -536,11 +560,11 @@ Recall@10 medido contra fuerza bruta sobre el mismo indice, 50 consultas.
 
 | N | nlist | ms | escrituras | paginas | KB | iters | media/min/max por celda |
 |---|---|---|---|---|---|---|---|
-| 1000 | 32 | 43.6 | 409 | 134 | 536 | 12 | 31.2 / 17 / 46 |
-| 2500 | 50 | 139.8 | 1167 | 329 | 1316 | 12 | 50.0 / 22 / 101 |
-| 5000 | 71 | 297.7 | 2876 | 651 | 2604 | 12 | 70.4 / 23 / 185 |
-| 10000 | 100 | 603.1 | 6956 | 1295 | 5180 | 12 | 100.0 / 24 / 360 |
-| 20000 | 141 | 1295.9 | 15920 | 2579 | 10316 | 12 | 141.8 / 24 / 643 |
+| 1000 | 31 | 43.8 | 409 | 134 | 536 | 12 | 32.3 / 16 / 50 |
+| 2500 | 50 | 141.1 | 1166 | 329 | 1316 | 12 | 50.0 / 22 / 101 |
+| 5000 | 70 | 304.7 | 2769 | 651 | 2604 | 12 | 71.4 / 20 / 191 |
+| 10000 | 100 | 616.8 | 6955 | 1295 | 5180 | 12 | 100.0 / 24 / 360 |
+| 20000 | 141 | 1303.9 | 15919 | 2579 | 10316 | 12 | 141.8 / 24 / 643 |
 
 Con nlist = raiz de N (el valor por defecto), el numero de vectores por
 celda crece tambien como raiz de N: es lo que mantiene acotado el costo de
@@ -551,20 +575,22 @@ guarda los vectores dentro (IVF-Flat), no solo punteros.
 
 | nlist | inercia | paginas | media/min/max | nprobe def. | recall@10 | accesos/consulta | ms/consulta |
 |---|---|---|---|---|---|---|---|
-| 1 | 27871.3 | 2562 | 20000.0 / 20000 / 20000 | 1 | 1.0000 | 2720.0 | 22.288 |
-| 4 | 26524.9 | 2562 | 5000.0 / 4252 / 5415 | 2 | 0.6940 | 1381.9 | 13.147 |
-| 16 | 25107.5 | 2563 | 1250.0 / 860 / 1633 | 4 | 0.6600 | 705.2 | 6.872 |
-| 64 | 23185.5 | 2569 | 312.5 / 41 / 808 | 8 | 0.7500 | 417.4 | 3.865 |
-| 141 | 22751.5 | 2579 | 141.8 / 24 / 643 | 12 | 0.7460 | 395.0 | 2.747 |
-| 400 | 21853.2 | 2612 | 50.0 / 14 / 158 | 20 | 0.6740 | 577.9 | 2.654 |
-| 1000 | 20857.4 | 2689 | 20.0 / 5 / 71 | 32 | 0.6800 | 1154.8 | 3.262 |
+| 1 | 27871.3 | 2562 | 20000.0 / 20000 / 20000 | 1 | 1.0000 | 2720.0 | 12.681 |
+| 4 | 26524.9 | 2562 | 5000.0 / 4252 / 5415 | 2 | 0.6940 | 1381.9 | 6.205 |
+| 16 | 25107.5 | 2563 | 1250.0 / 860 / 1633 | 4 | 0.6600 | 705.2 | 3.116 |
+| 64 | 23185.5 | 2569 | 312.5 / 41 / 808 | 8 | 0.7500 | 417.4 | 1.731 |
+| 141 | 22751.5 | 2579 | 141.8 / 24 / 643 | 12 | 0.7460 | 395.0 | 1.255 |
+| 400 | 21853.2 | 2612 | 50.0 / 14 / 158 | 20 | 0.6740 | 577.9 | 0.962 |
+| 1000 | 20857.4 | 2689 | 20.0 / 5 / 71 | 32 | 0.6800 | 1154.8 | 1.336 |
 
 nlist = 1 es el caso degenerado: una sola celda con todo dentro, o sea
 fuerza bruta disfrazada de indice (recall 1 y el costo mas alto). Al subir
-nlist las celdas se encogen y la consulta se abarata, pero el recall con el
-nprobe por defecto BAJA, no sube: nprobe por defecto es raiz de nlist, asi
-que la FRACCION de celdas visitadas se encoge --- de la mitad con nlist=4 a
-la treintava parte con nlist=1000 --- y cada vez quedan fuera mas vecinos.
+nlist las celdas se encogen, pero el nprobe por defecto es raiz de nlist,
+asi que la FRACCION de celdas visitadas tambien se encoge --- de la mitad con
+nlist=4 a la treintava parte con nlist=1000. Por eso el recall con el valor
+por defecto no mejora al subir nlist: cae desde 1 y se queda alrededor de 0.7.
+Y el costo tampoco baja sin fin: con demasiadas celdas hay que comparar contra
+todos los centroides y visitar muchas celdas pequenas, y vuelve a subir.
 Es la leccion practica del experimento: nlist y nprobe no se eligen por
 separado, y el valor por defecto es solo un punto de partida.
 La inercia (suma de distancias al centroide) solo baja: mide lo bien que el
@@ -572,17 +598,17 @@ clustering describe los datos, no lo buena que es la busqueda.
 
 ### C. La curva: recall@10 frente a nprobe
 
-N = 20000, nlist = 141, fuerza bruta: 27.414 ms y 2718.0 accesos a pagina por consulta.
+N = 20000, nlist = 141, fuerza bruta: 12.244 ms y 2718.0 accesos a pagina por consulta.
 
 | nprobe | % celdas | recall@10 | accesos/consulta | bloques leidos | ms/consulta | aceleracion | % del I/O exacto |
 |---|---|---|---|---|---|---|---|
-| 1 | 0.7 % | 0.3280 | 176.0 | 51.5 | 0.540 | 50.7x | 6.5 % |
-| 2 | 1.4 % | 0.4600 | 203.6 | 77.2 | 0.841 | 32.6x | 7.5 % |
-| 5 | 3.5 % | 0.6180 | 259.6 | 128.4 | 1.453 | 18.9x | 9.5 % |
-| 10 | 7.1 % | 0.7160 | 358.5 | 219.2 | 2.464 | 11.1x | 13.2 % |
-| 20 | 14.2 % | 0.8000 | 549.9 | 394.5 | 4.180 | 6.6x | 20.2 % |
-| 50 | 35.5 % | 0.9180 | 1159.5 | 954.7 | 10.520 | 2.6x | 42.7 % |
-| 141 | 100.0 % | 1.0000 | 3076.0 | 2717.2 | 28.835 | 1.0x | 113.2 % |
+| 1 | 0.7 % | 0.3280 | 176.0 | 32.5 | 0.190 | 64.4x | 6.5 % |
+| 2 | 1.4 % | 0.4600 | 203.6 | 58.0 | 0.311 | 39.4x | 7.5 % |
+| 5 | 3.5 % | 0.6180 | 259.6 | 109.0 | 0.556 | 22.0x | 9.5 % |
+| 10 | 7.1 % | 0.7160 | 358.5 | 199.6 | 1.063 | 11.5x | 13.2 % |
+| 20 | 14.2 % | 0.8000 | 549.9 | 374.6 | 1.862 | 6.6x | 20.2 % |
+| 50 | 35.5 % | 0.9180 | 1159.5 | 933.6 | 4.698 | 2.6x | 42.7 % |
+| 141 | 100.0 % | 1.0000 | 3076.0 | 2692.0 | 13.094 | 0.9x | 113.2 % |
 
 Esta es la tabla que resume el modulo. El recall sube rapido al principio
 y se aplana: las primeras celdas son las que contienen a casi todos los
@@ -599,11 +625,11 @@ sigue siendo una fraccion pequena del exacto.
 
 | dim | bytes/entrada | entradas/pagina | paginas | recall@10 (nprobe def.) | ms/consulta |
 |---|---|---|---|---|---|
-| 8 | 44 | 93.1 | 57 | 0.9960 | 0.039 |
-| 32 | 140 | 29.3 | 176 | 0.9080 | 0.243 |
-| 128 | 524 | 7.8 | 651 | 0.6980 | 0.850 |
-| 384 | 1548 | 2.6 | 1919 | 0.3500 | 2.525 |
-| 768 | 3084 | 1.3 | 3821 | 0.3120 | 5.120 |
+| 8 | 44 | 93.1 | 57 | 0.9920 | 0.024 |
+| 32 | 140 | 29.3 | 176 | 0.9320 | 0.090 |
+| 128 | 524 | 7.8 | 651 | 0.7080 | 0.390 |
+| 384 | 1548 | 2.6 | 1919 | 0.3760 | 1.209 |
+| 768 | 3084 | 1.3 | 3820 | 0.3220 | 2.184 |
 
 En dimension 384 una entrada pesa 1548 bytes: entran DOS Y MEDIA en una
 pagina de 4 KB, y el indice acaba pesando mas que la tabla. Eso es lo que

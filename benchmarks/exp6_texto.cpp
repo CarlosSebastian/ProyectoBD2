@@ -526,6 +526,8 @@ int main(int argc, char** argv) {
         separador(8);
 
         std::mt19937 rng(321);
+        double x_min = 1e300, x_max = 0.0;          // rango de "ms x", para el texto
+        double acc_1 = 1e300, acc_5 = 0.0;          // accesos con 1 y con 5 terminos
         for (const char* op : {"AND", "OR", "AND NOT"}) {
             for (int nt : {1, 3, 5}) {
                 double ms_ix = 0, ms_sc = 0, accesos = 0, filas = 0;
@@ -566,6 +568,12 @@ int main(int argc, char** argv) {
                     if (got != esp) identico = false;
                 }
                 const double n = static_cast<double>(N_CONSULTAS);
+                if (ms_ix > 0) {
+                    x_min = std::min(x_min, ms_sc / ms_ix);
+                    x_max = std::max(x_max, ms_sc / ms_ix);
+                }
+                if (nt == 1) acc_1 = std::min(acc_1, accesos / n);
+                if (nt == 5) acc_5 = std::max(acc_5, accesos / n);
                 fila({op, std::to_string(nt), num(accesos / n, 1), num(ms_ix / n, 4),
                       num(ms_sc / n, 4),
                       num(ms_ix > 0 ? ms_sc / ms_ix : 0.0, 1) + "x",
@@ -574,7 +582,8 @@ int main(int argc, char** argv) {
         }
         std::cout <<
           "\nEl costo lo manda LEER las listas, no mezclarlas: los accesos a pagina\n"
-          "crecen casi proporcionalmente al numero de terminos (de ~8 con uno a ~43 con\n"
+          "crecen casi proporcionalmente al numero de terminos (de ~" << num(acc_1, 0)
+       << " con uno a ~" << num(acc_5, 0) << " con\n"
           "cinco) sea cual sea el operador, porque hay que traer una lista por termino.\n"
           "La mezcla en si es lineal y practicamente gratis al lado de eso.\n\n"
           "El AND de tres o mas terminos tomados al azar devuelve CERO documentos casi\n"
@@ -584,7 +593,8 @@ int main(int argc, char** argv) {
           "en una linea, la razon por la que los buscadores dejaron de exigir que\n"
           "aparezcan todos los terminos y pasaron a RANKEAR: con el booleano puro, una\n"
           "consulta de cinco palabras no devuelve nada.\n\n"
-          "Frente al recorrido completo el indice gana entre 30 y 55 veces, y eso que la\n"
+          "Frente al recorrido completo el indice gana entre " << num(x_min, 0) << " y "
+       << num(x_max, 0) << " veces, y eso que la\n"
           "columna del escaneo es una cota inferior que no incluye leer ni tokenizar.\n";
 
         // ------------------------------------------------------------------

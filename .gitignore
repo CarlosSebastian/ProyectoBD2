@@ -86,3 +86,6 @@ data/natural_images/*/*
 !data/natural_images/motorbike/motorbike_0702.jpg
 !data/natural_images/motorbike/motorbike_0770.jpg
 !data/natural_images/person/person_0362.jpg
+# PostgreSQL local para la comparacion con GIN (Experimento 6)
+pgdata/
+pg.log

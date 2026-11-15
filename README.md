@@ -137,6 +137,25 @@ python benchmarks/exp6_gin.py --csv data/exp6_corpus.csv \
                               --host 127.0.0.1 --port 5433
 ```
 
+**En Windows**, `pgserver` no tiene versión para todas las versiones de Python
+(con 3.13, `pip` no lo encuentra). La alternativa, también sin instalador ni
+permisos de administrador, son los binarios portables de PostgreSQL 16
+(https://www.enterprisedb.com/download-postgresql-binaries), descomprimidos en
+`C:\pgsql`. En PowerShell, desde la raíz del repositorio:
+
+```powershell
+$env:PATH = "C:\pgsql\bin;$env:PATH"
+initdb -D pgdata -U postgres -A trust -E UTF8 --locale=C     # solo la primera vez
+pg_ctl -D pgdata -o "-p 5440" -l pg.log start
+cmd /c "python benchmarks\exp6_gin.py --csv data\exp6_corpus.csv --consultas data\exp6_consultas.txt --host 127.0.0.1 --port 5440 > benchmarks\exp6_gin.txt"
+pg_ctl -D pgdata stop
+```
+
+Si `pg_ctl` no arranca y `pg.log` dice *could not bind ... Permission denied*,
+el puerto ya lo usa otro PostgreSQL instalado: basta elegir otro. El `cmd /c`
+es para que el `.txt` no salga en UTF-16, que es lo que escribe el `>` de
+PowerShell.
+
 PostgreSQL se usa **solo como punto de comparación**. Los datos del proyecto
 los sigue guardando e indexando el motor propio; aquí se carga una copia del
 mismo corpus para poder decir, con números, qué tan lejos queda un índice

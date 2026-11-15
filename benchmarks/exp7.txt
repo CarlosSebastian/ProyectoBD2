@@ -5,7 +5,46 @@
 
 6899 imagenes, 8 clases, 24 consultas.
 BoVW: codebook de 256 palabras visuales (SIFT + K-Means).
-Denso: 1000 dimensiones.
+Denso: 512 dimensiones.
 
 ### A. Construccion de las dos representaciones
+
+| representacion | extraccion (ms) | codebook/-- (ms) | indexar (ms) | pag. datos | pag. indice | detalle |
+|---|---|---|---|---|---|---|
+| BoVW + invertido | 71268 | 3697 | 721 | 1435 | 343 | 246 palabras visuales usadas |
+| Denso + IVF | (red) | -- | 1744 | 6899 | 3514 | 83 celdas |
+
+Insertar las 6899 filas en las dos tablas: 204 ms.
+El BoVW paga su costo ANTES de la consulta: extraer los descriptores y
+entrenar el codebook es lo caro, y hay que rehacerlo si cambia la
+coleccion. El denso paga una pasada de red por imagen y ya.
+
+### B. Efectividad: Precision@5 y Precision@10
+
+| representacion | indice | P@5 | P@10 | ms/consulta | accesos/consulta | se encuentra a si misma |
+|---|---|---|---|---|---|---|
+| BoVW (SIFT + K-Means) | invertido TF-IDF | 0.4250 | 0.4292 | 10.672 | 7427.8 | 24/24 |
+| Embeddings densos | IVF coseno | 1.0000 | 0.9917 | 3.046 | 755.7 | 24/24 |
+
+La ultima columna es una comprobacion de cordura, no un resultado: la imagen
+de consulta esta dentro de la coleccion, asi que tiene que salir primera en
+las dos rutas. Si no saliera, el error estaria en la indexacion y no en la
+representacion, y el resto de la tabla no significaria nada.
+
+Lo que se espera ver, y es el resultado clasico de la literatura: el BoVW
+pierde contra los embeddings densos por un margen amplio. La razon es que
+cuantizar un descriptor a la palabra visual mas cercana TIRA informacion ---
+dos parches parecidos que caen en celdas distintas dejan de parecerse, y dos
+parches distintos que caen en la misma pasan a ser identicos --- y ademas el
+histograma olvida donde estaba cada cosa en la imagen. El embedding de una red
+entrenada no cuantiza nada y ademas fue optimizado justamente para que la
+distancia signifique semejanza semantica.
+
+Lo que el BoVW si conserva: no necesita GPU ni un modelo preentrenado, el
+codebook se entrena con los propios datos, y cada resultado se puede explicar
+--- 'estas dos imagenes comparten estas palabras visuales' --- mientras que un
+embedding denso es opaco. Y, para este motor, tiene una propiedad que vale la
+pena remarcar: no hizo falta anadir NADA. Un histograma de palabras visuales
+es un documento, y el indice invertido de la Parte 3 lo indexa igual que un
+abstract de arXiv.
 

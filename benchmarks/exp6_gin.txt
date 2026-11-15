@@ -3,34 +3,34 @@
   EXPERIMENTO 6 (segunda mitad) - GIN de PostgreSQL sobre el mismo corpus
 ==========================================================================
 
-PostgreSQL 16.2 on x86_64-pc-linux-gnu, compiled by gcc (GCC) 10.2.1 20210130 (Red Hat 10.2.1-11), 64-bit
+PostgreSQL 16.16, compiled by Visual C++ build 1944, 64-bit
 
 -- cargando el corpus --
    20000 documentos
 -- construyendo el indice GIN --
-   2465 ms, 9680 kB en disco
+   3264 ms, 9680 kB en disco
 
 ### Recuperacion booleana
 
 | operador | terminos | GIN: ms | GIN: bloques del indice | GIN: bloques totales | SeqScan: ms | SeqScan: bloques | ms x | filas |
 |---|---|---|---|---|---|---|---|---|
-| AND | 1 | 0.6937 | 4.0 | 231.2 | 674.9312 | 2252 | 973.0x | 242 |
-| AND | 3 | 0.0785 | 10.0 | 10.0 | 661.2347 | 2252 | 8423.4x | 0 |
-| AND | 5 | 0.1178 | 16.0 | 16.0 | 666.1174 | 2252 | 5654.6x | 0 |
-| AND NOT | 1 | 0.6396 | 4.0 | 234.7 | 664.7559 | 2252 | 1039.3x | 244 |
-| AND NOT | 3 | 0.7072 | 10.0 | 246.3 | 669.6332 | 2252 | 946.9x | 252 |
-| AND NOT | 5 | 0.8086 | 16.0 | 270.8 | 663.4123 | 2252 | 820.4x | 270 |
-| OR | 1 | 0.6389 | 4.0 | 202.3 | 670.5450 | 2252 | 1049.6x | 209 |
-| OR | 3 | 1.2812 | 10.0 | 578.9 | 672.1580 | 2252 | 524.6x | 660 |
-| OR | 5 | 1.7802 | 16.0 | 892.0 | 668.2347 | 2252 | 375.4x | 1110 |
+| AND | 1 | 0.7482 | 4.0 | 231.2 | 993.1132 | 2252 | 1327.3x | 242 |
+| AND | 3 | 0.1321 | 10.0 | 10.0 | 993.8753 | 2252 | 7523.7x | 0 |
+| AND | 5 | 0.1597 | 16.0 | 16.0 | 988.4875 | 2252 | 6189.7x | 0 |
+| AND NOT | 1 | 0.8061 | 4.0 | 234.7 | 991.8340 | 2252 | 1230.4x | 244 |
+| AND NOT | 3 | 0.9177 | 10.0 | 246.3 | 993.4871 | 2252 | 1082.6x | 252 |
+| AND NOT | 5 | 0.9623 | 16.0 | 270.8 | 987.6418 | 2252 | 1026.3x | 270 |
+| OR | 1 | 0.7944 | 4.0 | 202.3 | 994.4546 | 2252 | 1251.8x | 209 |
+| OR | 3 | 1.7899 | 10.0 | 578.9 | 999.0531 | 2252 | 558.2x | 660 |
+| OR | 5 | 2.8690 | 16.0 | 892.0 | 1007.1690 | 2252 | 351.1x | 1110 |
 
 ### Ranking Top-10 (terminos unidos con OR, ordenados por ts_rank)
 
 | terminos | GIN: ms | GIN: bloques del indice | GIN: bloques totales | SeqScan: ms | SeqScan: bloques | ms x | filas |
 |---|---|---|---|---|---|---|---|
-| 1 | 19.8590 | 4.0 | 257.2 | 683.4721 | 2289 | 34.4x | 10 |
-| 3 | 43.8961 | 10.0 | 532.1 | 699.3149 | 2289 | 15.9x | 10 |
-| 5 | 80.2403 | 16.0 | 870.1 | 711.5294 | 2289 | 8.9x | 10 |
+| 1 | 29.0406 | 4.0 | 257.2 | 1003.3282 | 2289 | 34.5x | 10 |
+| 3 | 63.0687 | 10.0 | 532.1 | 1024.9346 | 2289 | 16.3x | 10 |
+| 5 | 116.4239 | 16.0 | 870.1 | 1053.7981 | 2289 | 9.1x | 10 |
 
 Un ranking por GIN no es barato: el indice encuentra los documentos que
 contienen algun termino, pero ts_rank necesita el tsvector de cada uno, y
@@ -47,8 +47,3 @@ indice propio en las booleanas vale la de 'bloques del indice': las dos
 cuentan solo paginas del indice. La de 'bloques totales' suma las del
 heap, que PostgreSQL visita para devolver el id de cada fila.
 
-
-Nota de metodo: la primera version de este script sumaba TODAS las lineas
-'Buffers:' del plan. Como en EXPLAIN los Buffers de cada nodo ya incluyen los
-de sus hijos, y ademas se sumaban los de la planificacion (catalogo), los
-bloques del GIN salian inflados. Estos numeros son los corregidos.
