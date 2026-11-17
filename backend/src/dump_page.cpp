@@ -443,7 +443,7 @@ void dumpInvertido(const char* b, int numero, bool hex_completo,
             const int largo = static_cast<unsigned char>(b[off]);
             std::string t(b + off + 1, static_cast<std::size_t>(largo));
             const int o = off + 1 + largo;
-            std::cout << "  " << std::setw(5) << i << "  " << std::setw(32) << std::left << t
+            std::cout << "  " << std::right << std::setw(5) << i << "  " << std::setw(32) << std::left << t
                       << std::right << std::setw(6) << readAt<std::uint32_t>(b, o)
                       << std::setw(14) << readAt<std::uint64_t>(b, o + 4)
                       << std::setw(10) << readAt<std::uint32_t>(b, o + 12) << "\n";
@@ -465,7 +465,7 @@ void dumpInvertido(const char* b, int numero, bool hex_completo,
         const std::int32_t sl = readAt<std::int32_t>(b, o + 4);
         const std::uint32_t lg = readAt<std::uint32_t>(b, o + 8);
         if (pg == 0 && sl == 0 && lg == 0) continue;
-        std::cout << "  " << std::setw(8) << (base + i)
+        std::cout << "  " << std::right << std::setw(8) << (base + i)
                   << "  " << std::setw(8) << ("(" + std::to_string(pg) + "," + std::to_string(sl) + ")")
                   << std::setw(14) << lg
                   << std::setw(18) << readAt<float>(b, o + 12) << "\n";
