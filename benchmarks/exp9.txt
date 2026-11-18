@@ -1,0 +1,39 @@
+==========================================================================
+  EXPERIMENTO 9 - Tiempo de respuesta extremo a extremo (aplicacion RAG)
+==========================================================================
+
+12 preguntas x 1 repeticion(es), k = 5, corpus de 21748 papers.
+Embeddings: all-minilm.  Generacion: qwen2.5:7b.
+
+### A. Reparto de la latencia por etapa (ms, media)
+
+| modo | reescritura (LLM) | embedding | MOTOR (SQL) | generacion (LLM) | total | % del motor |
+|---|---|---|---|---|---|---|
+| bm25 | 192.1 | 0.0 | 1.6 | 4142.7 | 6392.1 | 0.0 % |
+| vectorial | 177.8 | 25.4 | 4.2 | 4802.5 | 7068.5 | 0.1 % |
+| hibrido | 172.1 | 13.5 | 5.9 | 5180.2 | 7425.7 | 0.1 % |
+
+La columna que cuenta para este proyecto es la del MOTOR. Las otras tres
+son Ollama, y dependen de la maquina y del modelo, no del diseno de los
+indices.
+
+### B. Latencia extremo a extremo: media y cola
+
+| modo | media (ms) | p95 (ms) | minimo | maximo | fuentes/consulta |
+|---|---|---|---|---|---|
+| bm25 | 6392 | 9802 | 3528 | 10408 | 5.0 |
+| vectorial | 7068 | 11330 | 3867 | 14383 | 5.0 |
+| hibrido | 7426 | 11004 | 4479 | 11176 | 5.0 |
+
+### C. Lo que pide el motor en cada pregunta
+
+| modo | lecturas de disco | accesos a pagina | ms del motor |
+|---|---|---|---|
+| bm25 | 137.3 | 7160.8 | 1.57 |
+| vectorial | 569.2 | 941.0 | 4.16 |
+| hibrido | 703.7 | 8101.8 | 5.91 |
+
+Estas tres columnas son las reproducibles: no dependen de la GPU ni de
+la version del modelo. El modo hibrido paga dos consultas, una por cada
+indice, y a cambio fusiona dos rankings con criterios independientes.
+
