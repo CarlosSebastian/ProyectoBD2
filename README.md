@@ -559,6 +559,12 @@ ingesta.
 
 Todos los comandos se lanzan **desde la raíz del repositorio**.
 
+**Atajo: el repositorio ya trae el corpus y sus embeddings** (21 748 papers,
+`ai/corpus/arxiv_papers.jsonl` y `ai/cache/emb_all-minilm.bin`). Con Ollama y
+los dos modelos instalados basta `./build.sh run`: carga la tabla del RAG sola
+en un minuto y levanta el asistente. Los pasos 1 y 3 solo hacen falta para
+usar otro corpus u otro modelo de embeddings.
+
 **1. Descargar el corpus** (una sola vez; no necesita el motor):
 
 ```bash

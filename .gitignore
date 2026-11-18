@@ -33,12 +33,17 @@ informe/figuras/*.png
 informe/
 benchmarks/graficas.py
 
-# Aplicacion de IA (RAG): el corpus y los embeddings son datos generados.
+# Aplicacion de IA (RAG). Se versionan el corpus (21 748 papers, 35 MB) y sus
+# embeddings (33 MB): con ellos './build.sh run' carga la tabla del RAG sola en
+# un minuto, sin descargar nada ni calcular embeddings (eso son ~16 min).
+# papers.csv (120 MB, pasa el limite de GitHub) se regenera en la ingesta.
 ai/corpus/*
 !ai/corpus/.gitkeep
 !ai/corpus/muestra_100.jsonl
+!ai/corpus/arxiv_papers.jsonl
 ai/cache/*
 !ai/cache/.gitkeep
+!ai/cache/emb_all-minilm.bin
 __pycache__/
 graphify-out/
 
