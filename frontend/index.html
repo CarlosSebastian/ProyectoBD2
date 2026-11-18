@@ -662,8 +662,9 @@ function pintarMapa(resp, sql){
     }
   });
 
-  // Dibujar tambien la geometria de la consulta: el rectangulo del WITHIN o el
-  // punto de referencia del KNN. Se leen del SQL que se acaba de ejecutar.
+  // Dibujar tambien la geometria de la consulta: el rectangulo del WITHIN, el
+  // circulo de una consulta por radio o el punto de referencia del KNN. Se leen
+  // del SQL que se acaba de ejecutar.
   let nota = nPoligonos ? `${nPuntos} punto(s), ${nPoligonos} polígono(s)`
                         : `${nPuntos} punto(s)`;
   const w = /WITHIN\s*\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)/i.exec(sql);
@@ -674,8 +675,23 @@ function pintarMapa(resp, sql){
     puntos.push([y0,x0],[y1,x1]);
     nota += ' · ventana en azul';
   }
-  const k = /<->\s*POINT\s*\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)/i.exec(sql);
-  if(k){
+  // Radio: WITHIN_RADIUS((lon, lat), km) o ST_DISTANCE(col, POINT(lon,lat)) <= metros.
+  const rk = /WITHIN_RADIUS\s*\(\s*\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)\s*,\s*([\d.]+)\s*\)/i.exec(sql);
+  const rm = /ST_DISTANCE\s*\(\s*\w+\s*,\s*POINT\s*\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)\s*\)\s*<=?\s*([\d.]+)/i.exec(sql);
+  const r = rk ? [+rk[1], +rk[2], +rk[3] * 1000] : rm ? [+rm[1], +rm[2], +rm[3]] : null;
+  if(r){
+    const [cx, cy, metros] = r;
+    L.circle([cy, cx], {radius: metros, color:'#3b82f6', weight:2, dashArray:'5 4',
+                        fillOpacity:0.05}).bindPopup(`Radio de ${metros} m`).addTo(capaMapa);
+    L.circleMarker([cy, cx], {radius:4, color:'#3b82f6', weight:2, fillOpacity:1}).addTo(capaMapa);
+    const dLat = metros / 111320, dLon = metros / (111320 * Math.cos(cy * Math.PI / 180));
+    puntos.push([cy - dLat, cx - dLon], [cy + dLat, cx + dLon]);
+    nota += ' · radio en azul';
+  }
+  // Punto de referencia del k-NN, euclidiano (<->) o geografico (ORDER BY ST_DISTANCE).
+  const k = /<->\s*POINT\s*\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)/i.exec(sql)
+         || /ORDER\s+BY\s+ST_DISTANCE\s*\(\s*\w+\s*,\s*POINT\s*\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)/i.exec(sql);
+  if(k && !r){
     const qx=+k[1], qy=+k[2];
     L.circleMarker([qy,qx], {radius:9, color:'#3b82f6', weight:3, fillOpacity:0})
       .bindPopup('Punto de consulta').addTo(capaMapa);

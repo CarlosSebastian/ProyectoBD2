@@ -36,6 +36,14 @@ MAX_ABSTRACT = 1700       # una fila (texto + vector de 384 float) debe caber en
 LOTE = 16
 
 
+def recortar_bytes(txt: str, n: int) -> str:
+    """CHAR(n) del motor mide BYTES y corta donde caiga: un titulo con tildes
+    podia quedar partido a mitad de un caracter UTF-8 y volver como JSON
+    invalido. Se recorta aqui, en un borde de caracter."""
+    b = txt.encode("utf-8")
+    return txt if len(b) <= n else b[:n].decode("utf-8", "ignore")
+
+
 def recortar(txt: str, n: int) -> str:
     if len(txt) <= n:
         return txt
@@ -126,7 +134,7 @@ def main():
         w = csv.writer(f)
         w.writerow(["id", "arxiv_id", "titulo", "abstract", "anio", "cat", "emb"])
         for p in papers:
-            w.writerow([p["id"], p["arxiv_id"], p["titulo"], recortar(p["abstract"], MAX_ABSTRACT),
+            w.writerow([p["id"], p["arxiv_id"], recortar_bytes(p["titulo"], 200), recortar(p["abstract"], MAX_ABSTRACT),
                         p["anio"], p["cat"],
                         "[" + ",".join(f"{x:.6g}" for x in cache[p["id"]]) + "]"])
 
