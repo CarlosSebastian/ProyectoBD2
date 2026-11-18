@@ -12,13 +12,16 @@
 #
 #  Tras compilar queda tambien build/dump_page, el inspector de los binarios.
 #     ./build.sh bench        corre los cuatro experimentos del enunciado
-#     ./build.sh run          levanta el servidor en http://localhost:8080
+#     ./build.sh run          levanta el motor en http://localhost:8080 y, si hay
+#                             Python, tambien el asistente RAG (:8000)
+#     ./build.sh serve        lo mismo que run, sin recompilar
 #     ./build.sh clean        borra binarios y datos generados
 #
 #  Variables:
 #     PAGE=8192 ./build.sh bench     cambia el tamano de pagina (Experimento 4)
 #     PORT=9000 ./build.sh run       otro puerto
 #     POOL=8    ./build.sh run       buffer pool chico: hace visible el I/O fisico
+#     RAG=0     ./build.sh run       solo el motor, sin el asistente RAG
 # ============================================================================
 set -e
 cd "$(dirname "$0")"
@@ -68,6 +71,119 @@ compilar() {
     echo ">> listo"
 }
 
+# ---------------------------------------------------------------------------
+#  Asistente RAG (ai/rag_server.py). Es OTRO proceso, en Python, que usa el
+#  motor por su API REST. Se levanta junto al motor si hay un Python a mano.
+# ---------------------------------------------------------------------------
+buscarPython() {
+    # En Git Bash / MSYS2 el PATH no siempre incluye el Python de Windows,
+    # asi que ademas de los nombres habituales se prueban sus rutas tipicas.
+    local c
+    for c in python3 python py; do
+        if command -v "$c" >/dev/null 2>&1 && "$c" -c "import sys" >/dev/null 2>&1; then
+            echo "$c"; return 0
+        fi
+    done
+    if [ -n "$LOCALAPPDATA" ] && command -v cygpath >/dev/null 2>&1; then
+        local base; base=$(cygpath -u "$LOCALAPPDATA")
+        for c in "$base"/Microsoft/WindowsApps/python.exe "$base"/Programs/Python/Python3*/python.exe; do
+            if [ -x "$c" ] && "$c" -c "import sys" >/dev/null 2>&1; then
+                echo "$c"; return 0
+            fi
+        done
+    fi
+    return 1
+}
+
+esperarMotor() {
+    # Con el mismo Python del RAG, no con curl: MSYS2 no siempre trae curl, y
+    # sin el, esta espera fallaba aunque el motor estuviera arriba.
+    "$1" - "$PORT" <<'PY' >/dev/null 2>&1
+import sys, time, urllib.request
+url = "http://127.0.0.1:%s/api/health" % sys.argv[1]
+for _ in range(60):
+    try:
+        urllib.request.urlopen(url, timeout=1); sys.exit(0)
+    except Exception:
+        time.sleep(0.25)
+sys.exit(1)
+PY
+}
+
+servir() {
+    # El motor corre en PRIMER PLANO, como siempre: asi Ctrl+C le llega directo.
+    if [ "${RAG:-1}" != "0" ] && [ -f ai/rag_server.py ]; then
+        case "$OSTYPE" in
+            msys*|cygwin*|win32*) ragWindows ;;
+            *)
+                local py
+                if py=$(buscarPython); then
+                    levantarRag "$py" &
+                    local rag=$!
+                    trap "kill $rag 2>/dev/null" EXIT
+                else
+                    echo ">> asistente RAG: no se encontro Python en esta terminal."
+                    echo "   Levantalo aparte:  python ai/rag_server.py"
+                fi
+                ;;
+        esac
+    fi
+    echo ">> motor: http://localhost:$PORT   (Ctrl+C detiene todo)"
+    "./build/dbserver$EXE" --port "$PORT" --data data --static frontend --pool "$POOL"
+}
+
+faltaTablaRag() {
+    # La tabla del RAG vive en data/ y './build.sh clean' la borra. Los
+    # embeddings NO se borran (ai/cache/), asi que se puede recargar en ~1 min
+    # sin recalcular nada ni necesitar Ollama.
+    ! grep -q "^TABLE ${RAG_TABLA:-arxiv} " data/catalog.txt 2>/dev/null \
+        && ls ai/cache/emb_*.bin >/dev/null 2>&1 \
+        && [ -f ai/corpus/arxiv_papers.jsonl ]
+}
+
+ragWindows() {
+    # En Windows el RAG se abre en SU PROPIA ventana (minimizada). Correr el
+    # Python de Windows dentro de esta terminal de Git Bash / MSYS2 tumbaba al
+    # motor sin ningun mensaje; en otra consola no lo toca. Al detener el motor
+    # con Ctrl+C se cierra esa ventana tambien.
+    local bat=ai/cache/levantar_rag.bat
+    mkdir -p ai/cache
+    # La ventana nueva hereda el entorno de MSYS2: su PATH no tiene el Python
+    # de Windows y su 'timeout' es el de coreutils. Por eso el .bat rearma el
+    # PATH de Windows desde el registro y llama a timeout.exe por su ruta.
+    {
+        echo '@echo off'
+        echo 'title Asistente RAG'
+        echo 'for /f "tokens=2,*" %%A in ('"'"'reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" /v Path 2^>nul'"'"') do set "RAG_SP=%%B"'
+        echo 'for /f "tokens=2,*" %%A in ('"'"'reg query "HKCU\Environment" /v Path 2^>nul'"'"') do set "RAG_UP=%%B"'
+        echo 'call set "PATH=%RAG_SP%;%RAG_UP%;%LOCALAPPDATA%\Microsoft\WindowsApps"'
+        echo "set DB_URL=http://127.0.0.1:$PORT"
+        echo '"%SystemRoot%\System32\timeout.exe" /t 2 /nobreak >nul'
+        if faltaTablaRag; then
+            echo 'echo Falta la tabla del RAG: se recarga desde ai\cache\ (1 minuto)'
+            echo 'python ai\ingesta.py'
+        fi
+        echo 'python ai\rag_server.py'
+        echo 'if errorlevel 1 pause'
+    } | sed 's/$/\r/' > "$bat"
+    cmd.exe //c start "Asistente RAG" //min "ai\cache\levantar_rag.bat"
+    trap 'taskkill //FI "WINDOWTITLE eq Asistente RAG*" //T //F >/dev/null 2>&1' EXIT
+    echo ">> asistente RAG: ventana 'Asistente RAG' (minimizada), http://localhost:8000"
+    echo "   o la pestana 'Asistente RAG' del cliente"
+}
+
+levantarRag() {
+    local py=$1
+    esperarMotor "$py" || echo ">> aviso: el motor tarda en responder en :$PORT"
+    if faltaTablaRag; then
+        echo ">> asistente RAG: falta la tabla del RAG; se recarga desde ai/cache/"
+        DB_URL="http://127.0.0.1:$PORT" "$py" ai/ingesta.py | tail -n 5 \
+            || echo "   la recarga fallo; correla a mano:  python ai/ingesta.py"
+    fi
+    echo ">> asistente RAG: http://localhost:8000  (o la pestana 'Asistente RAG')"
+    DB_URL="http://127.0.0.1:$PORT" exec "$py" ai/rag_server.py > ai/cache/rag_server.log 2>&1
+}
+
 case "${1:-all}" in
     all)   compilar ;;
     test)
@@ -82,11 +198,8 @@ case "${1:-all}" in
         ;;
     demo)  compilar; mkdir -p data/_demo; "./build/demo$EXE" data/_demo ;;
     bench) PAGE=$PAGE ./benchmarks/run_experimentos.sh ;;
-    run)
-        compilar
-        echo ">> http://localhost:$PORT   (Ctrl+C para detener)"
-        "./build/dbserver$EXE" --port "$PORT" --data data --static frontend --pool "$POOL"
-        ;;
+    run)   compilar; servir ;;
+    serve) servir ;;
     clean)
         rm -rf build
         # Lo que genera el motor: se borra sin miedo, se recrea solo.
@@ -102,7 +215,7 @@ case "${1:-all}" in
         echo ">> limpio  (se conservan data/bovw_* y data/*.onnx)"
         ;;
     *)
-        echo "uso: ./build.sh [all|test|demo|bench|run|clean]"
+        echo "uso: ./build.sh [all|test|demo|bench|run|serve|clean]"
         exit 1
         ;;
 esac

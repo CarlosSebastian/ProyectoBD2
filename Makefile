@@ -70,7 +70,7 @@ $(BUILD)/%: backend/tests/%.cpp $(LIB_OBJ)
 	$(CXX) $(CXXFLAGS) -Ibackend/tests $< $(LIB_OBJ) -o $@
 
 run: dirs $(BUILD)/dbserver
-	@./$(BUILD)/dbserver --port $(PORT) --data data --static frontend --pool $(POOL)
+	@PORT=$(PORT) POOL=$(POOL) ./build.sh serve
 
 server: run
 

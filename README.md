@@ -16,7 +16,11 @@ fijo.
 make run
 ```
 
-Compila todo y sirve el cliente en **http://localhost:8080**.
+Compila todo y sirve el cliente en **http://localhost:8080**, y levanta además
+el asistente RAG (http://localhost:8000), que también se abre desde la pestaña
+**Asistente RAG** del cliente. En Windows el RAG corre en su propia ventana
+(minimizada, "Asistente RAG"); en Linux y Mac, en segundo plano. Ctrl+C detiene
+los dos. Con `RAG=0 ./build.sh run` se levanta solo el motor.
 
 Opciones útiles:
 
@@ -588,13 +592,18 @@ repiten), los carga con `COPY` y crea los tres índices: B+ sobre `id`,
 existe, la vacía y la recarga. Con 25 000 papers, el cálculo de embeddings es lo
 que más tarda.
 
-**4. Levantar el servidor RAG** (terminal 3, en :8000):
+**4. Levantar el servidor RAG** (en :8000). `./build.sh run` ya lo levanta
+solo. Para levantarlo a mano, con el motor corriendo, en otra terminal:
 
 ```bash
 python ai/rag_server.py
 ```
 
-**5. Abrir http://localhost:8000.** Los tres indicadores de arriba tienen que
+La tabla del RAG vive en `data/`, así que `./build.sh clean` la borra; los
+embeddings no (quedan en `ai/cache/`). Por eso, si al arrancar falta la tabla,
+`./build.sh run` la vuelve a cargar sola en un minuto, sin recalcular nada.
+
+**5. Abrir http://localhost:8000** (o la pestaña **Asistente RAG** del cliente). Los tres indicadores de arriba tienen que
 estar en verde: `motor ✓`, `ollama ✓` y `N papers`. Escribe una pregunta (por
 ejemplo *¿Qué se ha investigado sobre generación de recetas con IA?*); la
 primera respuesta tarda unos segundos porque Ollama carga el modelo.

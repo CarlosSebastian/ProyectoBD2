@@ -44,7 +44,10 @@ SISTEMA = (
 
 def solo_palabras(txt: str) -> str:
     """El lexer SQL no tiene escape de comillas ni de ';': se dejan solo letras, digitos y espacios."""
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", txt)).strip()
+    # El "_" tambien se quita: \w lo cuenta como letra, y el LLM a veces une la
+    # consulta con guiones bajos ("inverted_index_search"), que el modelo de
+    # embeddings ve como una sola palabra rara.
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]|_", " ", txt)).strip()
 
 
 def reescribir(pregunta: str) -> str:

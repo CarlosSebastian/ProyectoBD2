@@ -67,6 +67,11 @@ def pedir(url: str, ruta: str, cuerpo=None, timeout=600):
         return json.load(r)
 
 
+# "bm25" es el nombre interno del modo lexico en rag_server.py; el indice
+# invertido de la ingesta puntua con TF-IDF + coseno.
+NOMBRE = {"bm25": "lexica (TF-IDF)", "vectorial": "vectorial (IVF)", "hibrido": "hibrido"}
+
+
 def resumen(valores):
     """media y p95. Con pocas muestras el p95 es el maximo, y esta bien asi:
     lo que interesa es si hay una cola larga, no estimarla con precision."""
@@ -107,7 +112,10 @@ def medir(url, modo, preguntas, k, reps):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--url", default="http://localhost:8000")
+    # 127.0.0.1 y no "localhost": en Windows, localhost prueba primero IPv6 (::1),
+    # el servidor solo escucha en IPv4 y cada peticion puede perder ~2 s esperando el
+    # rechazo, que se sumarian al total sin pertenecer a ninguna etapa.
+    ap.add_argument("--url", default="http://127.0.0.1:8000")
     ap.add_argument("--modos", nargs="+", default=["bm25", "vectorial", "hibrido"])
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--repeticiones", type=int, default=1)
@@ -159,14 +167,15 @@ def main():
 
     w("### A. Reparto de la latencia por etapa (ms, media)")
     w()
-    w("| modo | " + " | ".join(n for _, n in etapas) + " | total | % del motor |")
-    w("|---|" + "---|" * (len(etapas) + 2))
+    w("| modo | " + " | ".join(n for _, n in etapas) + " | otros | total | % del motor |")
+    w("|---|" + "---|" * (len(etapas) + 3))
     for modo, filas in tablas.items():
         medias = [statistics.fmean([f[c] for f in filas]) for c, _ in etapas]
         tot = statistics.fmean([f["total"] for f in filas])
         pct = 100.0 * medias[2] / tot if tot else 0.0
-        w("| %s | %s | %.1f | %.1f %% |"
-          % (modo, " | ".join("%.1f" % m for m in medias), tot, pct))
+        otros = tot - sum(medias)    # HTTP, JSON y armado del prompt: lo no medido
+        w("| %s | %s | %.1f | %.1f | %.1f %% |"
+          % (NOMBRE.get(modo, modo), " | ".join("%.1f" % m for m in medias), otros, tot, pct))
     w()
     w("La columna que cuenta para este proyecto es la del MOTOR. Las otras tres")
     w("son Ollama, y dependen de la maquina y del modelo, no del diseno de los")
@@ -181,7 +190,7 @@ def main():
         tot = [f["total"] for f in filas]
         media, p95 = resumen(tot)
         w("| %s | %.0f | %.0f | %.0f | %.0f | %.1f |"
-          % (modo, media, p95, min(tot), max(tot),
+          % (NOMBRE.get(modo, modo), media, p95, min(tot), max(tot),
              statistics.fmean([f["fuentes"] for f in filas])))
     w()
 
@@ -191,7 +200,7 @@ def main():
     w("|---|---|---|---|")
     for modo, filas in tablas.items():
         w("| %s | %.1f | %.1f | %.2f |"
-          % (modo,
+          % (NOMBRE.get(modo, modo),
              statistics.fmean([f["disk_reads"] for f in filas]),
              statistics.fmean([f["accesos"] for f in filas]),
              statistics.fmean([f["motor"] for f in filas])))

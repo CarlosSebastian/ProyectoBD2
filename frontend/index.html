@@ -153,6 +153,18 @@
   .paso .ms{font-family:var(--mono);color:var(--muted);font-size:11.5px}
   .paso .detalle{color:var(--muted);font-size:11px;margin-top:1px}
   .paso .barra-ms{height:3px;border-radius:2px;background:var(--accent);margin-top:4px;min-width:2px}
+
+  /* Pestanas: el cliente SQL y la aplicacion RAG en la misma pagina */
+  .tabs{display:flex;gap:4px;margin-left:8px}
+  .tab{font-size:12px;padding:4px 12px;border-radius:999px;border:1px solid var(--border);
+       background:transparent;color:var(--muted);cursor:pointer}
+  .tab.activa{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
+  #vista-rag{display:none;height:calc(100vh - 49px);padding:12px}
+  #vista-rag iframe{width:100%;height:100%;border:1px solid var(--border);
+                    border-radius:var(--radius);background:var(--panel)}
+  #rag-caido{max-width:640px;margin:48px auto;padding:20px;background:var(--panel);
+             border:1px solid var(--border);border-radius:var(--radius)}
+  #rag-caido code{font-family:var(--mono);background:var(--bg);padding:1px 6px;border-radius:4px}
 </style>
 </head>
 <body>
@@ -160,6 +172,10 @@
 <header>
   <h1>Cliente SQL</h1>
   <span class="sub">Mini-gestor de bases de datos multimodal · CS2042</span>
+  <nav class="tabs">
+    <button class="tab activa" id="tab-sql">Cliente SQL</button>
+    <button class="tab" id="tab-rag">Asistente RAG</button>
+  </nav>
   <span class="spacer"></span>
   <span class="pill" id="pill-page">página — B</span>
   <span class="pill" id="pill-io">I/O total: —</span>
@@ -241,6 +257,22 @@
       <div class="body" id="media-grid"></div>
     </section>
   </div>
+</div>
+
+<!-- Aplicacion RAG. Es otro proceso (ai/rag_server.py, puerto 8000) que consulta
+     a ESTE motor por su API REST; aqui solo se muestra su pagina. -->
+<div id="vista-rag">
+  <div id="rag-caido" style="display:none">
+    <h3 style="margin-top:0">El asistente RAG no esta corriendo</h3>
+    <p>Es una aplicacion aparte que usa este motor por su API REST. Para levantarla,
+       con el motor ya encendido, en otra terminal:</p>
+    <p><code>python ai/rag_server.py</code></p>
+    <p style="color:var(--muted)">Necesita Ollama y haber corrido antes
+       <code>python ai/ingesta.py</code>. <code>./build.sh run</code> la levanta sola.
+       </p>
+    <button id="rag-reintentar">Reintentar</button>
+  </div>
+  <iframe id="rag-frame" title="Asistente RAG" style="display:none"></iframe>
 </div>
 
 <script>
@@ -677,6 +709,46 @@ fetch('/api/health').then(r=>r.json()).then(d=>{
   $('#pill-page').textContent = `página ${d.page_size} B · pool ${d.pool_pages}`;
 }).catch(()=>{});
 cargarTablas();
+
+// ---------------------------------------------------------------------------
+//  Pestanas. El RAG vive en otro puerto (8000 por defecto, ?rag=PUERTO para
+//  cambiarlo); se comprueba que responda antes de cargarlo en el iframe.
+// ---------------------------------------------------------------------------
+const RAG_URL = `${location.protocol}//${location.hostname}:` +
+                `${new URLSearchParams(location.search).get('rag') || 8000}/`;
+
+async function ragDisponible() {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 6000);
+  try {
+    // Se pide la pagina, no /api/salud: salud consulta al motor y a Ollama y
+    // puede tardar segundos. no-cors: solo importa que el servidor conteste.
+    await fetch(RAG_URL, {mode: 'no-cors', cache: 'no-store', signal: ctl.signal});
+    return true;
+  } catch (e) { return false; } finally { clearTimeout(t); }
+}
+
+async function mostrarRag() {
+  const frame = $('#rag-frame'), caido = $('#rag-caido');
+  if (await ragDisponible()) {
+    if (!frame.src) frame.src = RAG_URL;
+    caido.style.display = 'none'; frame.style.display = 'block';
+  } else {
+    frame.style.display = 'none'; caido.style.display = 'block';
+  }
+}
+
+function cambiarVista(rag) {
+  $('#tab-sql').classList.toggle('activa', !rag);
+  $('#tab-rag').classList.toggle('activa', rag);
+  document.querySelector('.layout').style.display = rag ? 'none' : '';
+  $('#vista-rag').style.display = rag ? 'block' : 'none';
+  if (rag) mostrarRag();
+  else if (mapa) setTimeout(() => mapa.invalidateSize(), 30);   // Leaflet tras estar oculto
+}
+$('#tab-sql').onclick = () => cambiarVista(false);
+$('#tab-rag').onclick = () => cambiarVista(true);
+$('#rag-reintentar').onclick = mostrarRag;
 </script>
 </body>
 </html>

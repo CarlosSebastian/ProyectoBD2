@@ -191,7 +191,7 @@ async function preguntar() {
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || r.status);
     pintarRespuesta(d.respuesta);
-    $('#consulta').textContent = 'Consulta de búsqueda: “' + d.consulta + '” · modo ' + d.modo;
+    $('#consulta').textContent = 'Consulta de búsqueda: “' + d.consulta + '” · modo ' + ({bm25: 'léxico (TF-IDF)', vectorial: 'vectorial', hibrido: 'híbrido'}[d.modo] || d.modo);
     pintarFuentes(d.fuentes); pintarMetricas(d.metricas); pintarTiempos(d.tiempos);
   } catch (e) {
     $('#respuesta').className = 'error'; $('#respuesta').textContent = 'Error: ' + e.message;
